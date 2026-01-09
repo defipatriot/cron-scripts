@@ -78,31 +78,40 @@ function setupGit() {
   
   const repoUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`;
   
-  console.log('Setting up git...');
+  console.log('Setting up git for repo: ' + GITHUB_REPO);
   
   // Always init git if not present
   if (!fs.existsSync('.git')) {
     run('git init', true);
-    run('git checkout -b main', true);
   }
   
   // Configure user
   run('git config user.email "bot@alliancedao.com"');
   run('git config user.name "Alliance DAO Bot"');
   
-  // Remove existing origin and add fresh one
+  // Remove existing origin and add fresh one (hide token from logs)
   run('git remote remove origin', true);
-  run(`git remote add origin ${repoUrl}`);
-  console.log('Remote origin set to: ' + GITHUB_REPO);
+  execSync(`git remote add origin ${repoUrl}`, { encoding: 'utf8', stdio: 'pipe' });
+  console.log('> git remote add origin https://***@github.com/' + GITHUB_REPO + '.git');
   
-  // Try to pull existing data
+  // Fetch and sync with remote
   try {
     console.log('Fetching from remote...');
-    run('git fetch origin main', true);
-    run('git reset --hard origin/main', true);
-    console.log('Synced with remote');
+    execSync('git fetch origin', { encoding: 'utf8', stdio: 'pipe' });
+    
+    // Check if main branch exists on remote
+    try {
+      execSync('git checkout main', { encoding: 'utf8', stdio: 'pipe' });
+      execSync('git pull origin main --rebase', { encoding: 'utf8', stdio: 'pipe' });
+      console.log('Synced with remote main branch');
+    } catch (e) {
+      // main branch might not exist yet, create it
+      console.log('Creating main branch...');
+      run('git checkout -b main', true);
+    }
   } catch (e) {
-    console.log('No existing remote data (this is OK for first run)');
+    console.log('No remote data yet (first run) - creating main branch');
+    run('git checkout -b main', true);
   }
   
   console.log('Git setup complete');
@@ -118,13 +127,6 @@ function gitCommitAndPush(message) {
   const repoUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`;
   
   try {
-    // Make sure we're on main branch
-    run('git checkout -b main', true);
-    
-    // Ensure remote is set
-    run('git remote remove origin', true);
-    run(`git remote add origin ${repoUrl}`);
-    
     // Stage all changes
     run('git add -A');
     
@@ -136,14 +138,22 @@ function gitCommitAndPush(message) {
       return;
     }
     
-    // Push 
+    // Pull latest to avoid conflicts (hide token)
+    console.log('Pulling latest changes...');
+    try {
+      execSync('git pull origin main --rebase', { encoding: 'utf8', stdio: 'pipe' });
+    } catch (e) {
+      console.log('Pull failed (might be first push)');
+    }
+    
+    // Push (hide token from logs)
     console.log('Pushing to GitHub...');
     try {
-      run('git push -u origin main');
+      execSync('git push -u origin main', { encoding: 'utf8', stdio: 'pipe' });
       console.log('✓ Successfully pushed to GitHub!');
     } catch (e) {
       console.log('Normal push failed, trying force push...');
-      run('git push -u origin main --force');
+      execSync('git push -u origin main --force', { encoding: 'utf8', stdio: 'pipe' });
       console.log('✓ Force pushed to GitHub!');
     }
   } catch (e) {
