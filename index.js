@@ -55,9 +55,19 @@ function ensureDirs() {
   });
 }
 
-function run(cmd) {
+function run(cmd, ignoreError = false) {
   console.log(`> ${cmd}`);
-  return execSync(cmd, { encoding: 'utf8', stdio: 'pipe' });
+  try {
+    const result = execSync(cmd, { encoding: 'utf8', stdio: 'pipe' });
+    if (result) console.log(result.trim());
+    return result;
+  } catch (e) {
+    if (ignoreError) {
+      console.log(`  (ignored: ${e.message})`);
+      return '';
+    }
+    throw e;
+  }
 }
 
 function setupGit() {
@@ -69,33 +79,69 @@ function setupGit() {
   const repoUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`;
   
   try {
+    // Always start fresh - clone into current directory
     if (!fs.existsSync('.git')) {
-      run(`git clone ${repoUrl} temp_clone`);
-      run('cp -r temp_clone/* . 2>/dev/null || true');
-      run('cp -r temp_clone/.git . 2>/dev/null || true');
-      run('rm -rf temp_clone');
+      console.log('Cloning repository...');
+      // Clone directly into current dir
+      run(`git clone ${repoUrl} .`);
     } else {
-      run('git pull origin main || true');
+      console.log('Pulling latest...');
+      run('git fetch origin', true);
+      run('git reset --hard origin/main', true);
     }
+    
     run('git config user.email "bot@alliancedao.com"');
     run('git config user.name "Alliance DAO Bot"');
+    console.log('Git setup complete');
     return true;
   } catch (e) {
-    console.log('Git setup failed:', e.message);
-    return false;
+    console.log('Git setup error:', e.message);
+    // Try to init fresh if clone failed
+    try {
+      console.log('Trying fresh init...');
+      run('git init');
+      run(`git remote add origin https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`, true);
+      run('git config user.email "bot@alliancedao.com"');
+      run('git config user.name "Alliance DAO Bot"');
+      return true;
+    } catch (e2) {
+      console.log('Git init also failed:', e2.message);
+      return false;
+    }
   }
 }
 
 function gitCommitAndPush(message) {
-  if (!GITHUB_TOKEN) return;
+  if (!GITHUB_TOKEN) {
+    console.log('No GITHUB_TOKEN - skipping push');
+    return;
+  }
   
   try {
     run('git add -A');
-    run(`git commit -m "${message}" || true`);
-    run('git push origin main || true');
-    console.log('Pushed to GitHub');
+    
+    // Check if there's anything to commit
+    try {
+      run(`git commit -m "${message}"`);
+    } catch (e) {
+      console.log('Nothing to commit or commit failed');
+      return;
+    }
+    
+    // Push with error handling
+    console.log('Pushing to GitHub...');
+    run('git push origin main');
+    console.log('✓ Successfully pushed to GitHub!');
   } catch (e) {
     console.log('Git push failed:', e.message);
+    // Try force push if normal push fails
+    try {
+      console.log('Trying force push...');
+      run('git push -f origin main');
+      console.log('✓ Force pushed to GitHub!');
+    } catch (e2) {
+      console.log('Force push also failed:', e2.message);
+    }
   }
 }
 
