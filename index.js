@@ -51,6 +51,10 @@ function ensureDirs() {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
       console.log(`Created directory: ${dir}`);
+    } else {
+      // List existing files
+      const files = fs.readdirSync(dir);
+      console.log(`Directory ${dir} exists with ${files.length} files`);
     }
   });
 }
@@ -80,38 +84,40 @@ function setupGit() {
   
   console.log('Setting up git for repo: ' + GITHUB_REPO);
   
-  // Always init git if not present
-  if (!fs.existsSync('.git')) {
-    run('git init', true);
+  // Configure git
+  run('git config --global user.email "bot@alliancedao.com"', true);
+  run('git config --global user.name "Alliance DAO Bot"', true);
+  
+  // Remove any existing .git and start fresh
+  if (fs.existsSync('.git')) {
+    console.log('Removing existing .git directory...');
+    fs.rmSync('.git', { recursive: true, force: true });
   }
   
-  // Configure user
-  run('git config user.email "bot@alliancedao.com"');
-  run('git config user.name "Alliance DAO Bot"');
-  
-  // Remove existing origin and add fresh one (hide token from logs)
-  run('git remote remove origin', true);
-  execSync(`git remote add origin ${repoUrl}`, { encoding: 'utf8', stdio: 'pipe' });
-  console.log('> git remote add origin https://***@github.com/' + GITHUB_REPO + '.git');
-  
-  // Fetch and sync with remote
+  // Clone the repo fresh (this gets all existing files)
+  console.log('Cloning repository...');
   try {
-    console.log('Fetching from remote...');
-    execSync('git fetch origin', { encoding: 'utf8', stdio: 'pipe' });
+    execSync(`git clone ${repoUrl} temp_repo`, { encoding: 'utf8', stdio: 'pipe' });
+    console.log('> git clone ***@github.com/' + GITHUB_REPO + '.git temp_repo');
     
-    // Check if main branch exists on remote
-    try {
-      execSync('git checkout main', { encoding: 'utf8', stdio: 'pipe' });
-      execSync('git pull origin main --rebase', { encoding: 'utf8', stdio: 'pipe' });
-      console.log('Synced with remote main branch');
-    } catch (e) {
-      // main branch might not exist yet, create it
-      console.log('Creating main branch...');
-      run('git checkout -b main', true);
+    // Move files from temp to current directory
+    if (fs.existsSync('temp_repo')) {
+      // Copy all files including .git
+      execSync('cp -r temp_repo/. .', { encoding: 'utf8', stdio: 'pipe' });
+      execSync('rm -rf temp_repo', { encoding: 'utf8', stdio: 'pipe' });
+      console.log('Repository cloned and files synced');
     }
   } catch (e) {
-    console.log('No remote data yet (first run) - creating main branch');
+    console.log('Clone failed, initializing new repo...');
+    run('git init', true);
+    execSync(`git remote add origin ${repoUrl}`, { encoding: 'utf8', stdio: 'pipe' });
     run('git checkout -b main', true);
+  }
+  
+  // Verify we have the files
+  if (fs.existsSync('./data/daily')) {
+    const dailyFiles = fs.readdirSync('./data/daily');
+    console.log(`Found ${dailyFiles.length} existing daily files`);
   }
   
   console.log('Git setup complete');
@@ -123,8 +129,6 @@ function gitCommitAndPush(message) {
     console.log('No GITHUB_TOKEN - skipping push');
     return;
   }
-  
-  const repoUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`;
   
   try {
     // Stage all changes
@@ -138,22 +142,14 @@ function gitCommitAndPush(message) {
       return;
     }
     
-    // Pull latest to avoid conflicts (hide token)
-    console.log('Pulling latest changes...');
-    try {
-      execSync('git pull origin main --rebase', { encoding: 'utf8', stdio: 'pipe' });
-    } catch (e) {
-      console.log('Pull failed (might be first push)');
-    }
-    
-    // Push (hide token from logs)
+    // Push
     console.log('Pushing to GitHub...');
     try {
-      execSync('git push -u origin main', { encoding: 'utf8', stdio: 'pipe' });
+      execSync('git push origin main', { encoding: 'utf8', stdio: 'pipe' });
       console.log('✓ Successfully pushed to GitHub!');
     } catch (e) {
       console.log('Normal push failed, trying force push...');
-      execSync('git push -u origin main --force', { encoding: 'utf8', stdio: 'pipe' });
+      execSync('git push origin main --force', { encoding: 'utf8', stdio: 'pipe' });
       console.log('✓ Force pushed to GitHub!');
     }
   } catch (e) {
