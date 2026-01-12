@@ -132,7 +132,7 @@ function gitCommitAndPush(message) {
   
   try {
     // Only stage the data folder, not code files
-    run('git add data/');
+    run('git add -f data/');
     
     // Check if there's anything to commit
     try {
