@@ -1,0 +1,15 @@
+{
+  "name": "skeleton-swap-snapshot",
+  "version": "2.0.0",
+  "description": "Daily/weekly/monthly/yearly snapshots of SkeletonSwap pool data",
+  "main": "index.js",
+  "scripts": {
+    "daily": "node index.js daily",
+    "weekly": "node index.js weekly",
+    "monthly": "node index.js monthly",
+    "yearly": "node index.js yearly",
+    "start": "node index.js daily"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
