@@ -1,0 +1,14 @@
+{
+  "name": "votion-snapshot",
+  "version": "1.0.0",
+  "description": "Capture Votion epoch snapshots for TLA historical data",
+  "main": "votion-snapshot.js",
+  "scripts": {
+    "snapshot": "node votion-snapshot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
