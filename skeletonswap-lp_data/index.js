@@ -252,38 +252,53 @@ async function runDaily() {
     const row = [
       dateStr,
       timeStr,
-      `"${pool.id || ''}"`,
-      pool.address || '',
-      pool.tvl?.usd?.toFixed(2) || '0',
-      pool.volume?.['24h']?.usd?.toFixed(2) || '0',
-      pool.volume?.['7d']?.usd?.toFixed(2) || '0',
-      pool.apr?.['7d']?.toFixed(4) || '0',
-      pool.reserves?.[0]?.amount || '0',
-      pool.reserves?.[1]?.amount || '0',
-      pool.totalShare || '0'
-    ];
-    csv += row.join(',') + '\n';
+      `"${pool.pool_id}"`,
+      pool.pool_address,
+      pool.tvl_usd ?? '',
+      pool.volume_24h_usd ?? '',
+      pool.volume_7d_usd ?? '',
+      pool.apr_7d ?? '',
+      pool.reserve_0 ?? '',
+      pool.reserve_1 ?? '',
+      pool.total_share ?? ''
+    ].join(',');
+    csv += row + '\n';
+    
+    console.log(`  ${pool.pool_id.padEnd(20)} TVL: $${(pool.tvl_usd || 0).toLocaleString().padStart(10)}`);
   }
   
-  // Save daily file to ROOT with day number (day-1.csv through day-7.csv)
+  // Save daily file to ROOT (e.g., ./day-1.csv)
   const filename = `day-${dayNum}.csv`;
-  fs.writeFileSync(filename, csv);
-  console.log(`Saved: ${filename}`);
+  const filepath = `./${filename}`;
+  fs.writeFileSync(filepath, csv);
+  console.log(`\nSaved: ${filepath}`);
   
-  // Also calculate and save 6-day rolling average
-  await calculate6DayAverage();
+  // Save dated backup to month folder (e.g., ./january_backup/2026-01-18.csv)
+  const backupDir = getBackupFolder();
+  if (!fs.existsSync(backupDir)) {
+    fs.mkdirSync(backupDir, { recursive: true });
+    console.log(`Created backup folder: ${backupDir}`);
+  }
+  const backupFile = path.join(backupDir, `${dateStr}.csv`);
+  fs.writeFileSync(backupFile, csv);
+  console.log(`Backup saved: ${backupFile}`);
+  
+  // If it's Saturday (day 6), calculate 6-day rolling average
+  if (dayNum === 6) {
+    await calculate6DayAverage();
+  }
   
   return { pools: pools.length, file: filename };
 }
 
 // =============================================================================
-// 6-DAY ROLLING AVERAGE
+// 6-DAY ROLLING AVERAGE (runs on Saturday)
 // =============================================================================
 
 async function calculate6DayAverage() {
   console.log('\n--- Calculating 6-Day Average ---');
   
-  // Read days 1-6 (excluding day 7 which is the oldest)
+  // Read days 1-6 (Monday-Saturday, excluding Sunday which is oldest)
   const dailyFiles = [];
   for (let day = 1; day <= 6; day++) {
     if (fs.existsSync(`./day-${day}.csv`)) {
