@@ -198,13 +198,17 @@ function parseCSV(content) {
   return rows;
 }
 
-function getWeekNumber(date) {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() + 4 - (d.getDay() || 7));
-  const yearStart = new Date(d.getFullYear(), 0, 1);
-  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-  return weekNo.toString().padStart(2, '0');
+// =============================================================================
+// EPOCH CALCULATION (replaces week number)
+// =============================================================================
+
+// TLA epochs started 2022-10-31 00:00:00 UTC, each epoch is 7 days
+const EPOCH_START = new Date('2022-10-31T00:00:00Z').getTime();
+const EPOCH_DURATION = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
+
+function getEpochNumber(date = new Date()) {
+  const timestamp = date.getTime();
+  return Math.floor((timestamp - EPOCH_START) / EPOCH_DURATION) + 1;
 }
 
 function getDayOfWeek(date) {
@@ -224,9 +228,11 @@ async function runDaily() {
   const dateStr = now.toISOString().split('T')[0];
   const timeStr = now.toISOString().split('T')[1].split('.')[0];
   const dayNum = getDayOfWeek(now);
+  const epoch = getEpochNumber(now);
   
   console.log(`Date: ${dateStr} (Day ${dayNum} of week)`);
-  console.log(`Time: ${timeStr} UTC\n`);
+  console.log(`Time: ${timeStr} UTC`);
+  console.log(`Current Epoch: ${epoch}\n`);
   
   // Fetch API
   console.log('Fetching pool data...');
@@ -246,61 +252,57 @@ async function runDaily() {
     const row = [
       dateStr,
       timeStr,
-      `"${pool.pool_id}"`,
-      pool.pool_address,
-      pool.tvl_usd ?? '',
-      pool.volume_24h_usd ?? '',
-      pool.volume_7d_usd ?? '',
-      pool.apr_7d ?? '',
-      pool.reserve_0 ?? '',
-      pool.reserve_1 ?? '',
-      pool.total_share ?? ''
-    ].join(',');
-    csv += row + '\n';
-    
-    console.log(`  ${pool.pool_id.padEnd(20)} TVL: $${(pool.tvl_usd || 0).toLocaleString().padStart(10)}`);
+      `"${pool.id || ''}"`,
+      pool.address || '',
+      pool.tvl?.usd?.toFixed(2) || '0',
+      pool.volume?.['24h']?.usd?.toFixed(2) || '0',
+      pool.volume?.['7d']?.usd?.toFixed(2) || '0',
+      pool.apr?.['7d']?.toFixed(4) || '0',
+      pool.reserves?.[0]?.amount || '0',
+      pool.reserves?.[1]?.amount || '0',
+      pool.totalShare || '0'
+    ];
+    csv += row.join(',') + '\n';
   }
   
-  // Save daily file to ROOT (e.g., ./day-1.csv)
+  // Save daily file to ROOT with day number (day-1.csv through day-7.csv)
   const filename = `day-${dayNum}.csv`;
-  const filepath = `./${filename}`;
-  fs.writeFileSync(filepath, csv);
-  console.log(`\nSaved: ${filepath}`);
+  fs.writeFileSync(filename, csv);
+  console.log(`Saved: ${filename}`);
   
-  // Save dated backup to month folder (e.g., ./january_backup/2026-01-18.csv)
-  const backupDir = getBackupFolder();
-  if (!fs.existsSync(backupDir)) {
-    fs.mkdirSync(backupDir, { recursive: true });
-    console.log(`Created backup folder: ${backupDir}`);
-  }
-  const backupFile = path.join(backupDir, `${dateStr}.csv`);
-  fs.writeFileSync(backupFile, csv);
-  console.log(`Backup saved: ${backupFile}`);
-  
-  // If it's Saturday (day 6), calculate 6-day rolling average
-  if (dayNum === 6) {
-    console.log('\n--- Calculating 6-day average for epoch snapshot ---');
-    await calculate6DayAverage();
-  }
+  // Also calculate and save 6-day rolling average
+  await calculate6DayAverage();
   
   return { pools: pools.length, file: filename };
 }
 
-// Calculate 6-day rolling average (days 1-6) for epoch snapshots
+// =============================================================================
+// 6-DAY ROLLING AVERAGE
+// =============================================================================
+
 async function calculate6DayAverage() {
-  const poolData = {};
-  let filesFound = 0;
+  console.log('\n--- Calculating 6-Day Average ---');
   
-  // Read days 1-6 from ROOT
+  // Read days 1-6 (excluding day 7 which is the oldest)
+  const dailyFiles = [];
   for (let day = 1; day <= 6; day++) {
-    const dayFile = `./day-${day}.csv`;
-    if (!fs.existsSync(dayFile)) {
-      console.log(`  Warning: day-${day}.csv not found`);
-      continue;
+    if (fs.existsSync(`./day-${day}.csv`)) {
+      dailyFiles.push(`day-${day}.csv`);
     }
-    
-    filesFound++;
-    const content = fs.readFileSync(dayFile, 'utf8');
+  }
+  
+  if (dailyFiles.length === 0) {
+    console.log('  No daily files found yet');
+    return;
+  }
+  
+  console.log(`  Using ${dailyFiles.length} daily files`);
+  
+  // Collect all rows by pool
+  const poolData = {};
+  
+  for (const file of dailyFiles) {
+    const content = fs.readFileSync(`./${file}`, 'utf8');
     const rows = parseCSV(content);
     
     for (const row of rows) {
@@ -326,13 +328,11 @@ async function calculate6DayAverage() {
     }
   }
   
-  console.log(`  Found ${filesFound} daily files for averaging`);
+  // Build aggregated CSV
+  let csv = AGG_HEADERS + '\n';
   
-  // Build 6-day average CSV
   const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   const sum = arr => arr.reduce((a, b) => a + b, 0);
-  
-  let csv = 'period,pool_id,pool_address,avg_tvl_usd,total_volume_usd,avg_apr_7d,avg_reserve_0,avg_reserve_1,avg_total_share,snapshot_count\n';
   
   for (const [poolId, data] of Object.entries(poolData)) {
     const row = [
@@ -358,18 +358,19 @@ async function calculate6DayAverage() {
 }
 
 // =============================================================================
-// WEEKLY AGGREGATION
+// WEEKLY AGGREGATION (NOW USES EPOCH)
 // =============================================================================
 
 async function runWeekly() {
-  console.log('\n========== WEEKLY AGGREGATION ==========\n');
+  console.log('\n========== WEEKLY (EPOCH) AGGREGATION ==========\n');
   
   const now = new Date();
   const year = now.getFullYear();
-  const week = getWeekNumber(now);
-  const periodStr = `${year}-W${week}`;
+  const epoch = getEpochNumber(now);
+  const periodStr = `${year}-epoch-${epoch}`;
   
-  console.log(`Aggregating week: ${periodStr}\n`);
+  console.log(`Aggregating epoch: ${epoch}`);
+  console.log(`Filename: ${periodStr}.csv\n`);
   
   // Read all daily files from ROOT
   const dailyFiles = [];
@@ -459,22 +460,42 @@ async function runMonthly() {
   
   console.log(`Aggregating month: ${periodStr}\n`);
   
-  // Read weekly files for this month
-  const weeklyFiles = fs.readdirSync(DIRS.weeklyAvg).filter(f => f.startsWith(`${year}-W`));
-  console.log(`Found ${weeklyFiles.length} weekly files for ${year}`);
+  // Read epoch files for this year (supports both old W format and new epoch format)
+  const weeklyFiles = fs.readdirSync(DIRS.weeklyAvg).filter(f => 
+    f.startsWith(`${year}-epoch-`) || f.startsWith(`${year}-W`)
+  );
+  console.log(`Found ${weeklyFiles.length} weekly/epoch files for ${year}`);
   
-  // Determine which weeks belong to this month (approximate)
+  // Determine which epochs belong to this month
+  // Calculate epoch range for target month
+  const monthStart = new Date(year, parseInt(month) - 1, 1);
+  const monthEnd = new Date(year, parseInt(month), 0); // Last day of month
+  const epochStart = getEpochNumber(monthStart);
+  const epochEnd = getEpochNumber(monthEnd);
+  
+  console.log(`Month ${month} spans epochs ${epochStart} to ${epochEnd}`);
+  
   const relevantFiles = weeklyFiles.filter(f => {
-    // Parse week number and estimate if it falls in target month
-    const match = f.match(/(\d{4})-W(\d{2})/);
-    if (!match) return false;
-    const weekNum = parseInt(match[2]);
-    // Rough estimate: weeks 1-4 = Jan, 5-8 = Feb, etc.
-    const estMonth = Math.ceil(weekNum / 4.33);
-    return estMonth === parseInt(month);
+    // Try epoch format first
+    const epochMatch = f.match(/(\d{4})-epoch-(\d+)/);
+    if (epochMatch) {
+      const fileEpoch = parseInt(epochMatch[2]);
+      return fileEpoch >= epochStart && fileEpoch <= epochEnd;
+    }
+    
+    // Fall back to old W format
+    const weekMatch = f.match(/(\d{4})-W(\d{2})/);
+    if (weekMatch) {
+      const weekNum = parseInt(weekMatch[2]);
+      // Rough estimate: weeks 1-4 = Jan, 5-8 = Feb, etc.
+      const estMonth = Math.ceil(weekNum / 4.33);
+      return estMonth === parseInt(month);
+    }
+    
+    return false;
   });
   
-  console.log(`Using ${relevantFiles.length} weekly files for ${periodStr}`);
+  console.log(`Using ${relevantFiles.length} files for ${periodStr}`);
   
   // Collect all rows by pool
   const poolData = {};
@@ -634,6 +655,7 @@ async function main() {
   console.log(`║  SkeletonSwap Pool Snapshot            ║`);
   console.log(`║  Mode: ${mode.padEnd(31)}║`);
   console.log(`║  Time: ${new Date().toISOString().padEnd(31)}║`);
+  console.log(`║  Epoch: ${getEpochNumber().toString().padEnd(30)}║`);
   console.log(`╚════════════════════════════════════════╝`);
   
   try {
