@@ -187,11 +187,10 @@ async function captureSnapshot() {
     try { index = await getFileFromGithub(indexPath); } catch(e) { index = null; }
     if (!index) index = { latest: null, daily: {}, history: [] };
 
-    // ── 1. Rolling daily file ───────────────────────────────────────────────
-    const dailyPath = `snapshots/daily/${dayName}.json`;
+    // ── 1. Permanent dated daily file ─────────────────────────────────────
+    const dailyPath = `snapshots/daily/${dateStr}.json`;
     await pushToGithub(dailyPath, JSON.stringify(snapshot, null, 2),
-        `🌕 Backing snapshot ${dayName} (${dateStr})`);
-    index.daily[dayName] = dateStr;
+        `🌕 Backing snapshot ${dateStr}`);
     index.latest = dateStr;
 
     // ── 2. Permanent history entry ──────────────────────────────────────────
