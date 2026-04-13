@@ -1,0 +1,11 @@
+{
+  "name": "ampcapa-snapshot",
+  "version": "1.0.0",
+  "description": "Daily snapshots of ampCAPA DAO member positions with weekly/monthly rollups",
+  "main": "ampcapa-snapshot.js",
+  "scripts": {
+    "start": "node ampcapa-snapshot.js"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
