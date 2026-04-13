@@ -1,0 +1,11 @@
+{
+  "name": "fuel-hourly-snapshot",
+  "version": "1.0.0",
+  "description": "Hourly FUEL price + liquidity + volume snapshots with daily/weekly/monthly rollups",
+  "main": "fuel-hourly-snapshot.js",
+  "scripts": {
+    "start": "node fuel-hourly-snapshot.js"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
