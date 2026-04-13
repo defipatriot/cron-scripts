@@ -1,0 +1,11 @@
+{
+  "name": "backing-snapshot",
+  "version": "1.0.0",
+  "description": "Daily NFT backing-in-LUNA snapshots for live avg daily gain calculation",
+  "main": "backing-snapshot.js",
+  "scripts": {
+    "start": "node backing-snapshot.js"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
