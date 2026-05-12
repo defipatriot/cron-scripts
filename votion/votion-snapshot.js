@@ -81,21 +81,27 @@ const LOCKUPS = [
 ];
 
 // LST hub contracts — same addresses the tool's lstContracts table uses.
-// arbLUNA needs the `{state:{}}` query for its current exchange_rate; ampLUNA
-// returns it in the first entry of `{exchange_rates:{limit:1}}`. The contract
-// addresses are stable and unlikely to change (multi-sig migration would be a
-// protocol-level event we'd notice). Hard-coding them here keeps the cron
-// self-contained — no config repo to keep in sync.
+// Both hubs are queried with `{exchange_rates:{limit:14}}` rather than
+// `{state:{}}` because the history serves DOUBLE DUTY:
+//   1. The current ratio (newest snapshot) drives amount/luna/usd math
+//   2. The full window (oldest → newest snapshot) lets us compute LST APY
+//      via rate-of-change, the same way the tool's _computeLstApyFromRates
+//      does. This costs zero extra HTTP calls vs. the old `{state:{}}`
+//      approach since both Eris hubs accept the same query.
+//
+// Response shapes differ between the two hubs (Eris evolved them at different
+// times):
+//   - ampLUNA hub:      [[unix_ts, "rate_string"], ...]
+//   - arbLUNA arb-vault: [[block_height, {exchange_rate, time_s}], ...]
+// The parsing helpers below normalize both shapes.
 const LST_HUBS = {
     arbLUNA: {
         contract: 'terra1r9gls56glvuc4jedsvc3uwh6vj95mqm9efc7hnweqxa2nlme5cyqxygy5m',
-        query:    { state: {} },
-        parse:    (data) => parseFloat(data?.data?.exchange_rate || 0),
+        query:    { exchange_rates: { limit: 14 } },
     },
     ampLUNA: {
         contract: 'terra10788fkzah89xrdm27zkj5yvhj9x3494lxawzm5qq3vvxcqz2yzaqyd3enk',
-        query:    { exchange_rates: { limit: 1 } },
-        parse:    (data) => parseFloat(data?.data?.exchange_rates?.[0]?.[1] || 0),
+        query:    { exchange_rates: { limit: 14 } },
     },
 };
 
@@ -185,20 +191,87 @@ async function queryContract(contractAddr, queryObj, label) {
 // DATA SOURCES — each returns either a successful payload or throws with context
 // -----------------------------------------------------------------------------
 
-// Fetch LST exchange rates. Two parallel chain queries — independent failure
-// (one can succeed while the other 5xxs). Returns { arbLUNA, ampLUNA, errors }.
+// Normalize an exchange_rates snapshot entry into a { ts, rate } pair.
+// Handles BOTH Eris response shapes (tuple and nested-object). Lifted from
+// the tool's _computeLstApyFromRates helper. Returns null on malformed entry.
+function _extractRateSnapshot(entry) {
+    if (!Array.isArray(entry) || entry.length < 2) return null;
+    const [first, second] = entry;
+    if (typeof second === 'string' || typeof second === 'number') {
+        // amp* shape: [unix_ts, "rate_string"]
+        return { ts: Number(first), rate: parseFloat(second) };
+    }
+    if (second && typeof second === 'object') {
+        // arb-vault shape: [block_height, { exchange_rate, time_s }]
+        return { ts: Number(second.time_s), rate: parseFloat(second.exchange_rate) };
+    }
+    return null;
+}
+
+// Compute LST APR + APY from a history window.
+// Math (same as the tool):
+//   APR (linear):   (r_new/r_old - 1) × (year_sec / span_sec) × 100
+//   APY (compound): ((r_new/r_old) ^ (year_sec/span_sec) - 1) × 100
+//
+// Uses the full span (oldest → newest snapshot in the returned window — typically
+// covering 4-19 days depending on how often the vault calls `harvest`). Adjacent
+// snapshots can be minutes apart and produce noisy rates, so we span the whole
+// window for stability.
+function computeLstApy(rates) {
+    if (!Array.isArray(rates) || rates.length < 2) return null;
+    const newest = _extractRateSnapshot(rates[0]);
+    const oldest = _extractRateSnapshot(rates[rates.length - 1]);
+    if (!newest || !oldest) return null;
+
+    const spanSec = newest.ts - oldest.ts;
+    if (!Number.isFinite(spanSec) || spanSec <= 0) return null;
+    if (!Number.isFinite(newest.rate) || !Number.isFinite(oldest.rate)) return null;
+    if (newest.rate <= 0 || oldest.rate <= 0) return null;
+
+    const yearSec = 365.25 * 86400;
+    const apr = (newest.rate / oldest.rate - 1) * (yearSec / spanSec) * 100;
+    const apy = (Math.pow(newest.rate / oldest.rate, yearSec / spanSec) - 1) * 100;
+    const windowDays = spanSec / 86400;
+    return { apr, apy, windowDays };
+}
+
+// Fetch LST exchange rates + APY history. Two parallel chain queries —
+// independent failure (one can succeed while the other 5xxs). Each query
+// returns BOTH the current ratio and a 14-snapshot history; we extract the
+// ratio from the newest entry and compute APY from the rate-of-change across
+// the full window. Single HTTP call per hub does double duty.
+//
+// Returns: { arbLUNA: { ratio, apr, apy, windowDays }, ampLUNA: {...}, errors }
 async function fetchLstRatios() {
     const result = { arbLUNA: null, ampLUNA: null, errors: {} };
 
     const tasks = Object.entries(LST_HUBS).map(async ([key, cfg]) => {
         try {
             const data = await queryContract(cfg.contract, cfg.query, `LST-${key}`);
-            const rate = cfg.parse(data);
-            if (!Number.isFinite(rate) || rate <= 0) throw new Error(`parsed rate invalid: ${rate}`);
-            result[key] = rate;
+            const rates = data?.data?.exchange_rates;
+            if (!Array.isArray(rates) || rates.length === 0) {
+                throw new Error(`no rates returned: ${JSON.stringify(data).slice(0, 100)}`);
+            }
+
+            // Newest snapshot drives the current ratio
+            const newest = _extractRateSnapshot(rates[0]);
+            if (!newest || !Number.isFinite(newest.rate) || newest.rate <= 0) {
+                throw new Error(`parsed ratio invalid: ${JSON.stringify(rates[0]).slice(0, 100)}`);
+            }
+
+            // Full window drives APY
+            const apyResult = computeLstApy(rates) || {};
+
+            result[key] = {
+                ratio: newest.rate,
+                apr: apyResult.apr ?? null,
+                apy: apyResult.apy ?? null,
+                windowDays: apyResult.windowDays ?? null,
+                snapshotsAvailable: rates.length,
+            };
         } catch (e) {
             result.errors[key] = e.message;
-            console.log(`  ⚠ ${key} ratio fetch failed: ${e.message}`);
+            console.log(`  ⚠ ${key} fetch failed: ${e.message}`);
         }
     });
     await Promise.all(tasks);
@@ -239,10 +312,18 @@ const BUCKET_NAMES = ['stable', 'project', 'bluechip', 'single'];
 
 // Build the rich lockup object from the raw Eris response + ratios + LUNA price.
 // Mirrors the tool's transformation exactly so the output is byte-comparable.
+// `ratios` is the FULL object returned by fetchLstRatios — each entry has
+// { ratio, apr, apy, windowDays, snapshotsAvailable } or is null if that LST
+// hub query failed.
 // Returns null if the lockup has zero VP (no position) — the caller filters
 // these out before adding to the snapshot.
 function buildLockup(lockupConfig, erisData, ratios, lunaPrice) {
-    const ratio = lockupConfig.type === 'arbLUNA' ? ratios.arbLUNA : ratios.ampLUNA;
+    // Pull this lockup's LST data. If the hub query failed, ratioObj is null
+    // and we degrade gracefully: amount/luna/usd math falls back to 0,
+    // lstApy stays 0. The snapshot still captures VP and bucket allocations.
+    const ratioObj = lockupConfig.type === 'arbLUNA' ? ratios.arbLUNA : ratios.ampLUNA;
+    const ratio  = ratioObj?.ratio || 0;
+    const lstApy = ratioObj?.apy   || 0;     // compound APY — what the live tool also uses for the headline number
 
     // VP comes from the first optimization (all 4 buckets report the same
     // total VP — that's the lockup's total, NOT per-bucket allocation).
@@ -256,16 +337,34 @@ function buildLockup(lockupConfig, erisData, ratios, lunaPrice) {
     const luna = amount * (ratio || 0);
     const usd = luna * (lunaPrice || 0);
 
-    // LST APY isn't fetched live in this cron (it'd add 3 more Eris calls and
-    // these APYs barely move week-to-week). Captured as 0; downstream tooling
-    // that needs LST APYs already has them in the live tool's export.
-    // Future TODO: lift fetchAllLstRatiosFromChain's APY computation here too,
-    // since we already have the exchange_rates data for ampLUNA. For now, 0.
-    const lstApy = 0;
     const expectedRewards = erisData.summary?.totalExpectedReward || 0;
-    // Votion APY: weekly rewards annualized over USD value. 52 weeks * 100 for %.
-    // Same formula as the tool. Guard against /0 (no USD value yet).
-    const votionApy = (usd > 0 && expectedRewards > 0) ? (expectedRewards / usd) * 52 * 100 : 0;
+    // Votion APY: two formulas captured. The live tool produces `votionApy`
+    // using the simple formula (weekly × 52); Votion's site displays the
+    // compound formula ((1 + weekly)^52 - 1) under "Total Expected Rewards".
+    // Capturing both means downstream readers don't have to guess which one
+    // a particular UI expects:
+    //   - votionApy:         simple — matches tla-tool_ext.html's lockup.votionApy
+    //   - votionApyCompound: compound — matches Votion site's displayed APY
+    // Difference is ~10pp on max lockups; both are mathematically valid views.
+    //
+    // Guard against /0 (no USD value yet). If usd is 0, the lockup is sub-cent
+    // and the displayed APY is meaningless anyway; both fields default to 0.
+    let votionApy = 0;
+    let votionApyCompound = 0;
+    if (usd > 0 && expectedRewards > 0) {
+        const weeklyYield = expectedRewards / usd;
+        votionApy = weeklyYield * 52 * 100;
+        votionApyCompound = (Math.pow(1 + weeklyYield, 52) - 1) * 100;
+    }
+    // Total lock APY = LST yield (Eris vault appreciation) + Votion vote rewards.
+    // This is the number the live tool surfaces as "lockApy" and Votion's site
+    // shows at the top of each lockup card as "APY". Note: Votion's site uses
+    // Eris's published LST APY (from their own forecast endpoint), which can
+    // differ from our chain-derived APY by 20-30pp because Eris projects
+    // forward including expected restaking. The cron captures the actual
+    // historical rate-of-change from the on-chain exchange_rates window,
+    // which is more conservative but verifiable. We use simple votionApy
+    // here for parity with the tool's lockup.lockApy = lstApy + votionApy.
     const lockApy = lstApy + votionApy;
 
     // Build the bucket array. For each optimization (Eris emits 4 — one per
@@ -319,6 +418,7 @@ function buildLockup(lockupConfig, erisData, ratios, lunaPrice) {
         lockApy,
         lstApy,
         votionApy,
+        votionApyCompound,                          // compound version — matches Votion site's "APY" text
         period:          parseInt(erisData.period) || 0,
         expectedRewards,
         buckets,
@@ -475,8 +575,8 @@ async function captureVotionSnapshot() {
         fetchLstRatios(),
         fetchLunaPriceUsd(),
     ]);
-    console.log(`   arbLUNA ratio: ${ratios.arbLUNA?.toFixed(6) ?? 'FAILED'}`);
-    console.log(`   ampLUNA ratio: ${ratios.ampLUNA?.toFixed(6) ?? 'FAILED'}`);
+    console.log(`   arbLUNA ratio: ${ratios.arbLUNA?.ratio?.toFixed(6) ?? 'FAILED'}  (APY: ${ratios.arbLUNA?.apy?.toFixed(2) ?? '—'}% over ${ratios.arbLUNA?.windowDays?.toFixed(1) ?? '?'}d)`);
+    console.log(`   ampLUNA ratio: ${ratios.ampLUNA?.ratio?.toFixed(6) ?? 'FAILED'}  (APY: ${ratios.ampLUNA?.apy?.toFixed(2) ?? '—'}% over ${ratios.ampLUNA?.windowDays?.toFixed(1) ?? '?'}d)`);
     console.log(`   LUNA price:    $${lunaPriceInfo.price?.toFixed(4) ?? 'FAILED'}`);
 
     // Step 2: sequential (staggered) fetch of all 6 lockups
@@ -535,6 +635,10 @@ async function captureVotionSnapshot() {
         capturedAtUnix: startedAt.getTime(),
         period,
         voteBefore: voteBeforeIso,
+        // ratios now carries the full LST data: current ratio + APR/APY
+        // computed from the exchange_rates window. Same shape the live tool
+        // produces in store.lstRatios. Downstream code that only wants the
+        // bare number reads `.ratio` on each entry.
         ratios: {
             arbLUNA: ratios.arbLUNA,
             ampLUNA: ratios.ampLUNA,
