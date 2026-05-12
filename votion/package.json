@@ -1,7 +1,7 @@
 {
   "name": "votion-snapshot",
-  "version": "1.0.0",
-  "description": "Capture Votion epoch snapshots for TLA historical data",
+  "version": "2.0.0",
+  "description": "Capture Votion epoch snapshots for TLA historical data (v2 rich shape — matches tla-tool_ext.html exports)",
   "main": "votion-snapshot.js",
   "scripts": {
     "snapshot": "node votion-snapshot.js"
