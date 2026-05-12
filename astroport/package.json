@@ -1,0 +1,14 @@
+{
+  "name": "astroport-snapshot",
+  "version": "1.0.0",
+  "description": "Daily Astroport pool snapshot cron for TLA-relevant LPs",
+  "main": "astroport-snapshot.js",
+  "scripts": {
+    "snapshot": "node astroport-snapshot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
