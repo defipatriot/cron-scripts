@@ -1,0 +1,14 @@
+{
+  "name": "network-and-prices",
+  "version": "1.0.0",
+  "description": "Daily Terra network stats + LST ratios + token prices snapshot",
+  "main": "network-and-prices.js",
+  "scripts": {
+    "snapshot": "node network-and-prices.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
