@@ -138,6 +138,13 @@ const MATCH_DIRECT_THRESHOLD_PCT  = 5;    // within ±5% → direct_match
 const MATCH_MINOR_THRESHOLD_PCT   = 25;   // within ±25% → minor_disagreement
                                           // anything beyond → flagged_mismatch
 
+// Cron refresh cadence — Render runs this every hour. The output includes
+// `nextRefreshExpectedAt` so the dashboard can show a countdown timer to next
+// data refresh. Used for "Next update in 47m" displays.
+// Aligns with deving.zones NFT data which also updates hourly.
+const REFRESH_INTERVAL_HOURS = 1;
+const REFRESH_INTERVAL_MS = REFRESH_INTERVAL_HOURS * 60 * 60 * 1000;
+
 // HTTP / GitHub config
 const HTTP_TIMEOUT_MS = 20000;
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
@@ -385,7 +392,10 @@ async function fetchAstroportMetrics() {
     }
 }
 
-// Extract latest price from a token's series array.
+// Extract latest price + full 7-day series from a token's metrics entry.
+// Astroport samples each token's price every 4 hours and exposes the last 7
+// days (~43 points). We preserve the full series so the dashboard can render
+// a 7-day chart without making additional API calls.
 function getAstroportPrice(astroData, chain, address) {
     if (!astroData || !astroData[chain]) return null;
     const tok = astroData[chain][address];
@@ -395,6 +405,10 @@ function getAstroportPrice(astroData, chain, address) {
     const latest = series[series.length - 1];
     const price = Number(latest?.value);
     if (!Number.isFinite(price) || price < 0) return null;
+    // Normalize series to a smaller per-point shape (omit nulls, round timestamps to seconds).
+    const compactSeries = series
+        .filter(p => p && p.value != null && Number.isFinite(Number(p.value)))
+        .map(p => ({ t: Math.round(p.time), v: Number(p.value) }));
     return {
         price_usd: price,
         timestamp: latest.time,
@@ -402,6 +416,8 @@ function getAstroportPrice(astroData, chain, address) {
         volume_raw: tok.volume,
         price_change_24h_pct: tok.priceChange24h != null ? tok.priceChange24h * 100 : null,
         price_change_7d_pct: tok.priceChange7d != null ? tok.priceChange7d * 100 : null,
+        series: compactSeries,
+        series_points: compactSeries.length,
     };
 }
 
@@ -485,6 +501,7 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
         let astroPrice = null;
         let astroChain = null;
         let astroExtra = {};
+        let astroSeries = null;        // 7-day price-history points for charts
         const chainOrder = config.preferChain
             ? [config.preferChain, ...Object.keys(config.astroportAddresses).filter(c => c !== config.preferChain)]
             : Object.keys(config.astroportAddresses);
@@ -499,11 +516,13 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
                     price_change_24h_pct: result.price_change_24h_pct,
                     price_change_7d_pct: result.price_change_7d_pct,
                     timestamp: result.timestamp,
+                    series_points: result.series_points,
                 };
                 if (astroPrice == null) {
                     astroPrice = result.price_usd;
                     astroChain = chain;
                     astroExtra = result;
+                    astroSeries = result.series;
                 }
             }
         }
@@ -533,6 +552,10 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
                     price_change_24h_pct: astroExtra.price_change_24h_pct,
                     price_change_7d_pct: astroExtra.price_change_7d_pct,
                     all_chains: allAstroPrices,   // every chain we found this token on
+                    // 7-day price series at 4-hour resolution (~42 points).
+                    // Schema: [{t: unix_seconds, v: usd_price}, ...]
+                    // Use this to render dashboard charts without extra API calls.
+                    series: astroSeries,
                 } : { available: false },
                 coingecko: cgPrice != null ? {
                     price_usd: cgPrice,
@@ -705,9 +728,17 @@ async function captureNetworkAndPrices() {
     const tokenPrices = assemblePriceTable({ astroData, cgData, lstRatios: ratios.ratios });
 
     const snapshot = {
-        schemaVersion: 2,    // v2 — added dual-source price comparison + match_quality
+        schemaVersion: 2,    // v2 — added dual-source price comparison + match_quality + series + refresh metadata
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
+
+        // Refresh-timing metadata for the dashboard countdown timer.
+        // The cron runs every REFRESH_INTERVAL_HOURS; the dashboard computes
+        // "next update in N minutes" by subtracting now from nextRefreshExpectedAt.
+        // Aligned with deving.zones NFT data which also refreshes hourly.
+        refreshIntervalMs: REFRESH_INTERVAL_MS,
+        refreshIntervalHours: REFRESH_INTERVAL_HOURS,
+        nextRefreshExpectedAt: new Date(startedAt.getTime() + REFRESH_INTERVAL_MS).toISOString(),
 
         sources: {
             terra_lcd:        network  ? { ok: true } : { ok: false, error: networkResult.reason?.message || 'unknown' },
@@ -725,19 +756,32 @@ async function captureNetworkAndPrices() {
 
     const content = JSON.stringify(snapshot, null, 2);
 
+    // Hour-of-day check — the cron now fires every hour, but we only want a
+    // permanent dated archive once per day. Capture the end-of-day snapshot
+    // (23:xx UTC) as the daily archive; other hourly runs only update the
+    // rolling "latest" file. This keeps the GitHub repo clean without losing
+    // historical resolution (intra-day points are preserved in Astroport's
+    // series field within each snapshot).
+    const isEndOfDay = startedAt.getUTCHours() === 23;
+
     if (GITHUB_TOKEN) {
         console.log('\n📤 Publishing to GitHub...');
         await pushToGithub('data/network-and-prices.json', content,
-            `📊 Network & prices v2 — ${dateStr}`);
-        await pushToGithub(`data/daily/${dateStr}.json`, content,
-            `📊 Daily snapshot ${dateStr}`);
+            `📊 Network & prices — ${dateStr} ${startedAt.getUTCHours().toString().padStart(2, '0')}:xx`);
+        if (isEndOfDay) {
+            await pushToGithub(`data/daily/${dateStr}.json`, content,
+                `📊 Daily archive ${dateStr}`);
+            console.log(`  ✓ End-of-day archive written to data/daily/${dateStr}.json`);
+        } else {
+            console.log(`  (skipping daily archive — only written at 23:xx UTC; current hour ${startedAt.getUTCHours()})`);
+        }
     } else {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('network-and-prices.json', content);
         console.log(`  Saved: network-and-prices.json`);
     }
 
-    console.log(`\n✅ Done (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s)\n`);
+    console.log(`\n✅ Done (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s) — next refresh expected ${snapshot.nextRefreshExpectedAt}\n`);
     return snapshot;
 }
 
