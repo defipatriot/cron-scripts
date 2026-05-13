@@ -57,6 +57,17 @@ const BUCKETS = ['stable', 'project', 'bluechip', 'single'];
 // aDAO contracts
 const ADAO_VOTING_CONTRACT = 'terra1c57ur376szdv8rtes6sa9nst4k536dynunksu8tx5zu4z5u3am6qmvqx47';
 
+// aDAO treasury wallet — the aDAO Core contract that holds the DAO's collective TLA positions.
+// Tracked separately from named members so the TLA Stats page can render its "aDAO" tab
+// from treasury data while the Member Stats page renders per-member portfolios.
+const ADAO_TREASURY_WALLETS = [
+    {
+        address: 'terra1sffd4efk2jpdt894r04qwmtjqrrjfc52tmj6vkzjxqhd8qqu2drs3m5vzm',
+        label: 'aDAO Treasury',
+        kind: 'adao_core',
+    },
+];
+
 // External data sources
 const DAODAO_INDEXER_URL = `https://indexer.daodao.zone/phoenix-1/contract/${ADAO_VOTING_CONTRACT}/daoVotingCw721Staked/topStakers`;
 const PFPK_BASE_URL      = 'https://pfpk.daodao.zone/bech32/';
@@ -831,15 +842,30 @@ async function fetchMemberPortfolio(member, ctx) {
                 };
 
                 // user_pct_of_pool = user_lp / pool's total LP token supply
-                // pool's total LP supply lives in pool.lp_health.total_share
+                // pool's total LP supply lives in pool.lp_health.total_share (LP pools)
+                // For single-asset pools, no lp_health exists — use the staking-side denominator
                 if (pool?.lp_health?.total_share) {
                     const totalSupply = parseFloat(pool.lp_health.total_share) || 0;
                     if (totalSupply > 0) {
                         position.user_pct_of_pool = (userLp / totalSupply) * 100;
-                        const depthUsd = pool.depth_usd;
-                        if (depthUsd) {
-                            position.estimated_position_usd = depthUsd * (position.user_pct_of_pool / 100);
-                        }
+                    }
+                }
+                // USD valuation: prefer pool.depth_usd (full DEX TVL), fall back to
+                // staked_in_tla_usd (only what's staked in TLA) when depth_usd unavailable
+                if (position.user_pct_of_pool != null) {
+                    const referenceUsd = pool?.depth_usd ?? pool?.staked_in_tla_usd;
+                    if (referenceUsd) {
+                        position.estimated_position_usd = referenceUsd * (position.user_pct_of_pool / 100);
+                    }
+                }
+                // Single-asset pools: no lp_health — use compounder's total_lp as denominator
+                // and the pool's staked_in_tla_usd as the USD reference
+                if (position.estimated_position_usd == null && !pool?.lp_health) {
+                    const totalLp = parseFloat(entry.total_lp) || 0;
+                    if (totalLp > 0 && pool?.staked_in_tla_usd) {
+                        const compounderShare = userLp / totalLp;
+                        position.user_pct_of_pool = compounderShare * 100;
+                        position.estimated_position_usd = pool.staked_in_tla_usd * compounderShare;
                     }
                 }
 
@@ -1219,6 +1245,32 @@ async function captureSnapshot() {
     const validPortfolios = portfolios.filter(p => p && !p._error);
     console.log(`  ✓ ${validPortfolios.length}/${namedMembers.length} portfolios captured`);
 
+    // Phase 3b: Treasury wallets (aDAO Core + any other tracked DAO addresses).
+    // Tracked alongside members so the TLA Stats page can show treasury-only data.
+    // Uses the same portfolio shape, just tagged with `kind`.
+    console.log(`🏛️  Fetching ${ADAO_TREASURY_WALLETS.length} treasury wallet(s)...`);
+    const treasuryPortfolios = await parallelMap(ADAO_TREASURY_WALLETS, t => {
+        // Reuse fetchMemberPortfolio by passing a member-shaped object
+        return fetchMemberPortfolio({
+            address: t.address,
+            name: t.label,
+            nft_count: 0,
+            vp_pct_of_dao: 0,
+        }, ctx).then(p => {
+            if (p) {
+                p.kind = t.kind;
+                p.is_treasury = true;
+            }
+            return p;
+        });
+    }, BATCH_CONCURRENCY);
+    const validTreasuries = treasuryPortfolios.filter(p => p && !p._error);
+    console.log(`  ✓ ${validTreasuries.length}/${ADAO_TREASURY_WALLETS.length} treasury portfolios captured`);
+    for (const t of validTreasuries) {
+        const s = t.summary || {};
+        console.log(`    ${t.name}: VP ${s.voting_power_human?.toFixed(0)}, LP $${s.total_lp_position_usd?.toFixed(0)}, Locks ${s.lock_count}, Rewards $${s.total_pending_rewards_usd?.toFixed(2)}`);
+    }
+
     // Phase 4: Sort + rank
     validPortfolios.sort((a, b) => (b.voting?.total_voting_power_human || 0) - (a.voting?.total_voting_power_human || 0));
     validPortfolios.forEach((p, i) => { p.rank_by_vp = i + 1; });
@@ -1261,6 +1313,8 @@ async function captureSnapshot() {
             tla_snapshot_captured_at: ctx.tlaSnapshot?.capturedAt || null,
         },
         totals,
+        treasury: validTreasuries.length === 1 ? validTreasuries[0] : null,
+        treasuries: validTreasuries,
         members: validPortfolios,
     };
 
