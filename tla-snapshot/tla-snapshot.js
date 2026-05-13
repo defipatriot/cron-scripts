@@ -174,9 +174,11 @@ async function loadAllInputs(currentEpoch) {
         }),
     ];
 
-    // Votion (epoch-numbered, try current+previous epoch)
+    // Votion (epoch-numbered, try next/current/previous since the votion cron
+    // captures the UPCOMING epoch's optimization data — so when current=184,
+    // the latest votion file is for epoch 185 (the one being voted on right now).
     const votionTask = (async () => {
-        for (const e of [currentEpoch, currentEpoch - 1]) {
+        for (const e of [currentEpoch + 1, currentEpoch, currentEpoch - 1]) {
             try {
                 const data = await fetchJson(`${DATA_REPOS.votionBaseUrl}/votion-epoch-${e}.json`, `votion-${e}`);
                 console.log(`  ✓ votion: loaded epoch ${e}`);
