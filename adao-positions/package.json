@@ -1,0 +1,14 @@
+{
+  "name": "adao-positions-cron",
+  "version": "1.2.0",
+  "description": "Weekly cron capturing TLA portfolio data for named aDAO members",
+  "main": "adao-positions.js",
+  "scripts": {
+    "start": "node adao-positions.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
