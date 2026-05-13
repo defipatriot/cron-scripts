@@ -43,9 +43,10 @@ Each subfolder is one independent Render Cron Job that captures a specific slice
 | [`skeletonswap-lp_data/`](./skeletonswap-lp_data) | Daily Skeleton Swap pool TVL/volume + weekly + monthly rollups | Daily 23:45 | `ss-pool-data_2026` |
 | [`astroport/`](./astroport) | Daily Astroport TLA-pool TVL/volume + per-epoch chart aggregates (active+inactive) | Daily 23:50 | `astroport-pool-data_2026` |
 | [`bribes-history/`](./bribes-history) | All PD bribes decoded from DAODAO proposals + current bribe-manager state | Daily 23:35 | `bribes-data_2026` |
+| [`network-and-prices/`](./network-and-prices) | Terra network + LST ratios + dual-source token prices + 7-day price series | Hourly at :40 | `network-and-prices-data_2026` |
 | [`ampcapa/`](./ampcapa) | ampCAPA-specific data | (legacy) | TBD |
 | [`backing/`](./backing) | Backing-data snapshots | (legacy) | TBD |
-| [`fuel/`](./fuel) | FUEL hourly price | (legacy) | TBD |
+| [`fuel/`](./fuel) | FUEL hourly price | (legacy — kept for hourly candles) | `fuel-data_2026` |
 
 Each subfolder has its own `README.md` with detailed setup, schema, and reliability notes.
 
@@ -56,12 +57,14 @@ Each subfolder has its own `README.md` with detailed setup, schema, and reliabil
 This is the staggered schedule that lets producer crons finish before the consumer cron reads their output. All times in UTC.
 
 ```
-=== Daily flow (Mon-Sat) ===
-23:35  bribes-history       ← producer 1 (chain queries, ~5s)
-23:40  network-and-prices   ← producer 2 (Terra LCD + CoinGecko, ~15s)  [planned]
-23:45  skeletonswap         ← producer 3 (Backbone API, ~20s)
-23:50  astroport            ← producer 4 (Astroport TRPC, ~26s)
-23:58  tla-snapshot         ← consumer (reads all above, ~60s)         [planned]
+=== Hourly throughout the day ===
+:40  network-and-prices  ← refreshes price cache every hour (dashboard reads from here)
+
+=== Daily flow (Mon-Sat) — runs nightly ===
+23:35  bribes-history       ← chain queries, ~5s
+23:45  skeletonswap         ← Backbone API, ~20s
+23:50  astroport            ← Astroport TRPC, ~26s
+23:58  tla-snapshot         ← consumer (reads all above, ~60s)  [planned]
 
 === Sunday (epoch close) — same order plus: ===
 23:55  votion               ← weekly snapshot of full epoch
