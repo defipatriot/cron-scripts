@@ -53,6 +53,70 @@ const TLA_EPOCH_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 // 1% rule — pool is active if its VP is >= this % of its bucket's total VP.
 const ACTIVE_THRESHOLD_PCT = 1.0;
 
+// -----------------------------------------------------------------------------
+// REWARDS MODEL CONSTANTS (Phase B)
+// -----------------------------------------------------------------------------
+//
+// TLA emissions are determined by:
+//   1. Chain inflation (LUNA emitted per year by the Cosmos SDK mint module)
+//   2. Alliance module's "reward_weight" for each Alliance asset
+//   3. Within each bucket, the gauge controller's pool distribution (varies each epoch)
+//
+// Each TLA bucket has a separate Alliance asset (vt token) with a chain-set
+// reward_weight. These weights are governance parameters that change only via
+// on-chain proposals (rare event).
+//
+// Source of truth: Terra block explorer "Alliances" page → Alliance Assets table
+//                  https://chainsco.pe/terra2 or similar
+//                  (LCD endpoints for individual alliance queries are firewalled
+//                   at our LCD provider, so this comes from explorer UI)
+//
+// Calibrated: 2026-05-13
+// To update: visit the Alliance Assets table, find the 4 TLA vt tokens, copy
+//            their reward_weight values into TLA_ALLIANCE_WEIGHTS below.
+//            Health page (when built) will flag if Eris UI drifts from our model.
+//
+// Each TLA bucket's vt token:
+//   stable   factory/terra1ym2495f63mdx63tu96085x2vf3xpy9z9k5urxwhvmf9jldm99q5qr4q6n8/vt   10%
+//   project  factory/terra1x8v9fujf3c78q2we23x0vgzmxgtt0hgvuvfsxy4w3ar9kcua4c6qqcnhyh/vt    5%
+//   bluechip factory/terra16l43xt2uq09yvz4axg73n8rtm0qte9lremdwm6ph0e35r2jnm43qnl8h53/vt    5%
+//   single   factory/terra1u72y7gppxrsncctvgfyqduv3md6pgq77pqhz9rxgwl3dqgye00cq7vmf8u/vt    5%
+//   ───────────────────────────────────────────────────────────────────────────────────────
+//   Total TLA share of Alliance rewards:                                                  25%
+//
+// Other Alliance asset (non-TLA) we observed in screenshot — for awareness only:
+//   factory/terra16st8yfprkdl06kccktshd3p2vccq93xcn9mkhjl8s4jumyjtd4kqye0me5/vt   14%
+//   (unknown protocol — possibly aDAO direct, not TLA)
+//
+const TLA_ALLIANCE_WEIGHTS = {
+    stable:   0.10,
+    project:  0.05,
+    bluechip: 0.05,
+    single:   0.05,
+};
+
+// Calibration constant: TLA's total annual LUNA emission.
+//
+// Derived from Eris UI displayed "Rewards $X/year" per pool, summed across all pools:
+//   Sum of per-pool annual rewards $ = $1,184,056/year  (calibration)
+//   At LUNA $0.067 = 17,672,478 LUNA/year
+//
+// This represents the LUNA emission rate for the TLA bucket's 25% Alliance share.
+// Each cron run multiplies this by the LIVE LUNA price to get current $ value.
+//
+// If Alliance governance changes TLA's overall share (e.g. votes to raise from 25%
+// to 30%), this constant needs updating. Visible signal: Eris UI's total "Rewards"
+// header value diverges meaningfully from our model.
+//
+// Calibrated: 2026-05-13
+const TLA_LUNA_EMISSIONS_PER_YEAR = 17_672_478;
+
+const REWARDS_CALIBRATION_DATE = '2026-05-13';
+
+// Epochs per year (TLA epoch = 1 week, so ~52.18 per year)
+const EPOCHS_PER_YEAR = (365.25 * 24 * 60 * 60 * 1000) / TLA_EPOCH_DURATION_MS;
+
+
 // Hourly refresh
 const REFRESH_INTERVAL_HOURS = 1;
 const REFRESH_INTERVAL_MS = REFRESH_INTERVAL_HOURS * 60 * 60 * 1000;
@@ -325,7 +389,7 @@ async function fetchChainState() {
         queryContract(TLA_STAKING_CONTRACTS.project,  { total_staked_balances: {} }),
         queryContract(TLA_STAKING_CONTRACTS.bluechip, { total_staked_balances: {} }),
         queryContract(TLA_STAKING_CONTRACTS.single,   { total_staked_balances: {} }),
-        queryContract(TLA_GAUGE_CONTROLLER, { distributions: {} }),
+        queryContract(TLA_GAUGE_CONTROLLER, { distributions: { time: "current" } }),
     ]);
 
     const gauges = {
@@ -1122,6 +1186,185 @@ function computeRollups(pools, bucketVps) {
 }
 
 // -----------------------------------------------------------------------------
+// PHASE B: REWARDS MODEL
+// -----------------------------------------------------------------------------
+//
+// Self-contained, pure-math, defensive computation. Reads:
+//   • pools[].bucket
+//   • pools[].gauge_pool_id  (matched against distributions for accuracy)
+//   • pools[].voting_power.pct_of_bucket  (fallback if not in distributions)
+//   • pools[].staked_in_tla_usd
+//   • distributions  (live chain data: pools paying rewards in CURRENT epoch)
+//   • lunaPriceUsd  (live from network-and-prices)
+//
+// Why use chain `distributions` over our own `pct_of_bucket`:
+//   gauge_infos returns "next epoch" votes which may differ slightly from
+//   "current epoch" (which is what Eris's $ figures use). Using distributions
+//   directly avoids that drift and matches Eris exactly.
+//
+// Writes:
+//   • pools[].rewards = { annual_emissions_luna, annual_emissions_usd,
+//                         weekly_emissions_usd, approx_apr_pct,
+//                         distribution_share_of_bucket, bucket_weight }
+//   • byBucket[bucket].rewards = { annual_usd, weekly_usd, bucket_weight }
+//   • totals.rewards = { annual_luna, annual_usd, weekly_usd, calibration }
+//
+// Wrapped in try/catch — any failure leaves snapshot intact without rewards.
+//
+function computeRewards(pools, byBucket, totals, lunaPriceUsd, distributions) {
+    try {
+        // Defensive: need LUNA price to compute USD values
+        if (!lunaPriceUsd || lunaPriceUsd <= 0) {
+            console.warn('  ⚠ Rewards: no LUNA price available, skipping rewards computation');
+            return null;
+        }
+
+        // Build a lookup: gauge_pool_id → distribution_share (from chain's CURRENT epoch)
+        // distributions is a list of { gauge, period, total_gauge_vp, assets: [{ asset, distribution, total_vp }] }
+        // The "asset" object identifies the pool by cw20/native — same shape as gauge_pool_id
+        const chainDistByPoolId = new Map();
+        if (Array.isArray(distributions)) {
+            for (const bucketDist of distributions) {
+                for (const a of (bucketDist.assets || [])) {
+                    // pool_id key matches what's in our gauge_pool_id (e.g. "cw20:terra1..." or "native:factory/...")
+                    const key = a.asset?.cw20 ? `cw20:${a.asset.cw20}`
+                              : a.asset?.native ? `native:${a.asset.native}`
+                              : null;
+                    if (key && a.distribution) {
+                        chainDistByPoolId.set(key, parseFloat(a.distribution));
+                    }
+                }
+            }
+        }
+
+        // Total TLA annual emission (calibrated constant × live LUNA price)
+        const totalAnnualLuna = TLA_LUNA_EMISSIONS_PER_YEAR;
+        const totalAnnualUsd  = totalAnnualLuna * lunaPriceUsd;
+
+        // Per-bucket allocations
+        // TLA_ALLIANCE_WEIGHTS sums to 0.25 (TLA's 25% share of all Alliance rewards).
+        // Within TLA, normalize so they sum to 1.0 — that's each bucket's share OF TLA's emissions.
+        const tlaShareTotal = Object.values(TLA_ALLIANCE_WEIGHTS).reduce((a, b) => a + b, 0);
+        const bucketShareOfTla = {};
+        for (const [bucket, weight] of Object.entries(TLA_ALLIANCE_WEIGHTS)) {
+            bucketShareOfTla[bucket] = weight / tlaShareTotal;
+        }
+
+        // Per-bucket reward $/year and $/week
+        for (const bucket of BUCKETS) {
+            const share = bucketShareOfTla[bucket] || 0;
+            const annualUsd = totalAnnualUsd * share;
+            if (byBucket[bucket]) {
+                byBucket[bucket].rewards = {
+                    bucket_weight_of_tla:        share,
+                    bucket_weight_of_alliance:   TLA_ALLIANCE_WEIGHTS[bucket] || 0,
+                    annual_rewards_usd:          annualUsd,
+                    weekly_rewards_usd:          annualUsd / EPOCHS_PER_YEAR,
+                };
+            }
+        }
+
+        // Per-pool rewards
+        let computedCount = 0;
+        let fromChainDistCount = 0;
+        let fromGaugeInfosCount = 0;
+
+        for (const pool of pools) {
+            try {
+                const bucket = pool.bucket;
+                if (!bucket || !TLA_ALLIANCE_WEIGHTS[bucket]) continue;
+
+                // Prefer chain distributions (current epoch — what Eris uses), fallback to gauge_infos pct
+                let distShare = chainDistByPoolId.get(pool.gauge_pool_id);
+                let distSource;
+                if (distShare != null) {
+                    distSource = 'chain_distributions_current';
+                    fromChainDistCount++;
+                } else {
+                    // Fallback to gauge_infos pct (this pool isn't in distributions — likely below 1%)
+                    const pctOfBucket = pool.voting_power?.pct_of_bucket;
+                    if (pctOfBucket == null || pctOfBucket <= 0) {
+                        // Pool has no VP — no rewards
+                        pool.rewards = {
+                            annual_emissions_luna:        0,
+                            annual_emissions_usd:         0,
+                            weekly_emissions_usd:         0,
+                            approx_apr_pct:               null,
+                            distribution_share_of_bucket: 0,
+                            bucket_weight_of_tla:         bucketShareOfTla[bucket],
+                            source:                       'no_vp',
+                        };
+                        continue;
+                    }
+                    distShare = pctOfBucket / 100;
+                    distSource = 'gauge_infos_next_fallback';
+                    fromGaugeInfosCount++;
+                }
+
+                const bucketShare = bucketShareOfTla[bucket];
+                const annualLuna = totalAnnualLuna * bucketShare * distShare;
+                const annualUsd  = annualLuna * lunaPriceUsd;
+                const weeklyUsd  = annualUsd / EPOCHS_PER_YEAR;
+
+                // APR: rewards / staked × 100. Defensive against zero/null staked.
+                let apr = null;
+                const staked = pool.staked_in_tla_usd;
+                if (staked && staked > 0) {
+                    apr = (annualUsd / staked) * 100;
+                }
+
+                pool.rewards = {
+                    annual_emissions_luna:        annualLuna,
+                    annual_emissions_usd:         annualUsd,
+                    weekly_emissions_usd:         weeklyUsd,
+                    approx_apr_pct:               apr,
+                    distribution_share_of_bucket: distShare,
+                    bucket_weight_of_tla:         bucketShare,
+                    source:                       distSource,
+                };
+                computedCount++;
+            } catch (poolErr) {
+                // If one pool blows up, leave it without rewards and continue
+                console.warn(`  ⚠ Rewards: skipping ${pool.name || pool.gauge_pool_id} (${poolErr.message})`);
+            }
+        }
+
+        // Top-level rewards summary
+        totals.rewards = {
+            annual_emissions_luna: totalAnnualLuna,
+            annual_emissions_usd:  totalAnnualUsd,
+            weekly_emissions_usd:  totalAnnualUsd / EPOCHS_PER_YEAR,
+            luna_price_used:       lunaPriceUsd,
+            pools_with_rewards:    computedCount,
+            pools_from_chain_dist: fromChainDistCount,
+            pools_from_gauge_infos_fallback: fromGaugeInfosCount,
+            calibration: {
+                calibrated_at:   REWARDS_CALIBRATION_DATE,
+                source:          'Terra block explorer Alliance Assets page',
+                tla_alliance_weights: TLA_ALLIANCE_WEIGHTS,
+                tla_total_alliance_share: tlaShareTotal,
+                bucket_share_of_tla:  bucketShareOfTla,
+                _note: 'Update TLA_ALLIANCE_WEIGHTS and TLA_LUNA_EMISSIONS_PER_YEAR constants if Alliance governance changes weights. Health page will flag drift between this model and Eris UI.',
+            },
+        };
+
+        // Log a summary for the cron log
+        console.log(`  ✓ Rewards: $${totalAnnualUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}/year total ` +
+                    `across ${computedCount} pools (${fromChainDistCount} chain-dist, ${fromGaugeInfosCount} fallback)  ` +
+                    `(stable $${(totalAnnualUsd * bucketShareOfTla.stable).toLocaleString('en-US', { maximumFractionDigits: 0 })}, ` +
+                    `project $${(totalAnnualUsd * bucketShareOfTla.project).toLocaleString('en-US', { maximumFractionDigits: 0 })}, ` +
+                    `bluechip $${(totalAnnualUsd * bucketShareOfTla.bluechip).toLocaleString('en-US', { maximumFractionDigits: 0 })}, ` +
+                    `single $${(totalAnnualUsd * bucketShareOfTla.single).toLocaleString('en-US', { maximumFractionDigits: 0 })})`);
+
+        return totals.rewards;
+    } catch (e) {
+        // Top-level guard — if anything goes wrong, leave the snapshot without rewards
+        console.warn(`  ⚠ Rewards computation failed (${e.message}) — snapshot continues without rewards data`);
+        return null;
+    }
+}
+
+// -----------------------------------------------------------------------------
 // GITHUB PUBLISH
 // -----------------------------------------------------------------------------
 
@@ -1267,6 +1510,11 @@ async function captureTlaSnapshot() {
     // Phase 8: rollups
     console.log('📊 Computing rollups...');
     const { totals, byBucket } = computeRollups(pools, catalog.bucketVps);
+
+    // Phase B: rewards model (USD/year per pool, bucket, total)
+    console.log('💰 Computing rewards model...');
+    const lunaPriceUsd = tokenPrices?.LUNA?.final_price_usd || null;
+    computeRewards(pools, byBucket, totals, lunaPriceUsd, chainState.distributions);
 
     // Final assembly
     const snapshot = {
