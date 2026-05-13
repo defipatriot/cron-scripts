@@ -1,0 +1,14 @@
+{
+  "name": "tla-snapshot",
+  "version": "1.0.0",
+  "description": "Hourly unified TLA pool snapshot — consumes all 5 producer crons + live chain queries",
+  "main": "tla-snapshot.js",
+  "scripts": {
+    "snapshot": "node tla-snapshot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
