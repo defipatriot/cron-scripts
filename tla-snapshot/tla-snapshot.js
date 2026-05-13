@@ -532,7 +532,7 @@ async function enrichPool(entry, ctx) {
         try {
             const poolData = await queryContract(resolved.poolAddr, { pool: {} });
             if (poolData && Array.isArray(poolData.assets) && poolData.assets.length >= 2) {
-                lpHealth = buildLpHealth(poolData, tokenPrices);
+                lpHealth = await buildLpHealth(poolData, tokenPrices, ctx.tokenResolver);
             }
         } catch (e) {
             // Skip — pool might be on a chain other than terra (e.g. neutron-only)
@@ -622,32 +622,187 @@ function buildAmpLpInfo(stakedEntry) {
     };
 }
 
-function buildLpHealth(poolData, tokenPrices) {
-    const tokenSymbolFromInfo = (info) => {
-        if (info?.native_token?.denom) return resolveNativeDenom(info.native_token.denom);
-        if (info?.token?.contract_addr) return null;  // cw20 — would need extra lookup
-        return null;
-    };
+// =============================================================================
+// TOKEN RESOLVER — dynamic, on-chain truth
+// =============================================================================
+//
+// Strategy:
+//   • cw20 tokens (terra1...)   → `token_info` query  →  canonical symbol + decimals
+//   • IBC denoms (ibc/HASH...)  → IBC_REGISTRY lookup (hardcoded — see below)
+//   • Native (uluna)            → hardcoded
+//   • Factory (factory/...)     → parse symbol from path, assume 6 decimals
+//
+// Why IBC needs a hardcoded registry: `denom_traces` returns base_denoms in
+// wildly inconsistent formats (`inj`, `ueure`, `0x2260...`, `factory/.../fuel`)
+// that can't be normalized to price-feed symbols without per-token knowledge.
+// Better to be explicit.
+//
+// Why cw20 auto-discovers: cw20s have a canonical `token_info` query that
+// returns `{ symbol, decimals }`. New project tokens added to TLA will work
+// automatically without code changes — this is the common path.
+//
+// Adding a new IBC-bridged token (rare event, e.g. new LST integration):
+//   1. Add entry to IBC_REGISTRY below
+//   2. Add the price source in network-and-prices cron
+//
+// Adding a new cw20 token (common event, e.g. new project votes):
+//   ZERO code changes — token_info query handles it automatically.
+//   Just ensure the price is in network-and-prices (or it'll show $0).
+//
+// Results are cached within a single cron run.
+// =============================================================================
 
-    const assets = poolData.assets;
-    const assetDetails = assets.map(a => {
-        const symbol = tokenSymbolFromInfo(a.info);
-        const amount = parseFloat(a.amount) || 0;
-        // Token decimals registry — critical for correct USD math.
-        // Bridged tokens (PAXG, WBTC, ETH, etc.) have non-6 decimals.
-        const decimals = TOKEN_DECIMALS[symbol] ?? 6;
-        let usdValue = null;
-        let amountHuman = amount / Math.pow(10, decimals);
-        if (symbol && tokenPrices?.[symbol]?.final_price_usd) {
-            const price = tokenPrices[symbol].final_price_usd;
-            usdValue = amountHuman * price;
-            return { symbol, amount_raw: amount, amount_human: amountHuman, decimals, usd_value: usdValue, price_usd: price };
+// IBC token registry — authoritative for IBC-bridged tokens on Terra.
+// Decimals are the TERRA-SIDE decimals (after IBC bridging normalizes them).
+// Most Terra IBC denoms are 6 decimals regardless of source chain.
+// Exception: PAXG, WBTC, ETH, WSTETH, BNB are 18/8 on Terra too.
+const IBC_REGISTRY = {
+    'ibc/2C962DAB9F57FE0921435426AE75196009FAA1981BF86991203C8411F8980FDB':  { symbol: 'USDC',     decimals: 6  },
+    'ibc/9B19062D46CAB50361CE9B0A3E6D0A7A53AC9E7CB361F32A73CC733144A9A9E5':  { symbol: 'USDT',     decimals: 6  },
+    'ibc/88386AC48152D48B34B082648DF836F975506F0B57DBBFC10A54213B1BF484CB':  { symbol: 'WBTC',     decimals: 8  },
+    'ibc/0EF5630576C66968EF0787868CF09FD866FAD131BC148D24A148358A85F0EB62':  { symbol: 'PAXG',     decimals: 18 },
+    'ibc/8D52B251B447B7160421ACFBD50F6B0ABE5F98D2C404B03701130F12044439A1':  { symbol: 'EURE',     decimals: 6  },
+    'ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2':  { symbol: 'ATOM',     decimals: 6  },
+    'ibc/20850C646CDDDC2270E9BBDB08558B5FEE57B647EC6827F41096AABFD8A0471B':  { symbol: 'ETH',      decimals: 18 },
+    'ibc/A356EC90DC3AE43D485514DA7260EDC7ABB5CFAA0654CE2524C739392975AD3C':  { symbol: 'WSTETH',   decimals: 18 },
+    'ibc/1319C6B38CA613C89D78C2D1461B305038B1085F6855E8CD276FE3F7C9600B4C':  { symbol: 'BNB',      decimals: 18 },
+    'ibc/4B44179AC2F0BEE50C16A673B3B886398988692885B2848A1C8AEF27148B3961':  { symbol: 'FUEL',     decimals: 6  },
+    'ibc/B3F639855EE7478750CC8F82072307ED6E131A8EFF20345E1D136B50C4E5EC36':  { symbol: 'ampWHALE', decimals: 6  },
+    'ibc/36A02FFC4E74DF4F64305130C3DFA1B06BEAC775648927AA44467C76A77AB8DB':  { symbol: 'WHALE',    decimals: 6  },
+    // Additions discovered May 2026:
+    'ibc/08095CEDEA29977C9DD0CE9A48329FDA622C183359D5F90CF04CC4FF80CBE431':  { symbol: 'stLUNA',   decimals: 6  },
+    'ibc/8D8A7F7253615E5F76CB6252A1E1BD921D5EDB7BBAAF8913FB1C77FF125D9995':  { symbol: 'ASTRO',    decimals: 6  },
+    'ibc/792AAE6279F4709F66068E29A79E6F16BBC0A9B93561A91FC040606793E62D6B':  { symbol: 'SWTH',     decimals: 8  },
+    'ibc/05D299885B07905B6886F554B39346EA6761246076A1120B1950049B92B922DD':  { symbol: 'WBTC',     decimals: 8  },   // wbtc-satoshi variant
+    'ibc/25BC59386BB65725F735EFC0C369BB717AA8B5DAD846EAF9CBF5D0F18F207211':  { symbol: 'INJ',      decimals: 18 },
+    'ibc/CF57A83CED6CEC7D706631B5DC53ABC21B7EDA7DF7490732B4361E6D5DD19C73':  { symbol: 'WBTC',     decimals: 8  },   // osmo WBTC factory
+    'ibc/223FF539430381ADAB3A66AC4822E253C3F845E9841F17FEEC207B3AA9F8D915':  { symbol: 'dATOM',    decimals: 6  },   // neutron drop ATOM
+    'ibc/BC8A77AFBD872FDC32A348D3FB10CC09277C266CFE52081DE341C7EC6752E674':  { symbol: 'WETH',     decimals: 18 },
+    'ibc/517E13F14A1245D4DE8CF467ADD4DA0058974CDCC880FA6AE536DBCA1D16D84E':  { symbol: 'bWHALE',   decimals: 6  },   // migaloo bone WHALE
+    'ibc/0E90026619DD296AD4EF9546396F292B465BAB6B5BE00ABD6162AA1CE8E68098':  { symbol: 'rSWTH',    decimals: 8  },
+    'ibc/FD9DBF0DB4D301313195159303811FD2FD72185C4B11A51659EFCD49D7FF1228':  { symbol: 'stATOM',   decimals: 6  },
+    // Add new IBC tokens here as TLA adopts them.
+    // Easy to discover the hash: query `gauge_infos` and look at any unfamiliar `ibc/...` entries.
+    // For decimals: most are 6; check the source chain if unsure (ETH/EVM-derived = 18, BTC-derived = 8).
+};
+
+class TokenResolver {
+    constructor(queryContractFn) {
+        this.queryContract = queryContractFn;
+        this.cache = new Map();      // key (denom or cw20:addr) → { symbol, decimals }
+        this.stats = { hits: 0, queries: 0, ibc_known: 0, ibc_unknown: 0, factory: 0, failures: 0 };
+    }
+
+    // Get { symbol, decimals } for a pool asset info object.
+    async resolve(assetInfo) {
+        if (assetInfo?.native_token?.denom) {
+            return await this._resolveDenom(assetInfo.native_token.denom);
         }
-        return { symbol, amount_raw: amount, amount_human: amountHuman, decimals, usd_value: null, price_usd: null };
-    });
+        if (assetInfo?.token?.contract_addr) {
+            return await this._resolveCw20(assetInfo.token.contract_addr);
+        }
+        return { symbol: null, decimals: 6 };
+    }
+
+    async _resolveDenom(denom) {
+        if (this.cache.has(denom)) {
+            this.stats.hits++;
+            return this.cache.get(denom);
+        }
+
+        let result;
+
+        if (denom === 'uluna') {
+            result = { symbol: 'LUNA', decimals: 6 };
+        }
+        else if (denom.startsWith('ibc/')) {
+            if (IBC_REGISTRY[denom]) {
+                result = IBC_REGISTRY[denom];
+                this.stats.ibc_known++;
+            } else {
+                // Unknown IBC — leave as null so it shows up clearly in output
+                result = { symbol: null, decimals: 6, _unknown_ibc: denom };
+                this.stats.ibc_unknown++;
+            }
+        }
+        else if (denom.startsWith('factory/')) {
+            // Factory denoms: factory/<contract>/<symbol or uLP>
+            const parts = denom.split('/');
+            const suffix = parts[parts.length - 1];
+            result = {
+                symbol: suffix === 'uLP' ? null : suffix,
+                decimals: 6,  // Factory tokens on Terra are virtually always 6
+            };
+            this.stats.factory++;
+        }
+        else if (denom.startsWith('u') && denom.length <= 8) {
+            // Cosmos convention (uusd, uatom, uosmo, ueure)
+            result = { symbol: denom.slice(1).toUpperCase(), decimals: 6 };
+        }
+        else {
+            result = { symbol: null, decimals: 6 };
+            this.stats.failures++;
+        }
+
+        this.cache.set(denom, result);
+        return result;
+    }
+
+    async _resolveCw20(contractAddr) {
+        const key = `cw20:${contractAddr}`;
+        if (this.cache.has(key)) {
+            this.stats.hits++;
+            return this.cache.get(key);
+        }
+
+        let result;
+        try {
+            const info = await this.queryContract(contractAddr, { token_info: {} });
+            this.stats.queries++;
+            if (info?.symbol) {
+                result = { symbol: info.symbol, decimals: info.decimals ?? 6 };
+            } else {
+                result = { symbol: null, decimals: 6 };
+                this.stats.failures++;
+            }
+        } catch (e) {
+            result = { symbol: null, decimals: 6, _query_failed: true };
+            this.stats.failures++;
+        }
+
+        this.cache.set(key, result);
+        return result;
+    }
+
+    printStats(logger = console.log) {
+        const s = this.stats;
+        const total = s.hits + s.queries + s.ibc_known + s.ibc_unknown + s.factory;
+        logger(`  Token resolver: ${total} lookups (${s.queries} cw20 queries, ${s.hits} cached, ${s.ibc_known} IBC known, ${s.ibc_unknown} IBC unknown, ${s.factory} factory)`);
+        if (s.ibc_unknown > 0) {
+            const unknowns = [...this.cache.entries()].filter(([k, v]) => v._unknown_ibc).map(([k]) => k);
+            logger(`  ⚠ Unknown IBC denoms (add to IBC_REGISTRY if needed):`);
+            for (const u of unknowns) logger(`    ${u}`);
+        }
+    }
+}
+
+async function buildLpHealth(poolData, tokenPrices, resolver) {
+    const assets = poolData.assets;
+
+    const assetDetails = await Promise.all(assets.map(async (a) => {
+        const { symbol, decimals } = await resolver.resolve(a.info);
+        const amount = parseFloat(a.amount) || 0;
+        const amountHuman = amount / Math.pow(10, decimals);
+        let usdValue = null, priceUsd = null;
+        if (symbol && tokenPrices?.[symbol]?.final_price_usd) {
+            priceUsd = tokenPrices[symbol].final_price_usd;
+            usdValue = amountHuman * priceUsd;
+        }
+        return { symbol, amount_raw: amount, amount_human: amountHuman, decimals, usd_value: usdValue, price_usd: priceUsd };
+    }));
 
     const totalUsd = assetDetails.reduce((s, a) => s + (a.usd_value || 0), 0);
-    const balanceRatio = assetDetails.map(a => totalUsd > 0 ? (a.usd_value / totalUsd) * 100 : null);
+    const balanceRatio = assetDetails.map(a => totalUsd > 0 && a.usd_value != null ? (a.usd_value / totalUsd) * 100 : null);
 
     return {
         asset_0: assetDetails[0],
@@ -656,86 +811,6 @@ function buildLpHealth(poolData, tokenPrices) {
         total_pool_usd: totalUsd > 0 ? totalUsd : null,
         total_share: poolData.total_share,
     };
-}
-
-// Token decimals registry — required for correct USD math.
-// Bridged tokens often have 18 or 8 decimals, not 6.
-// Source: chain queries to each token's `token_info` (cw20) or known IBC mappings.
-const TOKEN_DECIMALS = {
-    // Native Terra (all 6)
-    LUNA:    6,
-    // IBC bridged 18-decimal tokens (ETH-family, EVM-side)
-    PAXG:    18,
-    EURE:    18,
-    ETH:     18,
-    WETH:    18,
-    WSTETH:  18,
-    BNB:     18,
-    WBNB:    18,
-    INJ:     18,
-    // Bitcoin-family
-    WBTC:    8,
-    // Cosmos-family (mostly 6)
-    USDC:    6,
-    USDT:    6,
-    ATOM:    6,
-    OSMO:    6,
-    STLUNA:  6,
-    STATOM:  6,
-    SOLID:   6,
-    SWTH:    8,
-    ROAR:    6,
-    CAPA:    6,
-    // Terra factory tokens / cw20s (default 6 for chain-native LSTs)
-    ampLUNA:  6,
-    arbLUNA:  6,
-    bLUNA:    6,
-    boneLUNA: 6,
-    ampROAR:  6,
-    ampCAPA:  6,
-    xASTRO:   6,
-    ASTRO:    6,
-    FUEL:     6,
-    // WHALE-family
-    WHALE:    6,
-    ampWHALE: 6,
-    boneWHALE: 6,
-};
-
-// Resolve a native denom to a symbol (uluna → LUNA, ibc/... → known IBC tokens, factory/...)
-// For Phase A we use a small inline registry. Phase B can broaden via denom_traces.
-function resolveNativeDenom(denom) {
-    if (denom === 'uluna') return 'LUNA';
-
-    // IBC denoms — from network-and-prices token registry. Add as needed.
-    const IBC_MAP = {
-        'ibc/2C962DAB9F57FE0921435426AE75196009FAA1981BF86991203C8411F8980FDB': 'USDC',
-        'ibc/9B19062D46CAB50361CE9B0A3E6D0A7A53AC9E7CB361F32A73CC733144A9A9E5': 'USDT',
-        'ibc/88386AC48152D48B34B082648DF836F975506F0B57DBBFC10A54213B1BF484CB': 'WBTC',
-        'ibc/0EF5630576C66968EF0787868CF09FD866FAD131BC148D24A148358A85F0EB62': 'PAXG',
-        'ibc/8D52B251B447B7160421ACFBD50F6B0ABE5F98D2C404B03701130F12044439A1': 'EURE',
-        'ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2': 'ATOM',
-        'ibc/20850C646CDDDC2270E9BBDB08558B5FEE57B647EC6827F41096AABFD8A0471B': 'ETH',
-        'ibc/A356EC90DC3AE43D485514DA7260EDC7ABB5CFAA0654CE2524C739392975AD3C': 'WSTETH',
-        'ibc/1319C6B38CA613C89D78C2D1461B305038B1085F6855E8CD276FE3F7C9600B4C': 'BNB',
-        'ibc/4B44179AC2F0BEE50C16A673B3B886398988692885B2848A1C8AEF27148B3961': 'FUEL',
-        'ibc/B3F639855EE7478750CC8F82072307ED6E131A8EFF20345E1D136B50C4E5EC36': 'ampWHALE',
-        'ibc/36A02FFC4E74DF4F64305130C3DFA1B06BEAC775648927AA44467C76A77AB8DB': 'WHALE',
-    };
-    if (IBC_MAP[denom]) return IBC_MAP[denom];
-
-    // Factory denoms — try to extract the symbol from the path
-    if (denom.startsWith('factory/')) {
-        const parts = denom.split('/');
-        const symbol = parts[parts.length - 1];
-        // Common ones we recognize
-        const knownFactorySymbols = ['ampLUNA', 'arbLUNA', 'bLUNA', 'ampCAPA', 'ampROAR', 'xASTRO',
-                                     'CAPA', 'ROAR', 'ASTRO', 'SOLID', 'FUEL', 'SWTH', 'stLUNA'];
-        if (knownFactorySymbols.includes(symbol)) return symbol;
-        return symbol;  // return whatever the suffix is
-    }
-
-    return null;
 }
 
 // -----------------------------------------------------------------------------
@@ -919,12 +994,14 @@ async function captureTlaSnapshot() {
 
     // Phase 4-5: enrich each pool
     console.log('💎 Enriching pools with LP health, ampLP info, USD valuations...');
+    const tokenResolver = new TokenResolver(queryContract);
     const enrichCtx = {
         astroportByPool: catalog.astroportByPool,
         stakedByAssetKey: catalog.stakedByAssetKey,
         ssByAddress,
         tokenPrices,
         lstRatios,
+        tokenResolver,
     };
 
     // Enrich in parallel batches (each does a chain query for LP health)
@@ -936,6 +1013,7 @@ async function captureTlaSnapshot() {
         pools.push(...enriched.filter(Boolean));
     }
     console.log(`  ✓ Enriched ${pools.length} pools`);
+    tokenResolver.printStats(console.log);
 
     // Phase 6: bribes
     console.log('🎁 Attaching bribes...');
