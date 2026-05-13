@@ -1,0 +1,14 @@
+{
+  "name": "bribes-history",
+  "version": "1.0.0",
+  "description": "TLA bribes history capture — every PD bribe ever, plus current chain state",
+  "main": "bribes-history.js",
+  "scripts": {
+    "snapshot": "node bribes-history.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
