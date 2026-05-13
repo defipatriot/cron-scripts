@@ -6,6 +6,18 @@ Daily snapshot of Terra network state, LST exchange rates, and token USD prices 
 
 ---
 
+## Why this cron exists
+
+The dashboard reads this cron's output instead of hitting CoinGecko and Astroport directly. Three reasons:
+
+1. **No per-user API calls to third-party oracles.** A dashboard with 100 visitors stops being 100 CoinGecko hits — it's 100 GitHub CDN reads (free, unlimited, instant).
+2. **Predictable freshness.** Output includes `nextRefreshExpectedAt` so the dashboard shows "next update in 47m" countdown. No mystery about how fresh the data is.
+3. **Rate-limit insulation.** CoinGecko free tier limits per-IP. Centralizing all CG calls to one cron with 24 calls/day stays well within limits forever, even if dashboard traffic spikes.
+
+The cron is intentionally hourly (not every minute, not daily): fresh enough for casual dashboard browsing, infrequent enough to avoid any rate-limit risk, and aligned with deving.zones NFT data so the dashboard countdown can cover both.
+
+---
+
 ## What it captures
 
 ### Network state (Terra LCD)
@@ -121,7 +133,9 @@ Without `GITHUB_TOKEN`, saves locally.
 | Root Directory | `network-and-prices` |
 | Build Command | `npm install` |
 | Command | `node network-and-prices.js` |
-| Schedule | `40 23 * * *` (daily 23:40 UTC) |
+| Schedule | `40 * * * *` (every hour at :40) |
+
+The schedule is hourly so the dashboard's cached prices stay within 1 hour of true. Aligns with deving.zones NFT data (also hourly) so dashboards can show ONE "data refreshes in N minutes" countdown for both data sources.
 
 ### Environment variables
 
