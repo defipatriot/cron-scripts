@@ -494,7 +494,23 @@ async function loadSharedData() {
         console.warn('  ⚠ asset_configs failed — amplified positions may be missed');
     }
 
-    return { tlaSnapshot, tokenPrices, lstRatios, lunaPriceUsd, poolByLpAddr, poolByGaugeId, ampConfigsByGauge };
+    // Fetch zluna hub state — needed for accurate pending-reward pricing.
+    // zluna is a yield-bearing share token; its LUNA-equivalent value is
+    // last_exchange_rate × share_exchange_rate (>1, grows as Alliance rewards accrue).
+    console.log('  ⛓  Fetching zluna hub state...');
+    const zlunaHub = 'terra1u72y7gppxrsncctvgfyqduv3md6pgq77pqhz9rxgwl3dqgye00cq7vmf8u';
+    let zlunaToLunaRatio = 1;  // safe fallback
+    const zlunaState = await queryContract(zlunaHub, { state: {} }).catch(() => null);
+    if (zlunaState?.last_exchange_rate && zlunaState?.share_exchange_rate) {
+        const lastEx = parseFloat(zlunaState.last_exchange_rate);
+        const shareEx = parseFloat(zlunaState.share_exchange_rate);
+        zlunaToLunaRatio = lastEx * shareEx;
+        console.log(`  ✓ zluna → LUNA ratio: ${zlunaToLunaRatio.toFixed(6)} (last_ex=${lastEx.toFixed(4)}, share_ex=${shareEx.toFixed(4)})`);
+    } else {
+        console.warn('  ⚠ zluna hub state unavailable — pending rewards will use 1:1 LUNA assumption');
+    }
+
+    return { tlaSnapshot, tokenPrices, lstRatios, lunaPriceUsd, poolByLpAddr, poolByGaugeId, ampConfigsByGauge, zlunaToLunaRatio };
 }
 
 // -----------------------------------------------------------------------------
@@ -579,19 +595,25 @@ async function resolveTokenPrice(assetInfo, ctx, symbolCache) {
 // Returns { is_amplified: bool, position_type: 'amplified' | 'non_amplified', stake_config_kind: ... }
 function classifyStakeMechanism(entry) {
     const cfg = entry?.config?.stake_config;
-    if (cfg && typeof cfg === 'object' && cfg.astroport) {
-        return {
-            is_amplified: true,
-            position_type: 'amplified',
-            stake_config_kind: 'astroport_incentives',
-            stake_config_detail: cfg.astroport,
-        };
-    }
+    const stakeConfigKind = (cfg && typeof cfg === 'object' && cfg.astroport)
+        ? 'astroport_incentives'
+        : (cfg === 'default' ? 'default' : (typeof cfg === 'string' ? cfg : 'unknown'));
+
+    // Amplification is determined by the STAKED ASSET, not the stake_config.
+    // The asset-compounder mints factory denoms (e.g. factory/<compounder>/N/<gauge>/amplp).
+    // If a user staked a factory token minted by the compounder, the position is amplified.
+    // If they staked a cw20 LP token directly, the position is non-amplified (raw LP).
+    const assetInfo = entry?.asset?.info || {};
+    const nativeDenom = assetInfo.native || '';
+    const cw20Addr = assetInfo.cw20 || '';
+    const isCompounderFactoryDenom = nativeDenom.startsWith(`factory/${TLA_ASSET_COMPOUNDER}/`);
+
     return {
-        is_amplified: false,
-        position_type: 'non_amplified',
-        stake_config_kind: cfg === 'default' ? 'default' : (typeof cfg === 'string' ? cfg : 'unknown'),
-        stake_config_detail: null,
+        is_amplified: isCompounderFactoryDenom,
+        position_type: isCompounderFactoryDenom ? 'amplified' : 'non_amplified',
+        stake_config_kind: stakeConfigKind,
+        stake_config_detail: (cfg && typeof cfg === 'object') ? cfg : null,
+        staked_denom_type: cw20Addr ? 'cw20' : (isCompounderFactoryDenom ? 'compounder_factory' : 'other_native'),
     };
 }
 
@@ -858,14 +880,26 @@ async function fetchMemberPortfolio(member, ctx) {
                         position.estimated_position_usd = referenceUsd * (position.user_pct_of_pool / 100);
                     }
                 }
-                // Single-asset pools: no lp_health — use compounder's total_lp as denominator
-                // and the pool's staked_in_tla_usd as the USD reference
+                // Single-asset amplified pools (e.g. ampCAPA): no lp_health, no depth_usd.
+                // user_lp is the underlying token amount (NOT LP shares). Price it directly
+                // by looking up the pool's symbol in token_prices (most accurate).
                 if (position.estimated_position_usd == null && !pool?.lp_health) {
-                    const totalLp = parseFloat(entry.total_lp) || 0;
-                    if (totalLp > 0 && pool?.staked_in_tla_usd) {
-                        const compounderShare = userLp / totalLp;
-                        position.user_pct_of_pool = compounderShare * 100;
-                        position.estimated_position_usd = pool.staked_in_tla_usd * compounderShare;
+                    const symbol = pool?.name;
+                    const priceUsd = symbol ? ctx.tokenPrices?.[symbol]?.final_price_usd : null;
+                    if (priceUsd) {
+                        position.estimated_position_usd = (userLp / 1e6) * priceUsd;
+                        position.price_source = `token_prices[${symbol}]`;
+                    } else {
+                        // Last-resort fallback: compounder share × pool TLA-staked USD.
+                        // Less accurate because the compounder may be only a portion of
+                        // total stakers in the single bucket — kept only to avoid null USD.
+                        const totalLp = parseFloat(entry.total_lp) || 0;
+                        if (totalLp > 0 && pool?.staked_in_tla_usd) {
+                            const compounderShare = userLp / totalLp;
+                            position.user_pct_of_pool = compounderShare * 100;
+                            position.estimated_position_usd = pool.staked_in_tla_usd * compounderShare;
+                            position.price_source = 'compounder_share_fallback';
+                        }
                     }
                 }
 
@@ -893,7 +927,11 @@ async function fetchMemberPortfolio(member, ctx) {
     }
 
     // ====== Pending rewards ======
+    // Rewards are paid in zluna (Alliance reward shares). 1 zluna ≠ 1 LUNA;
+    // zluna accrues yield over time so its LUNA-equivalent value > 1.
+    // Use the zluna→LUNA ratio fetched at shared-data load time.
     portfolio.pending_rewards = [];
+    const zlunaRatio = ctx.zlunaToLunaRatio || 1;
     for (const { bucket, pending } of stakingResults) {
         for (const entry of pending) {
             try {
@@ -907,8 +945,9 @@ async function fetchMemberPortfolio(member, ctx) {
                                    : rewardInfo?.native ? rewardInfo.native.split('/').pop()
                                    : rewardInfo?.cw20 ? 'cw20' : 'unknown';
 
-                // zluna ≈ LUNA value (it's wrapped Alliance reward LUNA)
-                const lunaEquivalent = rewardAmount / 1e6;
+                const amountHuman = rewardAmount / 1e6;
+                // For zluna: convert to LUNA-equivalent using hub ratio, then to USD
+                const lunaEquivalent = rewardSymbol === 'zluna' ? amountHuman * zlunaRatio : amountHuman;
                 const usdValue = ctx.lunaPriceUsd ? lunaEquivalent * ctx.lunaPriceUsd : null;
 
                 portfolio.pending_rewards.push({
@@ -917,7 +956,7 @@ async function fetchMemberPortfolio(member, ctx) {
                     pool_gauge_id: pool?.gauge_pool_id || null,
                     reward_symbol: rewardSymbol,
                     amount_raw: entry.reward_asset?.amount,
-                    amount_human: lunaEquivalent,
+                    amount_human: amountHuman,
                     luna_equivalent: lunaEquivalent,
                     usd_value: usdValue,
                 });
@@ -958,12 +997,19 @@ async function fetchMemberPortfolio(member, ctx) {
     }
 
     // ====== Pending rebase (gauge controller) ======
+    // Rebase is paid in ampLUNA. Convert ampLUNA → LUNA via LST ratio, then to USD.
     if (pendingRebase) {
         const rebaseAmount = parseFloat(pendingRebase.amount || pendingRebase.rebase || 0) || 0;
+        const amountHuman = rebaseAmount / 1e6;
+        const ampLunaRatio = ctx.lstRatios?.ampLUNA?.ratio || 1;
+        const lunaEquivalent = amountHuman * ampLunaRatio;
+        const usdValue = ctx.lunaPriceUsd ? lunaEquivalent * ctx.lunaPriceUsd : null;
         portfolio.pending_rebase = {
             amount_raw: pendingRebase.amount || pendingRebase.rebase || '0',
-            amount_human: rebaseAmount / 1e6,
-            usd_value: ctx.lunaPriceUsd ? (rebaseAmount / 1e6) * ctx.lunaPriceUsd : null,
+            amount_human: amountHuman,
+            asset_symbol: 'ampLUNA',
+            luna_equivalent: lunaEquivalent,
+            usd_value: usdValue,
             _raw: pendingRebase,  // include raw for debugging shape variations
         };
     } else {
@@ -1021,25 +1067,39 @@ async function fetchMemberPortfolio(member, ctx) {
     }
 
     // ====== Pending bribes ======
+    // Response shape: { start, end, buckets: [{gauge, asset (pool LP), assets: [{info, amount}]}] }
+    // Each bucket represents accrued bribes for ONE pool across epochs (start → end).
+    // The bucket.assets[] array contains the individual reward tokens.
     portfolio.pending_bribes = [];
     const bribeSymbolCache = new Map();
     if (userClaimable?.buckets && Array.isArray(userClaimable.buckets)) {
-        for (const b of userClaimable.buckets) {
-            try {
-                const amount = parseFloat(b.amount) || 0;
-                if (amount === 0) continue;  // Skip zero-balance entries (contract returns them as placeholders)
-                const amountHuman = amount / 1e6;
-                const priceInfo = await resolveTokenPrice(b.asset, ctx, bribeSymbolCache);
-                portfolio.pending_bribes.push({
-                    asset: b.asset,
-                    asset_symbol: priceInfo.symbol,
-                    amount_raw: b.amount,
-                    amount_human: amountHuman,
-                    price_usd: priceInfo.price_usd,
-                    usd_value: priceInfo.price_usd ? amountHuman * priceInfo.price_usd : null,
-                });
-            } catch (e) {
-                portfolio._errors.push(`Bribe parse: ${e.message}`);
+        for (const bucket of userClaimable.buckets) {
+            const poolAssetInfo = bucket.asset;
+            const poolForBucket = poolAssetInfo ? findPoolByAssetInfo(poolAssetInfo, ctx) : null;
+            const rewardAssets = Array.isArray(bucket.assets) ? bucket.assets : [];
+            for (const rewardEntry of rewardAssets) {
+                try {
+                    // rewardEntry shape: { info: {cw20|native}, amount: "..." }
+                    const rawAmount = rewardEntry.amount;
+                    const amount = parseFloat(rawAmount) || 0;
+                    if (amount === 0) continue;
+                    const amountHuman = amount / 1e6;
+                    const rewardAssetInfo = rewardEntry.info;
+                    const priceInfo = await resolveTokenPrice(rewardAssetInfo, ctx, bribeSymbolCache);
+                    portfolio.pending_bribes.push({
+                        gauge: bucket.gauge || null,
+                        pool_name: poolForBucket?.name || null,
+                        pool_gauge_id: poolForBucket?.gauge_pool_id || null,
+                        asset: rewardAssetInfo,
+                        asset_symbol: priceInfo.symbol,
+                        amount_raw: rawAmount,
+                        amount_human: amountHuman,
+                        price_usd: priceInfo.price_usd,
+                        usd_value: priceInfo.price_usd ? amountHuman * priceInfo.price_usd : null,
+                    });
+                } catch (e) {
+                    portfolio._errors.push(`Bribe parse: ${e.message}`);
+                }
             }
         }
     }
@@ -1102,6 +1162,10 @@ function computeMemberSummary(portfolio, ctx) {
 
     return {
         voting_power_human: portfolio.voting.total_voting_power_human,
+        // Display VP = fixed_amount × 10 (the "potential" VP shown in Eris UI).
+        // Use this for headline display to match what users see in Eris.
+        // The voting_power_human field is the actual VP that determines vote weights.
+        display_voting_power_human: portfolio.voting.fixed_amount_human * 10,
         fixed_amount_human: portfolio.voting.fixed_amount_human,
         lock_count: portfolio.locks.length,
         active_lp_position_count: portfolio.lp_positions.filter(p => p.status === 'active').length,
