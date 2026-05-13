@@ -513,14 +513,19 @@ async function enrichPool(entry, ctx) {
         // Single-sided gauges — derive name from denom/symbol
         if (resolved.symbolFromDenom) {
             name = resolved.symbolFromDenom;
-        } else if (resolved.lpDenom?.startsWith('ibc/')) {
-            // Creda case: wBTC.creda.a — IBC denom
-            // Could resolve via denom_traces but for now mark by hash prefix
-            name = 'Single:' + resolved.lpDenom.slice(0, 30);
         } else if (resolved.lpDenom) {
-            name = resolved.lpDenom.slice(0, 30);
+            // Try to resolve the denom to a proper symbol via TokenResolver
+            // (handles IBC → registry, factory → suffix)
+            const tokenInfo = await ctx.tokenResolver.resolve({ native_token: { denom: resolved.lpDenom } });
+            if (tokenInfo?.symbol) {
+                name = tokenInfo.symbol;
+            } else if (resolved.lpDenom.startsWith('ibc/')) {
+                name = 'Single:' + resolved.lpDenom.slice(0, 30);
+            } else {
+                name = resolved.lpDenom.slice(0, 30);
+            }
         }
-        dex = 'Single';  // override below if pool address suggests Creda etc
+        dex = 'Single';
         dexSubtype = 'single';
     }
     // Fallback name from pool_id if all else fails
@@ -532,20 +537,44 @@ async function enrichPool(entry, ctx) {
         try {
             const poolData = await queryContract(resolved.poolAddr, { pool: {} });
             if (poolData && Array.isArray(poolData.assets) && poolData.assets.length >= 2) {
-                lpHealth = await buildLpHealth(poolData, tokenPrices, ctx.tokenResolver);
+                lpHealth = await buildLpHealth(poolData, ctx.priceResolver, ctx.tokenResolver);
+                // Register reserves so price-derivation can use them for other pools
+                if (lpHealth._basics) {
+                    ctx.priceResolver.registerPoolReserves(name, lpHealth._basics[0], lpHealth._basics[1]);
+                    delete lpHealth._basics;  // strip internal field before output
+                }
             }
         } catch (e) {
             // Skip — pool might be on a chain other than terra (e.g. neutron-only)
         }
     }
 
-    // Staked-in-TLA USD value (approximation)
-    // staked_lp_tokens × (lp_pool_total_value / lp_pool_total_share)
+    // Staked-in-TLA USD value calculation — two paths:
+    //   1. LP-pair pools: staked_lp_tokens × (lp_pool_total_value / lp_pool_total_share)
+    //   2. Single-sided pools: staked_token_amount × token_price (no LP math)
     let stakedInTlaUsd = null;
-    if (stakedEntry && lpHealth?.total_pool_usd && lpHealth.total_share) {
-        const stakedLpAmount = parseFloat(stakedEntry.asset.amount);
-        const lpUnitValue = lpHealth.total_pool_usd / parseFloat(lpHealth.total_share);
-        stakedInTlaUsd = stakedLpAmount * lpUnitValue;
+    if (stakedEntry) {
+        if (lpHealth?.total_pool_usd && lpHealth.total_share) {
+            // LP-pair path
+            const stakedLpAmount = parseFloat(stakedEntry.asset.amount);
+            const lpUnitValue = lpHealth.total_pool_usd / parseFloat(lpHealth.total_share);
+            stakedInTlaUsd = stakedLpAmount * lpUnitValue;
+        } else if (resolved.isSingle) {
+            // Single-sided path: query token decimals + price
+            // For factory tokens, the symbol is at the end of the denom path
+            const denom = resolved.lpDenom;
+            if (denom) {
+                const tokenInfo = await ctx.tokenResolver.resolve({ native_token: { denom } });
+                if (tokenInfo.symbol) {
+                    const priceInfo = ctx.priceResolver.resolvePrice(tokenInfo.symbol);
+                    if (priceInfo.price) {
+                        const rawAmount = parseFloat(stakedEntry.asset.amount);
+                        const humanAmount = rawAmount / Math.pow(10, tokenInfo.decimals);
+                        stakedInTlaUsd = humanAmount * priceInfo.price;
+                    }
+                }
+            }
+        }
     }
 
     // Pool depth (Astroport TVL or SS TVL)
@@ -681,6 +710,7 @@ const IBC_REGISTRY = {
     'ibc/517E13F14A1245D4DE8CF467ADD4DA0058974CDCC880FA6AE536DBCA1D16D84E':  { symbol: 'bWHALE',   decimals: 6  },   // migaloo bone WHALE
     'ibc/0E90026619DD296AD4EF9546396F292B465BAB6B5BE00ABD6162AA1CE8E68098':  { symbol: 'rSWTH',    decimals: 8  },
     'ibc/FD9DBF0DB4D301313195159303811FD2FD72185C4B11A51659EFCD49D7FF1228':  { symbol: 'stATOM',   decimals: 6  },
+    'ibc/65B3EB6263482979FD7A80E3FFB9D0C85CFBF6DB63EB8DDE918B2984A40CEAB6':  { symbol: 'xASTRO',   decimals: 6  },   // Neutron channel-229
     // Add new IBC tokens here as TLA adopts them.
     // Easy to discover the hash: query `gauge_infos` and look at any unfamiliar `ibc/...` entries.
     // For decimals: most are 6; check the source chain if unsure (ETH/EVM-derived = 18, BTC-derived = 8).
@@ -786,20 +816,185 @@ class TokenResolver {
     }
 }
 
-async function buildLpHealth(poolData, tokenPrices, resolver) {
+// =============================================================================
+// PRICE RESOLVER — fully-auto multi-stage price discovery
+// =============================================================================
+//
+// Resolution chain (priority order, first hit wins):
+//
+//   1. DIRECT          — network-and-prices.token_prices[SYMBOL]
+//      The best case: token has an authoritative external price source.
+//
+//   2. LST RATIO       — network-and-prices.lst_ratios[SYMBOL]
+//      For LSTs (ampLUNA, arbLUNA, bLUNA, ampROAR, ampCAPA, xASTRO, etc.):
+//      derived_price = on-chain hub ratio × price(base_token)
+//      Example: arbLUNA = 2.907 × LUNA_price
+//      Recurses through base_token resolution.
+//
+//   3. POOL-DERIVED    — find a TLA pool containing this token paired with
+//      a token we CAN price; compute price from reserves ratio.
+//      Example: FUEL price = (LUNA_amount × LUNA_price) / FUEL_amount
+//      This makes the cron self-sufficient for any new token added to TLA.
+//
+//   4. UNKNOWN — return null, log warning.
+//
+// This means adding a new token to TLA requires ZERO code changes — the
+// cron auto-discovers symbol+decimals (cw20 token_info), then auto-derives
+// price from the pool itself if it's not in network-and-prices.
+// =============================================================================
+
+class PriceResolver {
+    constructor(tokenPrices, lstRatios) {
+        // Build case-insensitive index — TLA tokens come in mixed case
+        // (e.g. chain says "stLUNA", network-and-prices stores "STLUNA")
+        this.tokenPrices = tokenPrices || {};
+        this.lstRatios = lstRatios || {};
+        this.priceByLower = new Map();
+        for (const [k, v] of Object.entries(this.tokenPrices)) {
+            this.priceByLower.set(k.toLowerCase(), v);
+        }
+        this.lstByLower = new Map();
+        for (const [k, v] of Object.entries(this.lstRatios)) {
+            this.lstByLower.set(k.toLowerCase(), { ...v, _key: k });
+        }
+        this.derivedFromPool = new Map();
+        this.poolReserves = [];
+        this.cache = new Map();
+        this.stats = { direct: 0, lst: 0, pool_derived: 0, failed: 0 };
+    }
+
+    // Register a pool's reserves so we can use it for price derivation later.
+    registerPoolReserves(poolName, asset0, asset1) {
+        if (!asset0 || !asset1 || !asset0.symbol || !asset1.symbol) return;
+        if (!asset0.amount_human || !asset1.amount_human) return;
+        this.poolReserves.push({
+            pool_name: poolName,
+            sym_0: asset0.symbol, amt_0: asset0.amount_human,
+            sym_1: asset1.symbol, amt_1: asset1.amount_human,
+        });
+    }
+
+    // Get USD price for a symbol. Case-insensitive lookup.
+    resolvePrice(symbol, _recursionDepth = 0) {
+        if (!symbol) return { price: null, source: 'no_symbol' };
+        if (_recursionDepth > 3) return { price: null, source: 'recursion_limit' };
+
+        const symLower = symbol.toLowerCase();
+        if (this.cache.has(symLower)) {
+            return this.cache.get(symLower);
+        }
+
+        let result;
+
+        // Stage 1: DIRECT lookup (case-insensitive)
+        const directEntry = this.priceByLower.get(symLower);
+        if (directEntry?.final_price_usd && directEntry.final_price_usd > 0) {
+            result = { price: directEntry.final_price_usd, source: 'direct' };
+            this.stats.direct++;
+            this.cache.set(symLower, result);
+            return result;
+        }
+
+        // Stage 2: LST RATIO (case-insensitive)
+        const lstEntry = this.lstByLower.get(symLower);
+        if (lstEntry?.ratio && lstEntry?.base_token) {
+            const base = this.resolvePrice(lstEntry.base_token, _recursionDepth + 1);
+            if (base.price) {
+                const derivedPrice = lstEntry.ratio * base.price;
+                result = {
+                    price: derivedPrice,
+                    source: `lst_ratio:${lstEntry.base_token}×${lstEntry.ratio.toFixed(4)}`,
+                };
+                this.stats.lst++;
+                this.cache.set(symLower, result);
+                return result;
+            }
+        }
+        if (lstEntry?.xastro_usd) {
+            result = { price: lstEntry.xastro_usd, source: 'lst_explicit' };
+            this.stats.direct++;
+            this.cache.set(symLower, result);
+            return result;
+        }
+
+        // Stage 3: POOL-DERIVED
+        // Important: skip pools where BOTH sides are tokens with no other price source
+        // to avoid circular derivation (e.g. deriving stLUNA from LUNA-stLUNA when
+        // stLUNA appears only in that pool).
+        for (const pool of this.poolReserves) {
+            let pairedSym, pairedAmt, thisAmt;
+            if (pool.sym_0?.toLowerCase() === symLower && pool.sym_1?.toLowerCase() !== symLower) {
+                thisAmt = pool.amt_0; pairedSym = pool.sym_1; pairedAmt = pool.amt_1;
+            } else if (pool.sym_1?.toLowerCase() === symLower && pool.sym_0?.toLowerCase() !== symLower) {
+                thisAmt = pool.amt_1; pairedSym = pool.sym_0; pairedAmt = pool.amt_0;
+            } else continue;
+
+            if (!thisAmt || thisAmt === 0) continue;
+
+            const pairedPrice = this.resolvePrice(pairedSym, _recursionDepth + 1);
+            // Only trust pool-derivation if the paired token is DIRECTLY priced
+            // (not transitively via another pool, which can create chains of error)
+            if (pairedPrice.price && pairedPrice.source === 'direct') {
+                const derivedPrice = (pairedAmt * pairedPrice.price) / thisAmt;
+                result = {
+                    price: derivedPrice,
+                    source: `pool_derived:${pool.pool_name}(${pairedSym})`,
+                };
+                this.stats.pool_derived++;
+                this.cache.set(symLower, result);
+                return result;
+            }
+        }
+
+        result = { price: null, source: 'unknown' };
+        this.stats.failed++;
+        this.cache.set(symLower, result);
+        return result;
+    }
+
+    printStats(logger = console.log) {
+        const s = this.stats;
+        logger(`  Price resolver: ${s.direct} direct, ${s.lst} via LST ratio, ${s.pool_derived} pool-derived, ${s.failed} failed`);
+        if (s.pool_derived > 0) {
+            const derived = [...this.cache.entries()].filter(([_, v]) => v.source.startsWith('pool_derived'));
+            for (const [sym, info] of derived) {
+                logger(`    ✓ ${sym}: ${info.source} → $${info.price.toFixed(6)}`);
+            }
+        }
+        if (s.lst > 0) {
+            const lstDerived = [...this.cache.entries()].filter(([_, v]) => v.source.startsWith('lst_ratio'));
+            for (const [sym, info] of lstDerived) {
+                logger(`    ✓ ${sym}: ${info.source} → $${info.price.toFixed(6)}`);
+            }
+        }
+    }
+}
+
+async function buildLpHealth(poolData, priceResolver, resolver) {
     const assets = poolData.assets;
 
-    const assetDetails = await Promise.all(assets.map(async (a) => {
+    // First pass — resolve symbols + decimals + amounts (no prices yet)
+    const assetBasics = await Promise.all(assets.map(async (a) => {
         const { symbol, decimals } = await resolver.resolve(a.info);
         const amount = parseFloat(a.amount) || 0;
         const amountHuman = amount / Math.pow(10, decimals);
-        let usdValue = null, priceUsd = null;
-        if (symbol && tokenPrices?.[symbol]?.final_price_usd) {
-            priceUsd = tokenPrices[symbol].final_price_usd;
-            usdValue = amountHuman * priceUsd;
-        }
-        return { symbol, amount_raw: amount, amount_human: amountHuman, decimals, usd_value: usdValue, price_usd: priceUsd };
+        return { symbol, amount_raw: amount, amount_human: amountHuman, decimals };
     }));
+
+    // Second pass — apply prices (might use info from this pool's other side)
+    const assetDetails = assetBasics.map(b => {
+        const { price, source } = priceResolver.resolvePrice(b.symbol);
+        const usdValue = (price && b.amount_human) ? b.amount_human * price : null;
+        return {
+            symbol: b.symbol,
+            amount_raw: b.amount_raw,
+            amount_human: b.amount_human,
+            decimals: b.decimals,
+            usd_value: usdValue,
+            price_usd: price,
+            price_source: source,
+        };
+    });
 
     const totalUsd = assetDetails.reduce((s, a) => s + (a.usd_value || 0), 0);
     const balanceRatio = assetDetails.map(a => totalUsd > 0 && a.usd_value != null ? (a.usd_value / totalUsd) * 100 : null);
@@ -810,6 +1005,7 @@ async function buildLpHealth(poolData, tokenPrices, resolver) {
         balance_ratio_pct: balanceRatio,
         total_pool_usd: totalUsd > 0 ? totalUsd : null,
         total_share: poolData.total_share,
+        _basics: assetBasics,  // expose for pool-derived registration
     };
 }
 
@@ -995,6 +1191,7 @@ async function captureTlaSnapshot() {
     // Phase 4-5: enrich each pool
     console.log('💎 Enriching pools with LP health, ampLP info, USD valuations...');
     const tokenResolver = new TokenResolver(queryContract);
+    const priceResolver = new PriceResolver(tokenPrices, lstRatios);
     const enrichCtx = {
         astroportByPool: catalog.astroportByPool,
         stakedByAssetKey: catalog.stakedByAssetKey,
@@ -1002,18 +1199,62 @@ async function captureTlaSnapshot() {
         tokenPrices,
         lstRatios,
         tokenResolver,
+        priceResolver,
     };
 
-    // Enrich in parallel batches (each does a chain query for LP health)
-    const pools = [];
+    // ── PASS 1 — enrich all pools (this populates priceResolver.poolReserves) ──
+    // During this pass, pool-derived prices CANNOT yet help — they only become
+    // available after all pools have registered their reserves.
+    let pools = [];
     const BATCH = 6;
     for (let i = 0; i < catalog.resolved.length; i += BATCH) {
         const batch = catalog.resolved.slice(i, i + BATCH);
         const enriched = await Promise.all(batch.map(e => enrichPool(e, enrichCtx)));
         pools.push(...enriched.filter(Boolean));
     }
-    console.log(`  ✓ Enriched ${pools.length} pools`);
+    console.log(`  ✓ Pass 1: enriched ${pools.length} pools (discovering reserves)`);
+
+    // ── PASS 2 — re-enrich pools that had unpriced sides ──
+    // Now that priceResolver has all pool reserves, it can derive prices for
+    // tokens whose only source was the pool they live in (e.g. FUEL via LUNA-FUEL).
+    // We clear priceResolver's cache so the new pool-derived path is consulted.
+    priceResolver.cache.clear();
+    priceResolver.stats = { direct: 0, lst: 0, pool_derived: 0, failed: 0 };
+
+    // Find pools that had at least one null-priced asset OR null TVL — those need re-run
+    const needsRefresh = pools.filter(p => {
+        if (p.staked_in_tla_usd == null && p.sources?.in_staking_contract) return true;
+        if (p.lp_health) {
+            const a0 = p.lp_health.asset_0;
+            const a1 = p.lp_health.asset_1;
+            if ((a0?.symbol && a0?.usd_value == null) || (a1?.symbol && a1?.usd_value == null)) return true;
+        }
+        return false;
+    });
+    console.log(`  Pass 2: re-enriching ${needsRefresh.length} pools that need price derivation...`);
+
+    // Re-enrich just those pools (by reconstructing their resolved entries)
+    if (needsRefresh.length > 0) {
+        const poolNamesToRefresh = new Set(needsRefresh.map(p => p.name + '|' + (p.dex || '')));
+        const entriesToRefresh = catalog.resolved.filter(e => {
+            // We need to find the matching entry; easiest match is via the gauge_pool_id
+            return needsRefresh.some(p => p.gauge_pool_id === e.poolId);
+        });
+        const refreshed = [];
+        for (let i = 0; i < entriesToRefresh.length; i += BATCH) {
+            const batch = entriesToRefresh.slice(i, i + BATCH);
+            const enriched = await Promise.all(batch.map(e => enrichPool(e, enrichCtx)));
+            refreshed.push(...enriched.filter(Boolean));
+        }
+        // Replace the corresponding pool entries
+        for (const refreshedPool of refreshed) {
+            const idx = pools.findIndex(p => p.gauge_pool_id === refreshedPool.gauge_pool_id);
+            if (idx >= 0) pools[idx] = refreshedPool;
+        }
+    }
+
     tokenResolver.printStats(console.log);
+    priceResolver.printStats(console.log);
 
     // Phase 6: bribes
     console.log('🎁 Attaching bribes...');
