@@ -1406,6 +1406,26 @@ async function captureSnapshot() {
         console.log(`  ✓ Published data/current.json`);
         await publishFile(archivePath, portfoliosContent, `archive epoch ${epochInfo.number}`);
         console.log(`  ✓ Published ${archivePath}`);
+
+        // Heartbeat — uniform freshness contract across all crons
+        const heartbeat = {
+            schemaVersion: 1,
+            cron: 'adao-positions',
+            capturedAt: startedAt.toISOString(),
+            capturedAtUnix: startedAt.getTime(),
+            runId: `adao-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'weekly',
+            currentEpoch: epochInfo.number,
+            status: 'ok',
+            stats: {
+                members_count: validPortfolios.length,
+                treasury_present: !!portfoliosDoc.treasury,
+            },
+            next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        };
+        await publishFile('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
+            `📍 aDAO positions heartbeat — epoch ${epochInfo.number}`);
+        console.log(`  ✓ Published data/heartbeat.json`);
     }
 
     const elapsed = (Date.now() - startedAt.getTime()) / 1000;
