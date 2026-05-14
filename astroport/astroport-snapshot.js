@@ -451,16 +451,130 @@ function csvEscape(s) {
     return s;
 }
 
-function buildDailyCsv(poolsData) {
-    const header = 'pool,bucket,pool_type,pool_address,astroport_tvl_usd,astroport_day_volume_usd,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok';
+// Parse a CSV string into an array of row objects keyed by header.
+function parseCsv(content) {
+    const lines = content.trim().split('\n');
+    if (lines.length < 2) return [];
+    const headers = lines[0].split(',');
+    return lines.slice(1).map(line => {
+        // Simple parser — assumes no commas inside quoted fields (CSV builder uses csvEscape only when needed)
+        const values = line.split(',');
+        const row = {};
+        headers.forEach((h, i) => {
+            let v = values[i] || '';
+            v = v.replace(/^"|"$/g, '');
+            row[h.trim()] = v;
+        });
+        return row;
+    });
+}
+
+// Fetch a file from this cron's GitHub data repo via raw.githubusercontent.com.
+// Returns the text content or null if 404/unreachable.
+function fetchRawFromRepo(repoPath) {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${repoPath}`;
+        https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+                resolve(null);
+                return;
+            }
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => resolve(body));
+        }).on('error', () => resolve(null));
+    });
+}
+
+// Embedded data-quality metadata for aggregate CSVs.
+// 'filesUsed' = how many input snapshots actually had data; 'expected' = ideal count.
+function computeAggMetadata(filesUsed, expected, dates) {
+    const sorted = (dates || []).filter(Boolean).sort();
+    return {
+        period_start: sorted[0] || '',
+        period_end:   sorted[sorted.length - 1] || '',
+        snapshots_used: filesUsed,
+        snapshots_expected: expected,
+        has_gaps: filesUsed < expected,
+    };
+}
+
+// Build the rolling 6-day-avg CSV from past daily snapshots.
+// Aggregates by pool_name: TVL → avg, volume_24h_usd → sum.
+async function buildSixDayAvgCsv(todayDate) {
+    // Look back 6 calendar days from today (exclusive) and fetch each daily file from GitHub.
+    const filesToTry = [];
+    const today = new Date(todayDate + 'T00:00:00Z');
+    for (let i = 6; i >= 1; i--) {
+        const d = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
+        filesToTry.push(d.toISOString().slice(0, 10));
+    }
+
+    const poolAgg = {};   // poolName → { pool_address, tvl: [], volume: [], dates: [] }
+    const datesUsed = [];
+
+    for (const date of filesToTry) {
+        const content = await fetchRawFromRepo(`data/daily/${date}.csv`);
+        if (!content) continue;
+        datesUsed.push(date);
+        const rows = parseCsv(content);
+        for (const row of rows) {
+            const name = row.pool_name || row.pool;  // legacy fallback
+            if (!name) continue;
+            if (!poolAgg[name]) {
+                poolAgg[name] = {
+                    pool_address: row.pool_address || '',
+                    bucket: row.bucket || '',
+                    tvl: [],
+                    volume: [],
+                };
+            }
+            const tvl = parseFloat(row.tvl_usd || row.astroport_tvl_usd || 0);
+            const vol = parseFloat(row.volume_24h_usd || row.astroport_day_volume_usd || 0);
+            if (tvl) poolAgg[name].tvl.push(tvl);
+            if (vol) poolAgg[name].volume.push(vol);
+        }
+    }
+
+    const meta = computeAggMetadata(datesUsed.length, 6, datesUsed);
+    const header = 'period,period_start,period_end,snapshots_used,snapshots_expected,has_gaps,dex,pool_name,pool_address,bucket,avg_tvl_usd,total_volume_usd,snapshot_count';
+    const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+    const sum = a => a.reduce((x, y) => x + y, 0);
+    const rows = Object.entries(poolAgg).map(([name, data]) => [
+        '6-day-avg',
+        meta.period_start,
+        meta.period_end,
+        meta.snapshots_used,
+        meta.snapshots_expected,
+        meta.has_gaps,
+        'astroport',
+        csvEscape(name),
+        data.pool_address,
+        data.bucket,
+        avg(data.tvl).toFixed(2),
+        sum(data.volume).toFixed(2),
+        data.tvl.length,
+    ].join(','));
+    return { csv: [header, ...rows].join('\n') + '\n', meta };
+}
+
+function buildDailyCsv(poolsData, captureDate, captureTime) {
+    // Unified daily CSV schema — common prefix matches Skeleton Swap for cross-DEX consumption:
+    //   date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd
+    // Astroport-specific extras after: bucket,pool_type,is_amplified,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok
+    const header = 'date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd,bucket,pool_type,is_amplified,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok';
     const rows = poolsData.map(p => {
         return [
+            captureDate,
+            captureTime,
+            'astroport',
             csvEscape(p.name),
-            p.bucket || '',
-            p.poolType || '',
             p.poolContract,
             (p.astroportTvlUsd || 0).toFixed(2),
             (p.astroportDayVolumeUsd || 0).toFixed(2),
+            p.bucket || '',
+            p.poolType || '',
+            p.isAmplified ? 'true' : 'false',
             (p.latestLiquidity || 0).toFixed(2),
             p.latestEpoch ?? '',
             p.deprecated ? 'true' : 'false',
@@ -471,14 +585,23 @@ function buildDailyCsv(poolsData) {
     return [header, ...rows].join('\n') + '\n';
 }
 
-function buildWeeklyCsv(poolsData) {
-    const header = 'pool,bucket,pool_address,epoch,avg_liquidity_usd,total_volume_usd,liq_points,vol_points,tier,deprecated';
+function buildWeeklyCsv(poolsData, meta) {
+    // Aggregate CSV schema with embedded data-quality metadata.
+    // Mirrors SkeletonSwap's AGG_HEADERS structure.
+    const header = 'period,period_start,period_end,snapshots_used,snapshots_expected,has_gaps,dex,pool_name,pool_address,bucket,epoch,avg_liquidity_usd,total_volume_usd,liq_points,vol_points,tier,deprecated';
     const rows = poolsData.map(p => {
         const lce = pickLastCompleteEpoch(p.epochs) || {};
         return [
+            `2026-epoch-${lce.epoch || meta.period}`,
+            meta.period_start || '',
+            meta.period_end || '',
+            meta.snapshots_used,
+            meta.snapshots_expected,
+            meta.has_gaps,
+            'astroport',
             csvEscape(p.name),
-            p.bucket || '',
             p.poolContract,
+            p.bucket || '',
             lce.epoch ?? '',
             (lce.avgLiquidity || 0).toFixed(2),
             (lce.totalVolume || 0).toFixed(2),
@@ -631,14 +754,35 @@ async function captureAstroportSnapshot() {
     const jsonFilename = `astroport/astroport-epoch-${currentEpoch}.json`;
     const jsonContent = JSON.stringify(snapshot, null, 2);
     const dateStr = startedAt.toISOString().split('T')[0];
+    const timeStr = startedAt.toISOString().slice(11, 19);
     const dailyCsvFilename = `data/daily/${dateStr}.csv`;
-    const dailyCsvContent = buildDailyCsv(poolsData);
-    let weeklyCsvFilename = null, weeklyCsvContent = null;
-    if (runMode === 'weekly' || runMode === 'monthly') {
-        const previousEpoch = currentEpoch - 1;
-        weeklyCsvFilename = `data/weekly-avg/2026-epoch-${previousEpoch}.csv`;
-        weeklyCsvContent = buildWeeklyCsv(poolsData);
-    }
+    const dailyCsvContent = buildDailyCsv(poolsData, dateStr, timeStr);
+
+    // STEP 2: Rolling day-1..7 (Mon=1..Sun=7) — same content as today's dated daily, rotating filename.
+    // Each day-of-week slot is overwritten weekly. Matches Skeleton Swap's rolling pattern.
+    const dayNum = ((startedAt.getUTCDay() + 6) % 7) + 1;  // Mon=1, Sun=7
+    const rollingDailyFilename = `day-${dayNum}.csv`;
+    const rollingDailyContent = dailyCsvContent;  // same payload
+
+    // STEP 2 (continued): Weekly avg ALWAYS runs (not gated on runMode='weekly'),
+    // so the file accumulates each day. Bug-fix vs. previous behavior.
+    const previousEpoch = currentEpoch - 1;
+    const weeklyCsvFilename = `data/weekly-avg/2026-epoch-${previousEpoch}.csv`;
+    // Weekly meta — daily snapshots within the prior epoch's 7-day window
+    const weeklyMeta = computeAggMetadata(
+        poolsData.length > 0 ? 1 : 0,  // best-effort; we only know about THIS run's data
+        7,
+        [dateStr]
+    );
+    weeklyMeta.period = previousEpoch;
+    const weeklyCsvContent = buildWeeklyCsv(poolsData, weeklyMeta);
+
+    // STEP 3: 6-day rolling average — fetches past 6 dated daily CSVs from the repo
+    // and aggregates. Will have has_gaps=true until we've accumulated 6 days of dailies.
+    console.log('\n📊 Building 6-day rolling average (fetching past dailies)...');
+    const { csv: sixDayAvgContent, meta: sixDayMeta } = await buildSixDayAvgCsv(dateStr);
+    console.log(`   Used ${sixDayMeta.snapshots_used}/${sixDayMeta.snapshots_expected} daily snapshots (period: ${sixDayMeta.period_start} → ${sixDayMeta.period_end})`);
+    const sixDayAvgFilename = '6-day-avg.csv';
 
     // Phase 6: Publish
     // Build heartbeat content. Status reflects whether all targeted pools succeeded.
@@ -661,9 +805,9 @@ async function captureAstroportSnapshot() {
         console.log(`\n📤 Publishing to GitHub...`);
         await pushToGithub(jsonFilename, jsonContent, `📊 Astroport epoch ${currentEpoch} — ${dateStr} (${runMode})`);
         await pushToGithub(dailyCsvFilename, dailyCsvContent, `📊 Astroport daily — ${dateStr}`);
-        if (weeklyCsvFilename) {
-            await pushToGithub(weeklyCsvFilename, weeklyCsvContent, `📊 Astroport weekly — epoch ${currentEpoch - 1}`);
-        }
+        await pushToGithub(rollingDailyFilename, rollingDailyContent, `📊 Astroport day-${dayNum} (${dateStr})`);
+        await pushToGithub(weeklyCsvFilename, weeklyCsvContent, `📊 Astroport weekly accumulating — epoch ${previousEpoch}`);
+        await pushToGithub(sixDayAvgFilename, sixDayAvgContent, `📊 Astroport 6-day rolling avg`);
         // Heartbeat last — only written if everything above succeeded reaching this point
         await pushToGithub(heartbeatFilename, heartbeatContent, `📍 Astroport heartbeat — ${dateStr}`);
     } else {
@@ -675,7 +819,9 @@ async function captureAstroportSnapshot() {
         };
         writeLocal(jsonFilename, jsonContent);
         writeLocal(dailyCsvFilename, dailyCsvContent);
-        if (weeklyCsvFilename) writeLocal(weeklyCsvFilename, weeklyCsvContent);
+        writeLocal(rollingDailyFilename, rollingDailyContent);
+        writeLocal(weeklyCsvFilename, weeklyCsvContent);
+        writeLocal(sixDayAvgFilename, sixDayAvgContent);
         writeLocal(heartbeatFilename, heartbeatContent);
     }
 
