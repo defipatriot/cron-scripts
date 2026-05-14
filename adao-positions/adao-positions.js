@@ -68,6 +68,20 @@ const ADAO_TREASURY_WALLETS = [
     },
 ];
 
+// Council treasury wallet — separate Council DAO holding wallet. Not a TLA participant
+// (no LP positions / locks / votes expected) but tracked here because it's a peer treasury
+// to the aDAO Core wallet. fetchMemberPortfolio is reused — the TLA-related fields will be
+// empty for this wallet, only wallet_balances + summary.total_wallet_balances_usd are
+// meaningful. Output goes to a separate top-level `council_treasury` field so existing
+// consumers reading `treasury` (aDAO Core) are unaffected.
+const COUNCIL_TREASURY_WALLETS = [
+    {
+        address: 'terra1yqv0af22675wlcmgflxk4ve07vt8qlm999gk0cuw5l64r5xxgadsyg8ywv',
+        label: 'Council Treasury',
+        kind: 'council_core',
+    },
+];
+
 // External data sources
 const DAODAO_INDEXER_URL = `https://indexer.daodao.zone/phoenix-1/contract/${ADAO_VOTING_CONTRACT}/daoVotingCw721Staked/topStakers`;
 const PFPK_BASE_URL      = 'https://pfpk.daodao.zone/bech32/';
@@ -1341,6 +1355,35 @@ async function captureSnapshot() {
         console.log(`    ${t.name}: VP ${s.voting_power_human?.toFixed(0)}, LP $${s.total_lp_position_usd?.toFixed(0)}, Locks ${s.lock_count}, Rewards $${s.total_pending_rewards_usd?.toFixed(2)}`);
     }
 
+    // Phase 3c: Council treasury wallets. Same fetch path as aDAO treasury, but written
+    // to separate top-level fields. Council has no TLA participation so most of the
+    // returned portfolio shape is empty — wallet_balances + summary.total_wallet_balances_usd
+    // are the meaningful fields. Failures here never block the rest of the cron.
+    console.log(`🏛️  Fetching ${COUNCIL_TREASURY_WALLETS.length} council wallet(s)...`);
+    const councilPortfolios = await parallelMap(COUNCIL_TREASURY_WALLETS, t => {
+        return fetchMemberPortfolio({
+            address: t.address,
+            name: t.label,
+            nft_count: 0,
+            vp_pct_of_dao: 0,
+        }, ctx).then(p => {
+            if (p) {
+                p.kind = t.kind;
+                p.is_treasury = true;
+            }
+            return p;
+        }).catch(err => {
+            console.warn(`  ⚠ Council wallet ${t.label} failed: ${err.message}`);
+            return null;
+        });
+    }, BATCH_CONCURRENCY);
+    const validCouncils = councilPortfolios.filter(p => p && !p._error);
+    console.log(`  ✓ ${validCouncils.length}/${COUNCIL_TREASURY_WALLETS.length} council portfolios captured`);
+    for (const t of validCouncils) {
+        const s = t.summary || {};
+        console.log(`    ${t.name}: Wallet $${s.total_wallet_balances_usd?.toFixed(2) ?? '0.00'} (${t.wallet_balances?.length ?? 0} tokens)`);
+    }
+
     // Phase 4: Sort + rank
     validPortfolios.sort((a, b) => (b.voting?.total_voting_power_human || 0) - (a.voting?.total_voting_power_human || 0));
     validPortfolios.forEach((p, i) => { p.rank_by_vp = i + 1; });
@@ -1385,6 +1428,8 @@ async function captureSnapshot() {
         totals,
         treasury: validTreasuries.length === 1 ? validTreasuries[0] : null,
         treasuries: validTreasuries,
+        council_treasury: validCouncils.length === 1 ? validCouncils[0] : null,
+        council_treasuries: validCouncils,
         members: validPortfolios,
     };
 
@@ -1408,6 +1453,9 @@ async function captureSnapshot() {
         console.log(`  ✓ Published ${archivePath}`);
 
         // Heartbeat — uniform freshness contract across all crons
+        // Status is 'partial' if any tracked treasury fetch failed (council is optional but tracked).
+        const allTreasuriesOk = validTreasuries.length === ADAO_TREASURY_WALLETS.length;
+        const allCouncilsOk   = validCouncils.length === COUNCIL_TREASURY_WALLETS.length;
         const heartbeat = {
             schemaVersion: 1,
             cron: 'adao-positions',
@@ -1416,10 +1464,12 @@ async function captureSnapshot() {
             runId: `adao-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'weekly',
             currentEpoch: epochInfo.number,
-            status: 'ok',
+            status: (allTreasuriesOk && allCouncilsOk) ? 'ok' : 'partial',
             stats: {
                 members_count: validPortfolios.length,
                 treasury_present: !!portfoliosDoc.treasury,
+                council_present: !!portfoliosDoc.council_treasury,
+                council_count: validCouncils.length,
             },
             next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         };
@@ -1436,8 +1486,21 @@ async function captureSnapshot() {
 // ENTRY POINT
 // -----------------------------------------------------------------------------
 
-captureSnapshot().catch(e => {
-    console.error(`❌ FATAL: ${e.message}`);
-    console.error(e.stack);
-    process.exit(1);
-});
+// Only auto-run when invoked as a script (not when require()'d by a test harness)
+if (require.main === module) {
+    captureSnapshot().catch(e => {
+        console.error(`❌ FATAL: ${e.message}`);
+        console.error(e.stack);
+        process.exit(1);
+    });
+}
+
+// Exports for sandbox testing — does not affect production behavior
+module.exports = {
+    captureSnapshot,
+    loadSharedData,
+    fetchMemberPortfolio,
+    COUNCIL_TREASURY_WALLETS,
+    ADAO_TREASURY_WALLETS,
+    currentEpochInfo,
+};
