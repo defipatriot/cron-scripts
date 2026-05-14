@@ -155,6 +155,9 @@ function gitCommitAndPush(message) {
     // Add yearly file at root
     run('git add -f *-yearly.csv', true);
     
+    // Add heartbeat file (freshness signal for downstream consumers)
+    run('git add -f data/heartbeat.json', true);
+    
     // Check if there's anything to commit
     try {
       run(`git commit -m "${message}"`);
@@ -660,6 +663,41 @@ async function runYearly() {
 }
 
 // =============================================================================
+// HEARTBEAT — written at end of every successful run
+// Provides downstream consumers (page health check) a uniform freshness signal.
+// =============================================================================
+function writeHeartbeat(mode, result) {
+  const now = new Date();
+  const epoch = getEpochNumber(now);
+  // Approximate next expected run by cadence
+  const cadenceMs = {
+    daily:   24 * 60 * 60 * 1000,
+    weekly:  7 * 24 * 60 * 60 * 1000,
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    yearly:  365 * 24 * 60 * 60 * 1000,
+  }[mode] || 24 * 60 * 60 * 1000;
+  const heartbeat = {
+    schemaVersion: 1,
+    cron: 'skeletonswap-lp_data',
+    capturedAt: now.toISOString(),
+    capturedAtUnix: now.getTime(),
+    runId: `ss-${now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+    runMode: mode,
+    currentEpoch: epoch,
+    status: 'ok',
+    stats: {
+      poolsProcessed: result?.pools ?? null,
+      fileWritten: result?.file ?? null,
+    },
+    next_expected_run_at: new Date(now.getTime() + cadenceMs).toISOString(),
+  };
+  // Ensure data/ exists then write
+  if (!fs.existsSync('data')) fs.mkdirSync('data', { recursive: true });
+  fs.writeFileSync('data/heartbeat.json', JSON.stringify(heartbeat, null, 2));
+  console.log(`📍 Heartbeat written: data/heartbeat.json (mode=${mode}, epoch=${epoch})`);
+}
+
+// =============================================================================
 // MAIN
 // =============================================================================
 
@@ -696,6 +734,10 @@ async function main() {
       default:
         throw new Error(`Unknown mode: ${mode}`);
     }
+    
+    // Write freshness signal — done AFTER the mode succeeded, BEFORE git push
+    // so the heartbeat is committed in the same push as the data files.
+    writeHeartbeat(mode, result);
     
     // Commit to GitHub
     gitCommitAndPush(`${mode} snapshot: ${result.file}`);
