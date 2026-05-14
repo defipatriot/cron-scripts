@@ -641,6 +641,22 @@ async function captureAstroportSnapshot() {
     }
 
     // Phase 6: Publish
+    // Build heartbeat content. Status reflects whether all targeted pools succeeded.
+    const heartbeat = {
+        schemaVersion: 1,
+        cron: 'astroport',
+        capturedAt: startedAt.toISOString(),
+        capturedAtUnix: startedAt.getTime(),
+        runId: `astro-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+        runMode,
+        currentEpoch,
+        status: failed === 0 ? 'ok' : 'partial',
+        stats: { ok, deprecated, failed, total: targetPools.length },
+        next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    };
+    const heartbeatFilename = 'data/heartbeat.json';
+    const heartbeatContent = JSON.stringify(heartbeat, null, 2);
+
     if (GITHUB_TOKEN) {
         console.log(`\n📤 Publishing to GitHub...`);
         await pushToGithub(jsonFilename, jsonContent, `📊 Astroport epoch ${currentEpoch} — ${dateStr} (${runMode})`);
@@ -648,6 +664,8 @@ async function captureAstroportSnapshot() {
         if (weeklyCsvFilename) {
             await pushToGithub(weeklyCsvFilename, weeklyCsvContent, `📊 Astroport weekly — epoch ${currentEpoch - 1}`);
         }
+        // Heartbeat last — only written if everything above succeeded reaching this point
+        await pushToGithub(heartbeatFilename, heartbeatContent, `📍 Astroport heartbeat — ${dateStr}`);
     } else {
         console.log(`\n⚠️  GITHUB_TOKEN not set — saving locally`);
         const writeLocal = (rel, content) => {
@@ -658,6 +676,7 @@ async function captureAstroportSnapshot() {
         writeLocal(jsonFilename, jsonContent);
         writeLocal(dailyCsvFilename, dailyCsvContent);
         if (weeklyCsvFilename) writeLocal(weeklyCsvFilename, weeklyCsvContent);
+        writeLocal(heartbeatFilename, heartbeatContent);
     }
 
     console.log(`\n✅ Snapshot complete (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s)\n`);
