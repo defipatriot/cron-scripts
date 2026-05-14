@@ -26,8 +26,14 @@ const DIRS = {
 };
 
 // CSV Headers
-const DAILY_HEADERS = 'date,time,pool_id,pool_address,tvl_usd,volume_24h_usd,volume_7d_usd,apr_7d,reserve_0,reserve_1,total_share';
-const AGG_HEADERS = 'period,pool_id,pool_address,avg_tvl_usd,total_volume_usd,avg_apr_7d,avg_reserve_0,avg_reserve_1,avg_total_share,snapshot_count';
+// Unified daily CSV schema — common columns shared with Astroport for cross-DEX consumption.
+// Common prefix: date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd
+// SS-specific extras after: volume_7d_usd,apr_7d,reserve_0,reserve_1,total_share
+const DAILY_HEADERS = 'date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd,volume_7d_usd,apr_7d,reserve_0,reserve_1,total_share';
+
+// Aggregate CSV schema — adds data-quality metadata (snapshots_used/expected/has_gaps + period bounds).
+// Every row repeats these values for that aggregate (self-describing per row).
+const AGG_HEADERS = 'period,period_start,period_end,snapshots_used,snapshots_expected,has_gaps,dex,pool_name,pool_address,avg_tvl_usd,total_volume_usd,avg_apr_7d,avg_reserve_0,avg_reserve_1,avg_total_share,snapshot_count';
 
 // =============================================================================
 // UTILITIES
@@ -202,6 +208,33 @@ function parseCSV(content) {
 }
 
 // =============================================================================
+// AGGREGATE METADATA — embedded in every aggregate CSV row so downstream
+// consumers can validate data quality without a separate sidecar file.
+// =============================================================================
+function computeAggMetadata(filesRead, expectedCount) {
+  const dates = [];
+  for (const f of filesRead) {
+    try {
+      const content = fs.readFileSync(f, 'utf8');
+      const rows = parseCSV(content);
+      if (rows.length > 0 && rows[0].date) dates.push(rows[0].date);
+    } catch (e) { /* skip unreadable */ }
+  }
+  dates.sort();
+  return {
+    period_start: dates[0] || '',
+    period_end:   dates[dates.length - 1] || '',
+    snapshots_used: filesRead.length,
+    snapshots_expected: expectedCount,
+    has_gaps: filesRead.length < expectedCount,
+  };
+}
+
+// Helper to read pool name from a row regardless of legacy or new schema.
+// Legacy daily files have `pool_id`; new files have `pool_name`. Same value, different column.
+function rowPoolName(row) { return row.pool_name || row.pool_id || ''; }
+
+// =============================================================================
 // EPOCH CALCULATION (replaces week number)
 // =============================================================================
 
@@ -255,6 +288,7 @@ async function runDaily() {
     const row = [
       dateStr,
       timeStr,
+      'skeletonswap',
       `"${pool.pool_id}"`,
       pool.pool_address,
       pool.tvl_usd ?? '',
@@ -324,7 +358,7 @@ async function calculate6DayAverage() {
     const rows = parseCSV(content);
     
     for (const row of rows) {
-      const poolId = row.pool_id;
+      const poolId = rowPoolName(row);
       if (!poolData[poolId]) {
         poolData[poolId] = {
           pool_address: row.pool_address,
@@ -351,10 +385,19 @@ async function calculate6DayAverage() {
   
   const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   const sum = arr => arr.reduce((a, b) => a + b, 0);
+
+  // Data-quality metadata — embedded in every row for self-describing aggregates
+  const meta = computeAggMetadata(dailyFiles.map(f => `./${f}`), 6);
   
   for (const [poolId, data] of Object.entries(poolData)) {
     const row = [
       '6-day-avg',
+      meta.period_start,
+      meta.period_end,
+      meta.snapshots_used,
+      meta.snapshots_expected,
+      meta.has_gaps,
+      'skeletonswap',
       `"${poolId}"`,
       data.pool_address,
       avg(data.tvl).toFixed(2),
@@ -407,7 +450,7 @@ async function runWeekly() {
     const rows = parseCSV(content);
     
     for (const row of rows) {
-      const poolId = row.pool_id;
+      const poolId = rowPoolName(row);
       if (!poolData[poolId]) {
         poolData[poolId] = {
           pool_address: row.pool_address,
@@ -434,10 +477,18 @@ async function runWeekly() {
   
   const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   const sum = arr => arr.reduce((a, b) => a + b, 0);
+
+  const meta = computeAggMetadata(dailyFiles.map(f => `./${f}`), 7);  // 7 days in an epoch
   
   for (const [poolId, data] of Object.entries(poolData)) {
     const row = [
       periodStr,
+      meta.period_start,
+      meta.period_end,
+      meta.snapshots_used,
+      meta.snapshots_expected,
+      meta.has_gaps,
+      'skeletonswap',
       `"${poolId}"`,
       data.pool_address,
       avg(data.tvl).toFixed(2),
@@ -523,7 +574,7 @@ async function runMonthly() {
     const rows = parseCSV(content);
     
     for (const row of rows) {
-      const poolId = row.pool_id;
+      const poolId = rowPoolName(row);
       if (!poolData[poolId]) {
         poolData[poolId] = {
           pool_address: row.pool_address,
@@ -552,10 +603,22 @@ async function runMonthly() {
   
   const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   const sum = arr => arr.reduce((a, b) => a + b, 0);
+
+  // Month spans roughly 4-5 epochs (weekly files); expected count = epochs in this month
+  const meta = computeAggMetadata(
+    relevantFiles.map(f => path.join(DIRS.weeklyAvg, f)),
+    epochEnd - epochStart + 1
+  );
   
   for (const [poolId, data] of Object.entries(poolData)) {
     const row = [
       periodStr,
+      meta.period_start,
+      meta.period_end,
+      meta.snapshots_used,
+      meta.snapshots_expected,
+      meta.has_gaps,
+      'skeletonswap',
       `"${poolId}"`,
       data.pool_address,
       avg(data.tvl).toFixed(2),
@@ -605,7 +668,7 @@ async function runYearly() {
     const rows = parseCSV(content);
     
     for (const row of rows) {
-      const poolId = row.pool_id;
+      const poolId = rowPoolName(row);
       if (!poolData[poolId]) {
         poolData[poolId] = {
           pool_address: row.pool_address,
@@ -634,10 +697,22 @@ async function runYearly() {
   
   const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
   const sum = arr => arr.reduce((a, b) => a + b, 0);
+
+  // 12 monthly files expected for a full year
+  const meta = computeAggMetadata(
+    monthlyFiles.map(f => path.join(DIRS.monthlyAvg, f)),
+    12
+  );
   
   for (const [poolId, data] of Object.entries(poolData)) {
     const row = [
       periodStr,
+      meta.period_start,
+      meta.period_end,
+      meta.snapshots_used,
+      meta.snapshots_expected,
+      meta.has_gaps,
+      'skeletonswap',
       `"${poolId}"`,
       data.pool_address,
       avg(data.tvl).toFixed(2),
