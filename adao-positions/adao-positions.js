@@ -272,11 +272,17 @@ async function parallelMap(items, fn, concurrency = BATCH_CONCURRENCY) {
 
 function currentEpochInfo() {
     const now = Date.now();
-    const epoch = Math.floor((now - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS);
-    const epochStart = TLA_EPOCH_START_MS + epoch * TLA_EPOCH_DURATION_MS;
+    // epochIndex is 0-indexed (count of complete weeks since TLA START on 2022-10-31).
+    // We use it INTERNALLY for date math (epochStart etc.) because the math
+    // requires a 0-indexed offset.
+    // We expose `number` as epochIndex + 1 — the 1-indexed CANONICAL epoch
+    // number that matches `epoch_1-300_date.json` and Eris/Votion UIs.
+    const epochIndex = Math.floor((now - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS);
+    const number = epochIndex + 1;
+    const epochStart = TLA_EPOCH_START_MS + epochIndex * TLA_EPOCH_DURATION_MS;
     const epochEnd   = epochStart + TLA_EPOCH_DURATION_MS;
     return {
-        number: epoch,
+        number,
         starts_at: new Date(epochStart).toISOString(),
         ends_at: new Date(epochEnd).toISOString(),
         progress_pct: ((now - epochStart) / TLA_EPOCH_DURATION_MS) * 100,
