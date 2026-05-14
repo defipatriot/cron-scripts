@@ -310,11 +310,14 @@ async function fetchPoolChart(poolAddr, type) {
     return { series: [], ok: false, errorReason: (lastErr?.message || 'unknown').slice(0, 80) };
 }
 
+// Convert a Unix timestamp to the canonical 1-indexed TLA epoch number.
+// epochIndex = Math.floor(elapsed / DURATION) is 0-indexed; we add 1 to match
+// `epoch_1-300_date.json` and Eris/Votion UIs.
 function timestampToEpoch(tsSeconds) {
-    return Math.floor((tsSeconds * 1000 - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS);
+    return Math.floor((tsSeconds * 1000 - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS) + 1;
 }
 function timestampMsToEpoch(tsMs) {
-    return Math.floor((tsMs - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS);
+    return Math.floor((tsMs - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS) + 1;
 }
 
 function groupPointsByEpoch(series) {
