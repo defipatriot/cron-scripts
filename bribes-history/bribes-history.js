@@ -476,6 +476,21 @@ async function captureBribesHistory() {
             }, null, 2);
             await pushToGithub(filename, content, `📊 Epoch ${ep} bribes (${byEpoch[ep].length} records)`);
         }
+        // Heartbeat — written last so its presence implies all other pushes succeeded
+        const heartbeat = {
+            schemaVersion: 1,
+            cron: 'bribes-history',
+            capturedAt: startedAt.toISOString(),
+            capturedAtUnix: startedAt.getTime(),
+            runId: `bribes-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'daily',
+            currentEpoch,
+            status: 'ok',
+            stats: masterFile.stats,
+            next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        };
+        await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
+            `📍 Bribes-history heartbeat`);
     } else {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('pd-bribes-history.json', JSON.stringify(masterFile, null, 2));
@@ -489,7 +504,16 @@ async function captureBribesHistory() {
                 epoch: parseInt(sampleEp), bribes: byEpoch[sampleEp],
             }, null, 2));
         }
-        console.log(`  Saved: pd-bribes-history.json, current-state.json, bribers-registry.json, epoch-${sampleEp}.json`);
+        // Heartbeat — local
+        fs.writeFileSync('heartbeat.json', JSON.stringify({
+            schemaVersion: 1, cron: 'bribes-history',
+            capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
+            runId: `bribes-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'daily', currentEpoch, status: 'ok',
+            stats: masterFile.stats,
+            next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        }, null, 2));
+        console.log(`  Saved: pd-bribes-history.json, current-state.json, bribers-registry.json, epoch-${sampleEp}.json, heartbeat.json`);
     }
 
     console.log(`\n✅ Done (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s)\n`);
