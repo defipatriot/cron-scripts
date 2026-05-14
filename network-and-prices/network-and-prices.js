@@ -775,10 +775,38 @@ async function captureNetworkAndPrices() {
         } else {
             console.log(`  (skipping daily archive — only written at 23:xx UTC; current hour ${startedAt.getUTCHours()})`);
         }
+        // Heartbeat — uniform freshness contract across all crons
+        const sourceFailures = Object.entries(snapshot.sources).filter(([, v]) => !v.ok).length;
+        const heartbeat = {
+            schemaVersion: 1,
+            cron: 'network-and-prices',
+            capturedAt: startedAt.toISOString(),
+            capturedAtUnix: startedAt.getTime(),
+            runId: `nap-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
+            status: sourceFailures === 0 ? 'ok' : 'partial',
+            stats: {
+                tokens_priced: Object.keys(tokenPrices || {}).length,
+                lst_ratios:    Object.keys(ratios.ratios || {}).length,
+                source_failures: sourceFailures,
+            },
+            next_expected_run_at: snapshot.nextRefreshExpectedAt,
+        };
+        await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
+            `📍 Network & prices heartbeat`);
     } else {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('network-and-prices.json', content);
-        console.log(`  Saved: network-and-prices.json`);
+        fs.writeFileSync('heartbeat.json', JSON.stringify({
+            schemaVersion: 1, cron: 'network-and-prices',
+            capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
+            runId: `nap-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
+            status: 'ok',
+            stats: { tokens_priced: Object.keys(tokenPrices || {}).length },
+            next_expected_run_at: snapshot.nextRefreshExpectedAt,
+        }, null, 2));
+        console.log(`  Saved: network-and-prices.json, heartbeat.json`);
     }
 
     console.log(`\n✅ Done (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s) — next refresh expected ${snapshot.nextRefreshExpectedAt}\n`);
