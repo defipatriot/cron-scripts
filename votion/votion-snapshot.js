@@ -662,11 +662,38 @@ async function captureVotionSnapshot() {
         const message  = `📸 Votion epoch ${period} snapshot (v2 rich shape) — ${startedAt.toISOString().split('T')[0]}`;
         console.log(`\n📤 Pushing to GitHub: ${filename} (${(content.length/1024).toFixed(1)} KB)...`);
         await pushToGithub(filename, content, message);
+
+        // Heartbeat — uniform freshness contract across all crons
+        const heartbeat = {
+            schemaVersion: 1,
+            cron: 'votion',
+            capturedAt: startedAt.toISOString(),
+            capturedAtUnix: startedAt.getTime(),
+            runId: `votion-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'weekly',
+            currentEpoch: period,
+            status: 'ok',
+            stats: {
+                lockups_captured: Array.isArray(snapshot.lockups) ? snapshot.lockups.length
+                                : Array.isArray(snapshot.wallets) ? snapshot.wallets.length
+                                : null,
+            },
+            next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        };
+        await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
+            `📍 Votion heartbeat — epoch ${period}`);
     } else if (!GITHUB_TOKEN) {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally only');
         const filename = `votion-epoch-${period || 'test'}.json`;
         fs.writeFileSync(filename, JSON.stringify(snapshot, null, 2));
-        console.log(`   Saved: ${filename}`);
+        fs.writeFileSync('heartbeat.json', JSON.stringify({
+            schemaVersion: 1, cron: 'votion',
+            capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
+            runId: `votion-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'weekly', currentEpoch: period, status: 'ok',
+            next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        }, null, 2));
+        console.log(`   Saved: ${filename}, heartbeat.json`);
     }
 
     console.log(`\n✅ Snapshot complete (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s)\n`);
