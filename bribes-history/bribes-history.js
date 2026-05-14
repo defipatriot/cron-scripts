@@ -225,8 +225,14 @@ function extractBribesFromProposal(proposal) {
             for_pool: ab.for_info,                       // pool LP token: { cw20: '...' } or { native: '...' }
             gauge: ab.gauge,                             // 'project' | 'single' | 'bluechip' | 'stable'
             distribution: ab.distribution,               // { func: { func_type: 'linear', start: N, end: M } }
-            start_epoch: ab.distribution?.func?.start,
-            end_epoch: ab.distribution?.func?.end,
+            // Chain stores periods as 0-indexed (week of May 11-18 = chain period 184).
+            // We expose them as canonical 1-indexed (epoch 185) to match
+            // `epoch_1-300_date.json` and Eris/Votion UIs. The raw chain values
+            // remain available in `distribution.func.start/end` above.
+            start_epoch: ab.distribution?.func?.start != null
+                ? ab.distribution.func.start + 1 : null,
+            end_epoch: ab.distribution?.func?.end != null
+                ? ab.distribution.func.end + 1 : null,
         });
     }
     return bribes;
@@ -381,7 +387,9 @@ async function pushToGithub(filepath, content, message) {
 
 async function captureBribesHistory() {
     const startedAt = new Date();
-    const currentEpoch = Math.floor((startedAt.getTime() - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS);
+    // currentEpoch is 1-indexed canonical, matching `epoch_1-300_date.json` and
+    // Eris/Votion UIs. The raw Math.floor gives 0-indexed, so we add 1.
+    const currentEpoch = Math.floor((startedAt.getTime() - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS) + 1;
 
     console.log(`\n📸 Bribes History Capture`);
     console.log(`   Started: ${startedAt.toISOString()}`);
