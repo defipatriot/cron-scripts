@@ -202,8 +202,14 @@ async function queryContract(contractAddr, queryObj) {
 function currentEpochInfo() {
     const now = Date.now();
     const elapsed = now - TLA_EPOCH_START_MS;
-    const currentEpoch = Math.floor(elapsed / TLA_EPOCH_DURATION_MS);
-    const epochStartedAt = TLA_EPOCH_START_MS + (currentEpoch * TLA_EPOCH_DURATION_MS);
+    // epochIndex is 0-indexed (count of complete weeks since TLA START on 2022-10-31).
+    // We use it INTERNALLY for date math (epochStartedAt etc.) because the math
+    // requires a 0-indexed offset.
+    // We expose `currentEpoch` as epochIndex + 1 — the 1-indexed CANONICAL epoch
+    // number that matches `epoch_1-300_date.json` and Eris/Votion UIs.
+    const epochIndex = Math.floor(elapsed / TLA_EPOCH_DURATION_MS);
+    const currentEpoch = epochIndex + 1;
+    const epochStartedAt = TLA_EPOCH_START_MS + (epochIndex * TLA_EPOCH_DURATION_MS);
     const epochEndsAt = epochStartedAt + TLA_EPOCH_DURATION_MS;
     return {
         currentEpoch,
