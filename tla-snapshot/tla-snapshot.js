@@ -324,7 +324,10 @@ function parseSsCsv(csvText) {
     if (lines.length < 2) return new Map();
     const headers = lines[0].split(',').map(h => h.trim());
     const idx = {
+        // Support both legacy column 'pool_id' and new aligned column 'pool_name'.
+        // The SS cron migrated to pool_name in 2026-05 to align with Astroport's schema.
         pool_id:        headers.indexOf('pool_id'),
+        pool_name:      headers.indexOf('pool_name'),
         pool_address:   headers.indexOf('pool_address'),
         tvl_usd:        headers.indexOf('tvl_usd'),
         volume_24h_usd: headers.indexOf('volume_24h_usd'),
@@ -334,6 +337,8 @@ function parseSsCsv(csvText) {
         reserve_1:      headers.indexOf('reserve_1'),
         total_share:    headers.indexOf('total_share'),
     };
+    // Prefer pool_name when present, fall back to pool_id (legacy daily files)
+    const nameIdx = idx.pool_name >= 0 ? idx.pool_name : idx.pool_id;
     const result = new Map();
     // Simple CSV parser — handles quoted fields with commas inside
     for (let i = 1; i < lines.length; i++) {
@@ -341,7 +346,7 @@ function parseSsCsv(csvText) {
         const addr = row[idx.pool_address];
         if (!addr) continue;
         result.set(addr, {
-            pool_id:        (row[idx.pool_id] || '').replace(/"/g, ''),
+            pool_id:        (row[nameIdx] || '').replace(/"/g, ''),
             pool_address:   addr,
             tvl_usd:        parseFloat(row[idx.tvl_usd]) || null,
             volume_24h_usd: parseFloat(row[idx.volume_24h_usd]) || null,
@@ -1570,17 +1575,47 @@ async function captureTlaSnapshot() {
         await pushToGithub('data/tla-snapshot.json', content,
             `🏛️ TLA snapshot — epoch ${epochInfo.currentEpoch} (${dateStr} ${startedAt.getUTCHours().toString().padStart(2,'0')}:xx)`);
         // Only write daily archive at end-of-day (hour 23) to keep folder clean
-        if (startedAt.getUTCHours() === 23) {
+        const isEndOfDay = startedAt.getUTCHours() === 23;
+        if (isEndOfDay) {
             await pushToGithub(`data/daily/${dateStr}.json`, content,
                 `🏛️ Daily archive ${dateStr}`);
             console.log(`  ✓ End-of-day archive written`);
         } else {
             console.log(`  (skipping daily archive — only written at 23:xx UTC)`);
         }
+        // Heartbeat — uniform freshness contract across all crons
+        const sourceFailures = Object.values(snapshot.sources || {}).filter(v => v === false).length;
+        const heartbeat = {
+            schemaVersion: 1,
+            cron: 'tla-snapshot',
+            capturedAt: startedAt.toISOString(),
+            capturedAtUnix: startedAt.getTime(),
+            runId: `tla-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
+            currentEpoch: epochInfo.currentEpoch,
+            status: sourceFailures === 0 ? 'ok' : 'partial',
+            stats: {
+                total_pools: (snapshot.pools || []).length,
+                active_pools: totals.active_pools_count,
+                voted_pools: totals.voted_pools_count,
+                source_failures: sourceFailures,
+            },
+            next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+        };
+        await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
+            `📍 TLA snapshot heartbeat`);
     } else {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('tla-snapshot.json', content);
-        console.log(`  Saved: tla-snapshot.json`);
+        fs.writeFileSync('heartbeat.json', JSON.stringify({
+            schemaVersion: 1, cron: 'tla-snapshot',
+            capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
+            runId: `tla-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode: 'hourly', currentEpoch: epochInfo.currentEpoch, status: 'ok',
+            stats: { total_pools: (snapshot.pools || []).length, active_pools: totals.active_pools_count },
+            next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+        }, null, 2));
+        console.log(`  Saved: tla-snapshot.json, heartbeat.json`);
     }
 
     console.log(`\n✅ Done (${((Date.now() - startedAt.getTime()) / 1000).toFixed(1)}s)\n`);
