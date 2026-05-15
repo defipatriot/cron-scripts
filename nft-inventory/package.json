@@ -1,0 +1,11 @@
+{
+  "name": "nft-inventory-cron",
+  "version": "1.0.0",
+  "description": "Hourly aDAO NFT inventory snapshot from on-chain truth",
+  "main": "nft-inventory.js",
+  "scripts": {
+    "start": "node nft-inventory.js"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
