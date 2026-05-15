@@ -1,0 +1,11 @@
+{
+  "name": "marketplace-stats-cron",
+  "version": "1.0.0",
+  "description": "Hourly BBL + Boost marketplace snapshot (floors, listings, activity, sales history)",
+  "main": "marketplace-stats.js",
+  "scripts": {
+    "start": "node marketplace-stats.js"
+  },
+  "author": "Alliance DAO",
+  "license": "MIT"
+}
