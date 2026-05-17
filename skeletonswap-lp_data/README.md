@@ -6,6 +6,26 @@ Captures daily Skeleton Swap pool snapshots from Backbone Labs' aggregator API. 
 
 ---
 
+## ⚠ Data quality warning (added 2026-05-17)
+
+**The upstream source for this cron is unreliable.** A full audit of the daily backup files from 2026-01-12 → 2026-05-14 found:
+
+- **29 consecutive identical files (2026-04-16 → 2026-05-14)** — the source API has been returning cached/stale data for ~30 days running, the cron faithfully captures whatever it receives
+- **Three-week missing gap** (2026-03-12 → 2026-04-01) — likely a multi-day source outage
+- **Two earlier 5-day frozen runs** (2026-03-07 → 2026-03-11 and 2026-04-06 → 2026-04-10)
+- **Effective unique data coverage** is roughly 50% of the calendar window, not 75% (the "files present" coverage)
+
+**Root cause:** the cron pulls from `dex.warlock.backbonelabs.io/api/pools/phoenix-1`. That endpoint is BackBone Labs' read of Skeleton Swap pool state (they run both BBL marketplace and the SS aggregator). When their aggregator caches stale data, our cron has no way to detect it — the API still responds 200, the cron writes what it gets, the data looks current but isn't.
+
+**Implications for downstream:**
+- ❌ **Do not use this data for LP health scoring or trend analysis** — apparent stability is an artifact of upstream caching, not real market behavior
+- ❌ **Do not display SS data alongside Astroport data without a clear "unverified" label** — users may believe both are equally reliable
+- ✅ Keep capturing best-effort — there's no cost to leaving it running, and the source may recover
+
+**Path to fix:** querying Skeleton Swap pool contracts directly from chain (same approach as Astroport) would give us trustworthy data. Skeleton pools are on-chain like any other CW20-LP. The current cron's reliance on the BackBone aggregator was a convenience tradeoff that turned out to be expensive.
+
+---
+
 ## What it captures
 
 Every pool from Skeleton Swap (Backbone Labs' aggregator) on phoenix-1:
@@ -96,3 +116,19 @@ GITHUB_BRANCH    # main
 ## Output schema
 
 See [`ss-pool-data_2026/README.md`](https://github.com/defipatriot/ss-pool-data_2026/blob/main/README.md) for full column definitions.
+
+## Recent changes
+
+### 2026-05-17 — Data-source freeze identified and documented
+
+A full audit of the daily backup files from 2026-01-12 → 2026-05-14 surfaced significant reliability problems with the upstream source. See the **Data quality warning** at the top of this README for details.
+
+**Summary of findings:**
+- 29 consecutive identical files (2026-04-16 → 2026-05-14, ongoing) — BackBone aggregator caching stale data
+- 3-week missing gap (2026-03-12 → 2026-04-01) — likely multi-day source outage
+- Two earlier 5-day frozen runs (2026-03-07 → 2026-03-11, 2026-04-06 → 2026-04-10)
+- Effective unique data coverage ~50% of the calendar window, not the 75% suggested by raw file presence
+
+**Decision (2026-05-17)**: keep capturing best-effort. Don't change the cron. Don't use the data for scoring or trend analysis. Label clearly as "unverified" wherever it surfaces in dashboards.
+
+**Future fix tracked**: build a chain-direct Skeleton Swap capture cron that queries SS pool contracts directly (same approach as Astroport). That gives us ungameable, on-chain-verified data and lets us retire the BackBone dependency. This is on the project roadmap (see top-level README under Project Status).
