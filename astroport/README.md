@@ -149,6 +149,29 @@ GITHUB_BRANCH    # main
 
       "astroportTvlUsd":        1218050,             // pre-computed by Astroport indexer
       "astroportDayVolumeUsd":  12193,
+
+      // Added 2026-05-17 for LP health scoring + portfolio tracking
+      "astroportStakedLiquidityUsd": 134926.78,        // USD locked in Astroport's astro-staking
+      "astroportLpTotalSupply":      "5712384927512",  // total LP tokens minted (raw, string for precision)
+      "astroportDayFeesUsd":         51.024,           // 24h fee revenue (USD) — LP health signal
+      "astroportFeeApr":             0.01528,          // pool fee yield rate (decimal, e.g. 0.05 = 5%)
+      "astroportAssets": [                              // raw reserves at capture time
+        {
+          "symbol":    "LUNA",
+          "denom":     "uluna",
+          "amount":    "8765432109876",                // raw on-chain amount (multiply by 10^-precision)
+          "price_usd": 0.0665,
+          "precision": 6
+        },
+        {
+          "symbol":    "ampLUNA",
+          "denom":     "terra1ecgazyd...",
+          "amount":    "5432109876543",
+          "price_usd": 0.1362,
+          "precision": 6
+        }
+      ],
+
       "isDeregistered":         false,
       "isBlocked":              false,
       "isHidden":               false,
@@ -180,19 +203,34 @@ GITHUB_BRANCH    # main
 
 ## Field reference — CSV output
 
-### Daily CSV (`data/daily/YYYY-MM-DD.csv`)
+### Daily CSV (`data/daily/YYYY-MM-DD.csv`) — 20 columns
+
+The CSV's first 5 columns (`date,time,dex,pool_name,pool_address`) match the Skeleton Swap daily CSV schema so cross-DEX consumers can union them. Columns 6-15 are common per-pool metrics; columns 16-20 were added 2026-05-17 for LP health scoring and portfolio tracking.
 
 | Column | Type | Description |
 |---|---|---|
-| `pool` | string | Canonical pool name (LUNA-first when paired with LUNA) |
+| `date` | string | Capture date, YYYY-MM-DD UTC |
+| `time` | string | Capture time, HH:MM:SS UTC |
+| `dex` | string | Always `astroport` |
+| `pool_name` | string | Canonical pool name (LUNA-first when paired with LUNA) |
+| `pool_address` | string | Astroport pool contract |
+| `tvl_usd` | number | TVL from Astroport's indexer (`poolLiquidityUsd`) |
+| `volume_24h_usd` | number | 24h volume from Astroport's indexer (`dayVolumeUsd`) |
 | `bucket` | string | TLA gauge bucket: stable/project/bluechip/single |
 | `pool_type` | string | xyk/concentrated/stable (from Astroport) |
-| `pool_address` | string | Astroport pool contract |
-| `astroport_tvl_usd` | number | TVL from Astroport's indexer |
-| `astroport_day_volume_usd` | number | 24h volume from Astroport's indexer |
+| `is_amplified` | bool | Whether the pool is amplified (always false in current data; reserved for future use) |
 | `latest_epoch_avg_liquidity` | number | Mean TVL from chart samples in latest epoch |
 | `latest_epoch` | int | TLA epoch number |
-| `deprecated`, `is_deregistered`, `fetch_ok` | bool | Status flags |
+| `deprecated` | bool | Astroport returned "Pool not found" (post-deletion stub) |
+| `is_deregistered` | bool | Astroport's `isDeregistered` flag |
+| `fetch_ok` | bool | Whether chart data fetch succeeded |
+| `fees_24h_usd` | number | **New 2026-05-17.** Pool fee revenue in the last 24h (USD). From Astroport's `tradingFees.day`. Core LP-health signal. |
+| `fee_apr` | number | **New 2026-05-17.** Pool fee yield rate as a decimal (e.g. 0.05 = 5% APR). From Astroport's `tradingFees.apr`. Sanity-check against the dashboard's claimed APR. |
+| `lp_total_supply` | string | **New 2026-05-17.** Total LP tokens minted (raw, no decimals applied). From Astroport's `poolLiquidity`. Needed to compute any member's pct_of_pool over time as (their LP balance / total supply). Stored as a string to preserve full precision. |
+| `astro_staked_usd` | number | **New 2026-05-17.** USD value locked in Astroport's astro-staking contract for this pool (`poolStakedLiquidityUsd`). Note: this is DIFFERENT from TLA's staking — separate contract, separate purpose. |
+| `assets_json` | string (JSON-encoded) | **New 2026-05-17.** Raw asset reserves at capture time, as a CSV-escaped JSON array. Each entry: `{symbol, denom, amount (string), price_usd, precision}`. The `amount` field is the on-chain raw amount; multiply by `10^-precision` to get human-readable. Stored raw to preserve precision. Used for chain-direct verification and slippage analysis. |
+
+**CSV reading note:** Because `assets_json` contains embedded commas and double-quotes, parsing this CSV requires a real CSV reader (e.g. Python's `csv` module, JavaScript's `papaparse`). Naive `split(',')` will break. The cell follows RFC 4180: enclosed in `"`, internal `"` doubled to `""`.
 
 ### Weekly CSV (`data/weekly-avg/2026-epoch-{N}.csv`)
 
@@ -200,7 +238,7 @@ Uses **tiered last-complete-epoch selection**:
 
 | Column | Description |
 |---|---|
-| `pool`, `bucket`, `pool_address`, `deprecated` | Same as daily |
+| `pool_name`, `bucket`, `pool_address`, `deprecated` | Same as daily |
 | `epoch` | The epoch selected by the tiered fallback |
 | `avg_liquidity_usd` | TVL for that epoch |
 | `total_volume_usd` | Total volume = avgVolume × 7 |
@@ -220,3 +258,19 @@ const ALWAYS_INCLUDE_POOLS = [
 ```
 
 The pool will be included as long as Astroport's `pools.getAll` knows about it.
+
+## Recent changes
+
+### 2026-05-17 — Five new fields for LP health scoring + portfolio tracking
+
+Added to per-pool JSON output AND daily CSV. All come from Astroport's `pools.getAll` response (which the cron already fetches); they were just not being surfaced before.
+
+- **`fees_24h_usd`** — pool fee revenue last 24h (from `tradingFees.day`). Core LP health signal: real revenue vs promotional emissions.
+- **`fee_apr`** — fee yield rate as decimal (from `tradingFees.apr`). Sanity-check against dashboard's claimed APR.
+- **`lp_total_supply`** — total LP tokens minted (from `poolLiquidity`, stored as string for precision). Needed to compute any member's pct_of_pool over time as (their LP balance / total supply).
+- **`astro_staked_usd`** — USD locked in Astroport's astro-staking contract (from `poolStakedLiquidityUsd`). Separate from TLA's staking — different contract, different purpose.
+- **`assets_json`** — raw asset reserves at capture time as CSV-escaped JSON. Each entry: `{symbol, denom, amount (string), price_usd, precision}`. Used for chain-direct verification and slippage analysis.
+
+**Breaking change for CSV consumers**: the daily CSV is now 20 columns (was 15). Anything reading it column-by-position will break; readers must use a real CSV parser (Python `csv` module, papaparse, etc.) — naive `split(',')` will break on the embedded JSON in `assets_json`.
+
+**Verified**: cron ran end-to-end against live data after the changes — 36 pools captured in 25s, all new fields populated correctly for LUNA-CAPA and other test pools.
