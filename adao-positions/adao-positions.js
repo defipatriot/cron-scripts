@@ -1452,6 +1452,22 @@ async function captureSnapshot() {
         await publishFile(archivePath, portfoliosContent, `archive epoch ${epochInfo.number}`);
         console.log(`  ✓ Published ${archivePath}`);
 
+        // Daily archive — gives Portfolio Tracker enough time-series granularity
+        // for P&L tracking and fee-accrual trends without bloating the repo. The
+        // per-epoch archive above only fires once per 7 days (too coarse for
+        // intra-epoch member position changes); 24×/day would be wasteful since
+        // individual member positions don't typically change minute-to-minute.
+        //
+        // Strategy: write to data/daily/YYYY-MM-DD.json. If the cron runs multiple
+        // times per day (hourly schedule on Render), the file is OVERWRITTEN
+        // each run — so the daily file always reflects the most recent capture
+        // of that calendar day. End-of-day = final state of the day, which is
+        // what we actually want for daily P&L computation.
+        const dateStr = startedAt.toISOString().slice(0, 10);
+        const dailyPath = `data/daily/${dateStr}.json`;
+        await publishFile(dailyPath, portfoliosContent, `📸 positions daily snapshot — ${dateStr}`);
+        console.log(`  ✓ Published ${dailyPath}`);
+
         // Heartbeat — uniform freshness contract across all crons
         // Status is 'partial' if any tracked treasury fetch failed (council is optional but tracked).
         const allTreasuriesOk = validTreasuries.length === ADAO_TREASURY_WALLETS.length;
@@ -1462,7 +1478,10 @@ async function captureSnapshot() {
             capturedAt: startedAt.toISOString(),
             capturedAtUnix: startedAt.getTime(),
             runId: `adao-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
-            runMode: 'weekly',
+            // runMode reflects scheduling cadence. The actual cadence is determined by
+            // Render's cron schedule, not hardcoded here. Heartbeat consumers compute
+            // freshness vs next_expected_run_at, so this is mainly informational.
+            runMode: 'scheduled',
             currentEpoch: epochInfo.number,
             status: (allTreasuriesOk && allCouncilsOk) ? 'ok' : 'partial',
             stats: {
@@ -1471,6 +1490,9 @@ async function captureSnapshot() {
                 council_present: !!portfoliosDoc.council_treasury,
                 council_count: validCouncils.length,
             },
+            // Match the Render schedule. If you change Render to daily, change this to 25h.
+            // If you change Render to hourly, change to 75min. The dashboard reads this
+            // value to drive its freshness indicator — keep it consistent with reality.
             next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         };
         await publishFile('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
