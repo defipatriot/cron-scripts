@@ -130,17 +130,17 @@ If `GITHUB_TOKEN` is unset, the cron writes files locally to the working directo
 
 ### Schedule
 
-Cron string: `0 1 * * 1` (Mondays 01:00 UTC) — historical default.
+Cron string: `0 1 * * *` (daily 01:00 UTC).
 
-This places the run ~1 hour after the TLA epoch boundary (epochs start Monday 00:00 UTC), capturing the just-settled state after rewards distribute and gauge votes flip to the new period.
+This places the run ~1 hour after the TLA epoch boundary on Mondays (epochs start Monday 00:00 UTC), and gives a fresh capture at the same time every other day. The 01:00 UTC offset is deliberate so the weekly epoch-flip run is in the same window as all other days — no special-case handling needed.
 
-**⚠ Schedule consideration (2026-05-17)**: For the Portfolio Tracker dashboard to function, this cron needs to run **at least daily**, not weekly. The weekly cadence above produces only one snapshot every 7 days, which is too coarse for member position time-series. Recommended cron string for daily: `0 1 * * *` (every day at 01:00 UTC). When changing the schedule, also update `next_expected_run_at` in the heartbeat code (currently set to 7 days; change to 25 hours for daily, 75 minutes for hourly).
+**History**: Originally set to weekly Mondays (`0 1 * * 1`). Switched to daily on 2026-05-17 to support the Portfolio Tracker dashboard — weekly cadence produced only one snapshot per 7 days, too coarse for member position time-series. The `next_expected_run_at` constant in the heartbeat code was updated from 7 days to 25 hours to match.
 
 The cron is spaced from other crons in the system:
 - `votion`: Sun 23:55 UTC (weekly)
 - `bribes-history`: Daily 23:35 UTC
 - `tla-snapshot`: Hourly :40
-- `adao-positions`: **01:00 UTC** (currently weekly Mon, should be daily)
+- `adao-positions`: **Daily 01:00 UTC**
 
 ### Node.js version
 
@@ -150,12 +150,12 @@ Requires Node.js 18+ for native `fetch`. No external npm dependencies — the cr
 
 1. Create a new "Cron Job" service on Render pointing at the `cron-scripts` repo
 2. Set:
-   - **Schedule**: `0 1 * * 1`
+   - **Schedule**: `0 1 * * *` (daily 01:00 UTC)
    - **Command**: `node adao-positions/adao-positions.js`
    - **Build command**: (none — no dependencies)
 3. Add environment variables `GITHUB_TOKEN` and `GITHUB_REPO`
 
-The first run will create `data/current.json`, `data/members.json`, and `data/weekly/epoch-{N}.json` in the data repo. Subsequent runs append a new epoch file each Monday.
+The first run will create `data/current.json`, `data/members.json`, `data/daily/{YYYY-MM-DD}.json`, and `data/weekly/epoch-{N}.json` in the data repo. Subsequent runs overwrite the date-named daily file once per calendar day and append a new epoch file each Monday at the epoch boundary.
 
 ## Failure modes
 
@@ -197,9 +197,18 @@ The current schema is `schemaVersion: 1`. If breaking changes are needed, increm
 
 ## Recent changes
 
+### 2026-05-17 — Daily schedule (code prepared, Render switch pending)
+
+Cron code updated to match a daily schedule. **Two changes must ship together** — the Render schedule and this code update — or the heartbeat freshness indicator will be wrong:
+
+1. **In Render dashboard**: change cron expression from `0 1 * * 1` (weekly Mondays) → `0 1 * * *` (daily 01:00 UTC).
+2. **In this script** (already applied): `next_expected_run_at` constant changed from 7 days → 25 hours.
+
+If only step 1 happens, the dashboard will think the cron is overdue every 25 hours (because heartbeat says next-run-at = 7 days from now). If only step 2 happens, the dashboard will think the cron is stale every 25 hours (because Render is still running it weekly). Ship both together.
+
+**Rationale**: Portfolio Tracker needs daily snapshots to compute P&L, fee accrual, and "is my position growing" answers. The weekly per-epoch archive is too coarse (7 days between snapshots).
+
 ### 2026-05-17 — Daily archive added for Portfolio Tracker history
 
 - **Added** `data/daily/YYYY-MM-DD.json` archive — same payload as `current.json` but named by capture date. If the cron runs multiple times per day, the daily file is overwritten (last run of the calendar day wins).
 - **Cleaned up** heartbeat: `runMode` field changed from hardcoded `'weekly'` to `'scheduled'` (the actual cadence is determined by Render's cron expression, not the script).
-- **⚠ Action required**: this cron is currently scheduled WEEKLY on Render (`0 1 * * 1`). For the Portfolio Tracker dashboard to accumulate meaningful history, it needs to be DAILY (`0 1 * * *`). When changing the Render schedule, also update the `next_expected_run_at` constant in the script (currently 7 days; change to 25 hours for daily).
-- Rationale: Portfolio Tracker needs daily snapshots to compute P&L, fee accrual, and "is my position growing" answers. The weekly per-epoch archive is too coarse (7 days between snapshots).

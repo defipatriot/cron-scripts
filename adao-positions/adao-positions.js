@@ -1490,10 +1490,14 @@ async function captureSnapshot() {
                 council_present: !!portfoliosDoc.council_treasury,
                 council_count: validCouncils.length,
             },
-            // Match the Render schedule. If you change Render to daily, change this to 25h.
-            // If you change Render to hourly, change to 75min. The dashboard reads this
-            // value to drive its freshness indicator — keep it consistent with reality.
-            next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+            // Match the Render schedule. Currently set to 25 hours = daily schedule
+            // (cron expression `0 1 * * *`). Slight overshoot from 24h gives jitter room.
+            // If you change the Render schedule, update this:
+            //   weekly: 7 * 24 * 60 * 60 * 1000  (was the original value)
+            //   daily:  25 * 60 * 60 * 1000      (current)
+            //   hourly: 75 * 60 * 1000           (75 min, allows for run-time + jitter)
+            // The dashboard reads this value to drive its freshness indicator.
+            next_expected_run_at: new Date(startedAt.getTime() + 25 * 60 * 60 * 1000).toISOString(),
         };
         await publishFile('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
             `📍 aDAO positions heartbeat — epoch ${epochInfo.number}`);
