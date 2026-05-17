@@ -110,6 +110,12 @@ Key fields per member:
 
 Frozen archive of `current.json` named by the epoch number at capture time. These accumulate over time and enable epoch-over-epoch dashboard charts.
 
+### `data/daily/{YYYY-MM-DD}.json` (~170 KB each)
+
+Added 2026-05-17 to support the Portfolio Tracker dashboard. Same payload as `current.json` but named by capture date. If the cron runs multiple times per day, the file is overwritten — the daily file always reflects the most recent capture of that calendar day, which is what's wanted for daily P&L computation.
+
+Required for Portfolio Tracker time-series (member position value over days, fee accrual trends, "is this position actually growing"). The weekly archive above is too coarse for intra-epoch position changes.
+
 ## Configuration
 
 ### Environment variables
@@ -124,15 +130,17 @@ If `GITHUB_TOKEN` is unset, the cron writes files locally to the working directo
 
 ### Schedule
 
-Cron string: `0 1 * * 1` (Mondays 01:00 UTC).
+Cron string: `0 1 * * 1` (Mondays 01:00 UTC) — historical default.
 
 This places the run ~1 hour after the TLA epoch boundary (epochs start Monday 00:00 UTC), capturing the just-settled state after rewards distribute and gauge votes flip to the new period.
+
+**⚠ Schedule consideration (2026-05-17)**: For the Portfolio Tracker dashboard to function, this cron needs to run **at least daily**, not weekly. The weekly cadence above produces only one snapshot every 7 days, which is too coarse for member position time-series. Recommended cron string for daily: `0 1 * * *` (every day at 01:00 UTC). When changing the schedule, also update `next_expected_run_at` in the heartbeat code (currently set to 7 days; change to 25 hours for daily, 75 minutes for hourly).
 
 The cron is spaced from other crons in the system:
 - `votion`: Sun 23:55 UTC (weekly)
 - `bribes-history`: Daily 23:35 UTC
 - `tla-snapshot`: Hourly :40
-- `adao-positions`: **Mon 01:00 UTC (weekly)**
+- `adao-positions`: **01:00 UTC** (currently weekly Mon, should be daily)
 
 ### Node.js version
 
@@ -186,3 +194,12 @@ The current schema is `schemaVersion: 1`. If breaking changes are needed, increm
 - Lock VP projections use LST ratios from `network-and-prices.json` rather than re-querying LST hubs
 - Pool USD valuations for amplified positions use `user_lp / pool.lp_health.total_share × pool.depth_usd` (Eris's formula)
 - Bribe USD pricing falls back through three paths: direct token price lookup, LST-ratio-derived price, then null (unpriced)
+
+## Recent changes
+
+### 2026-05-17 — Daily archive added for Portfolio Tracker history
+
+- **Added** `data/daily/YYYY-MM-DD.json` archive — same payload as `current.json` but named by capture date. If the cron runs multiple times per day, the daily file is overwritten (last run of the calendar day wins).
+- **Cleaned up** heartbeat: `runMode` field changed from hardcoded `'weekly'` to `'scheduled'` (the actual cadence is determined by Render's cron expression, not the script).
+- **⚠ Action required**: this cron is currently scheduled WEEKLY on Render (`0 1 * * 1`). For the Portfolio Tracker dashboard to accumulate meaningful history, it needs to be DAILY (`0 1 * * *`). When changing the Render schedule, also update the `next_expected_run_at` constant in the script (currently 7 days; change to 25 hours for daily).
+- Rationale: Portfolio Tracker needs daily snapshots to compute P&L, fee accrual, and "is my position growing" answers. The weekly per-epoch archive is too coarse (7 days between snapshots).
