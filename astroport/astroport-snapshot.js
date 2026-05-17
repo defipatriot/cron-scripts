@@ -385,6 +385,33 @@ async function fetchPoolEpochData(poolMeta) {
         astroportTvlUsd:       poolMeta.poolLiquidityUsd || 0,
         astroportDayVolumeUsd: poolMeta.dayVolumeUsd || 0,
 
+        // Liquidity composition (added 2026-05-17 for LP health scoring)
+        // - poolStakedLiquidityUsd = USD value locked in Astroport's astro-staking
+        //   contract for this pool (not TLA staking, separate)
+        // - poolLpTotalSupply = total LP tokens minted; needed to compute any
+        //   member's pct_of_pool over time as their LP balance / total supply
+        astroportStakedLiquidityUsd: poolMeta.poolStakedLiquidityUsd || 0,
+        astroportLpTotalSupply:      String(poolMeta.poolLiquidity || ''),
+
+        // Fee generation (added 2026-05-17 — core LP health signal)
+        // - dayFeesUsd: USD fees the pool generated in the last 24h
+        // - feeApr: pool-fee yield rate, as a decimal (e.g. 0.05 = 5%)
+        astroportDayFeesUsd: poolMeta.tradingFees?.day || 0,
+        astroportFeeApr:     poolMeta.tradingFees?.apr || 0,
+
+        // Asset reserves at capture time (added 2026-05-17). Each entry:
+        //   { symbol, denom, amount (string), price_usd, precision }
+        // The 'amount' is the raw on-chain amount (not human-scaled). Multiply
+        // by 10^-precision to get the human-readable amount, then by price to
+        // get USD value. Stored as raw to preserve precision.
+        astroportAssets: (poolMeta.assets || []).map(a => ({
+            symbol:    a.symbol || null,
+            denom:     a.denom || a.address || null,
+            amount:    String(a.amount || '0'),
+            price_usd: a.price || 0,
+            precision: a.precision || 6,
+        })),
+
         // Astroport indexer flags
         isDeregistered: !!poolMeta.isDeregistered,
         isBlocked:      !!poolMeta.isBlocked,
@@ -562,8 +589,18 @@ function buildDailyCsv(poolsData, captureDate, captureTime) {
     // Unified daily CSV schema — common prefix matches Skeleton Swap for cross-DEX consumption:
     //   date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd
     // Astroport-specific extras after: bucket,pool_type,is_amplified,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok
-    const header = 'date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd,bucket,pool_type,is_amplified,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok';
+    //
+    // Added 2026-05-17 for LP health scoring + portfolio tracking:
+    //   - fees_24h_usd      pool fee revenue last 24h (LP health signal)
+    //   - fee_apr           fee yield rate (sanity-check vs claimed APR)
+    //   - lp_total_supply   raw LP tokens minted (for member pct_of_pool over time)
+    //   - astro_staked_usd  liquidity in Astroport's astro-staking (separate from TLA staking)
+    //   - assets_json       raw asset reserves as JSON-encoded array (for chain cross-check)
+    const header = 'date,time,dex,pool_name,pool_address,tvl_usd,volume_24h_usd,bucket,pool_type,is_amplified,latest_epoch_avg_liquidity,latest_epoch,deprecated,is_deregistered,fetch_ok,fees_24h_usd,fee_apr,lp_total_supply,astro_staked_usd,assets_json';
     const rows = poolsData.map(p => {
+        // assets_json is double-quoted so embedded commas don't break the CSV row
+        const assetsJsonRaw = JSON.stringify(p.astroportAssets || []);
+        const assetsJsonEscaped = '"' + assetsJsonRaw.replace(/"/g, '""') + '"';
         return [
             captureDate,
             captureTime,
@@ -580,6 +617,11 @@ function buildDailyCsv(poolsData, captureDate, captureTime) {
             p.deprecated ? 'true' : 'false',
             p.isDeregistered ? 'true' : 'false',
             p.fetchOk ? 'true' : 'false',
+            (p.astroportDayFeesUsd || 0).toFixed(6),
+            (p.astroportFeeApr || 0).toFixed(8),
+            p.astroportLpTotalSupply || '',
+            (p.astroportStakedLiquidityUsd || 0).toFixed(2),
+            assetsJsonEscaped,
         ].join(',');
     });
     return [header, ...rows].join('\n') + '\n';
