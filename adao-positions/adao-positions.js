@@ -30,6 +30,7 @@
 
 const https = require('https');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIG
@@ -1311,6 +1312,92 @@ async function publishFile(filePath, content, message) {
 // MAIN CAPTURE FLOW
 // -----------------------------------------------------------------------------
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-frozen failures: chain queries returning stale balances,
+// daodao.zone topStakers/pfpk frozen, or tla-snapshot upstream frozen.
+//
+// adao-positions has the broadest blast radius of any cron — it touches ~1000
+// chain queries, multiple TLA contracts, every named member's wallet, and
+// reads from the network-and-prices + tla-snapshot upstreams. If everything
+// froze at once, the fingerprint catches it.
+//
+// Fingerprint inputs: top-level totals + per-member (address, vp, lp_position,
+// pending rewards/bribes). Excludes epoch.number (counter that auto-flips).
+// 3 identical consecutive runs → 'stuck'.
+
+const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(portfoliosDoc) {
+    const totals = portfoliosDoc.totals || {};
+    // Per-member volatile signals
+    const memberItems = [];
+    for (const m of portfoliosDoc.members || []) {
+        const s = m.summary || {};
+        memberItems.push([
+            m.wallet || m.name || '?',
+            s.voting_power_human ?? null,
+            s.total_lp_position_usd ?? null,
+            s.total_pending_rewards_usd ?? null,
+            s.total_pending_bribes_usd ?? null,
+            s.lock_count ?? null,
+        ]);
+    }
+    memberItems.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+
+    const input = JSON.stringify({
+        // Pick only the numeric/scalar totals — skip nested objects
+        totals: {
+            named_member_count:           totals.named_member_count ?? null,
+            total_voting_power_human:     totals.total_voting_power_human ?? null,
+            total_lp_position_usd:        totals.total_lp_position_usd ?? null,
+            total_locked_usd:             totals.total_locked_usd ?? null,
+            total_pending_rewards_usd:    totals.total_pending_rewards_usd ?? null,
+            total_pending_bribes_usd:     totals.total_pending_bribes_usd ?? null,
+            total_wallet_balances_usd:    totals.total_wallet_balances_usd ?? null,
+            active_lp_positions:          totals.active_lp_positions ?? null,
+            at_risk_lp_positions:         totals.at_risk_lp_positions ?? null,
+        },
+        members: memberItems,
+        luna_price: portfoliosDoc.luna_price_used_usd ?? null,
+    });
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our previous heartbeat — graceful failure (returns null).
+function fetchPreviousHeartbeat() {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/data/heartbeat.json`;
+        const req = https.get(url, { timeout: 8000 }, (res) => {
+            if (res.statusCode !== 200) { resolve(null); return; }
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); }
+                catch (e) { resolve(null); }
+            });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureSnapshot() {
     const startedAt = new Date();
     console.log(`🚀 aDAO Positions Cron — ${startedAt.toISOString()}`);
@@ -1468,10 +1555,29 @@ async function captureSnapshot() {
         await publishFile(dailyPath, portfoliosContent, `📸 positions daily snapshot — ${dateStr}`);
         console.log(`  ✓ Published ${dailyPath}`);
 
+        // Compute data fingerprint and check freshness vs previous run.
+        // Catches frozen chain queries, daodao.zone freezes, or upstream freezes.
+        console.log('🔍 Computing data fingerprint...');
+        const dataFingerprint = computeDataFingerprint(portfoliosDoc);
+        const prevHeartbeat = await fetchPreviousHeartbeat();
+        const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+        const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+        console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+        console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                    (freshness.consecutiveStuckRuns > 1
+                        ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                        : ''));
+
         // Heartbeat — uniform freshness contract across all crons
         // Status is 'partial' if any tracked treasury fetch failed (council is optional but tracked).
+        // 'stuck' overrides both 'ok' and 'partial' (worst wins).
         const allTreasuriesOk = validTreasuries.length === ADAO_TREASURY_WALLETS.length;
         const allCouncilsOk   = validCouncils.length === COUNCIL_TREASURY_WALLETS.length;
+        let status;
+        if (freshness.dataFreshness === 'stuck')                  status = 'stuck';
+        else if (!allTreasuriesOk || !allCouncilsOk)              status = 'partial';
+        else                                                      status = 'ok';
+
         const heartbeat = {
             schemaVersion: 1,
             cron: 'adao-positions',
@@ -1483,13 +1589,18 @@ async function captureSnapshot() {
             // freshness vs next_expected_run_at, so this is mainly informational.
             runMode: 'scheduled',
             currentEpoch: epochInfo.number,
-            status: (allTreasuriesOk && allCouncilsOk) ? 'ok' : 'partial',
+            status,
             stats: {
                 members_count: validPortfolios.length,
                 treasury_present: !!portfoliosDoc.treasury,
                 council_present: !!portfoliosDoc.council_treasury,
                 council_count: validCouncils.length,
             },
+            // Freshness-monitoring fields (catches chain/upstream frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             // Match the Render schedule. Currently set to 25 hours = daily schedule
             // (cron expression `0 1 * * *`). Slight overshoot from 24h gives jitter room.
             // If you change the Render schedule, update this:
