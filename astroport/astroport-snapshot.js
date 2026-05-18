@@ -37,6 +37,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION
@@ -719,6 +720,73 @@ function determineRunMode(now) {
     return 'daily';
 }
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-data-frozen failures (warlock-style: cron runs successfully
+// but always gets identical numbers back from the upstream). For Astroport,
+// the upstream is Astroport's own indexer (`pools.getAll` + the per-pool charts
+// endpoints). If their indexer freezes, we want to flag it within 3 runs
+// instead of waiting weeks to notice on the dashboard.
+//
+// Fingerprint includes per-pool: TVL, 24h volume, LP total supply, and the
+// first-two asset reserve amounts. These all change with normal trading
+// activity, so identical fingerprints across runs are a strong stuck signal.
+// Excluded: pool addresses, timestamps, anything else stable.
+
+const STUCK_THRESHOLD = 3;   // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(poolsData) {
+    const items = [];
+    for (const p of poolsData) {
+        const key = p.poolContract || p.canonicalName || '?';
+        if (p.fetchOk || p.astroportTvlUsd) {
+            const assetAmounts = (p.astroportAssets || []).slice(0, 2).map(a => a.amount);
+            items.push([
+                key,
+                p.astroportTvlUsd,
+                p.astroportDayVolumeUsd,
+                p.astroportLpTotalSupply,
+                ...assetAmounts,
+            ]);
+        } else {
+            items.push([key, 'FAIL']);
+        }
+    }
+    items.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    const input = JSON.stringify(items);
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our own previous heartbeat so we can carry forward consecutiveStuckRuns
+// and compare fingerprints. Returns null on any error — must NEVER fail the run.
+// Reuses fetchRawFromRepo which already handles GITHUB_REPO + GITHUB_BRANCH.
+async function fetchPreviousHeartbeat() {
+    try {
+        const raw = await fetchRawFromRepo('data/heartbeat.json');
+        if (!raw) return null;
+        return JSON.parse(raw);
+    } catch (e) {
+        console.log(`   [freshness] no previous heartbeat available (${(e.message || '').slice(0, 60)})`);
+        return null;
+    }
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureAstroportSnapshot() {
     const startedAt = new Date();
     const runMode = determineRunMode(startedAt);
@@ -828,6 +896,25 @@ async function captureAstroportSnapshot() {
 
     // Phase 6: Publish
     // Build heartbeat content. Status reflects whether all targeted pools succeeded.
+
+    // Compute data fingerprint and check freshness vs previous run (warlock-style guard).
+    console.log('\n🔍 Computing data fingerprint...');
+    const dataFingerprint = computeDataFingerprint(poolsData);
+    const prevHeartbeat = await fetchPreviousHeartbeat();
+    const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+    const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+    console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+    console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                (freshness.consecutiveStuckRuns > 1
+                    ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                    : ''));
+
+    // Status escalation order (worst wins): stuck > partial > ok
+    let status;
+    if (freshness.dataFreshness === 'stuck') status = 'stuck';
+    else if (failed > 0)                     status = 'partial';
+    else                                     status = 'ok';
+
     const heartbeat = {
         schemaVersion: 1,
         cron: 'astroport',
@@ -836,8 +923,13 @@ async function captureAstroportSnapshot() {
         runId: `astro-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
         runMode,
         currentEpoch,
-        status: failed === 0 ? 'ok' : 'partial',
+        status,
         stats: { ok, deprecated, failed, total: targetPools.length },
+        // Freshness-monitoring fields (catches upstream-frozen failures)
+        dataFingerprint,
+        previousFingerprint:  freshness.previousFingerprint,
+        dataFreshness:        freshness.dataFreshness,
+        consecutiveStuckRuns: freshness.consecutiveStuckRuns,
         next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
     };
     const heartbeatFilename = 'data/heartbeat.json';
