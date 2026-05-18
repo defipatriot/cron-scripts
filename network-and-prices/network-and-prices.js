@@ -30,6 +30,7 @@
 
 const https = require('https');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION
@@ -702,6 +703,72 @@ async function pushToGithub(filepath, content, message) {
 // MAIN
 // -----------------------------------------------------------------------------
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-oracle-frozen failures. Critical for NAP because downstream
+// crons (skeletonswap, astroport, tla-snapshot) depend on NAP's prices — if
+// NAP serves stale data, the entire dashboard goes silently wrong.
+//
+// NAP runs HOURLY (unlike daily crons). Token prices should change every minute
+// in real markets, so 2 hours of identical prices is already suspicious and
+// 3 hours is definitive evidence the oracle source(s) have frozen.
+//
+// Fingerprint contents: sorted (token_name, final_price_usd) tuples + LUNA
+// market price. Excludes block height (changes constantly and would mask
+// price-source freezes) and timestamps. If the fingerprint is identical to
+// the previous run, either prices genuinely didn't move (extremely unlikely
+// for 27 tokens hourly) or both Astroport AND CoinGecko sources are stuck.
+
+const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(snapshot) {
+    const items = [];
+    const tp = snapshot.token_prices || {};
+    for (const [name, entry] of Object.entries(tp)) {
+        const price = entry?.final_price_usd ?? null;
+        items.push([name, price]);
+    }
+    items.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    // Include LUNA market price (independent CoinGecko detail endpoint, not in token_prices)
+    const lunaPrice = snapshot.luna_market?.price_usd ?? null;
+    const input = JSON.stringify({ tokens: items, luna: lunaPrice });
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our previous heartbeat from GitHub raw — graceful failure (returns null).
+function fetchPreviousHeartbeat() {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/data/heartbeat.json`;
+        const req = https.get(url, { timeout: 8000 }, (res) => {
+            if (res.statusCode !== 200) { resolve(null); return; }
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); }
+                catch (e) { resolve(null); }
+            });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureNetworkAndPrices() {
     const startedAt = new Date();
     const dateStr = startedAt.toISOString().slice(0, 10);
@@ -764,6 +831,18 @@ async function captureNetworkAndPrices() {
     // series field within each snapshot).
     const isEndOfDay = startedAt.getUTCHours() === 23;
 
+    // Compute data fingerprint and check freshness vs previous run (oracle-frozen guard).
+    console.log('🔍 Computing data fingerprint...');
+    const dataFingerprint = computeDataFingerprint(snapshot);
+    const prevHeartbeat = await fetchPreviousHeartbeat();
+    const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+    const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+    console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+    console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                (freshness.consecutiveStuckRuns > 1
+                    ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                    : ''));
+
     if (GITHUB_TOKEN) {
         console.log('\n📤 Publishing to GitHub...');
         await pushToGithub('data/network-and-prices.json', content,
@@ -777,6 +856,12 @@ async function captureNetworkAndPrices() {
         }
         // Heartbeat — uniform freshness contract across all crons
         const sourceFailures = Object.entries(snapshot.sources).filter(([, v]) => !v.ok).length;
+        // Status escalation (worst wins): stuck > partial > ok
+        let status;
+        if (freshness.dataFreshness === 'stuck') status = 'stuck';
+        else if (sourceFailures > 0)             status = 'partial';
+        else                                     status = 'ok';
+
         const heartbeat = {
             schemaVersion: 1,
             cron: 'network-and-prices',
@@ -784,12 +869,17 @@ async function captureNetworkAndPrices() {
             capturedAtUnix: startedAt.getTime(),
             runId: `nap-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
-            status: sourceFailures === 0 ? 'ok' : 'partial',
+            status,
             stats: {
                 tokens_priced: Object.keys(tokenPrices || {}).length,
                 lst_ratios:    Object.keys(ratios.ratios || {}).length,
                 source_failures: sourceFailures,
             },
+            // Freshness-monitoring fields (catches oracle-frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: snapshot.nextRefreshExpectedAt,
         };
         await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
@@ -802,8 +892,13 @@ async function captureNetworkAndPrices() {
             capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
             runId: `nap-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
-            status: 'ok',
+            status: freshness.dataFreshness === 'stuck' ? 'stuck' : 'ok',
             stats: { tokens_priced: Object.keys(tokenPrices || {}).length },
+            // Freshness-monitoring fields (catches oracle-frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: snapshot.nextRefreshExpectedAt,
         }, null, 2));
         console.log(`  Saved: network-and-prices.json, heartbeat.json`);
