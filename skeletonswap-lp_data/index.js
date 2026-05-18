@@ -1,6 +1,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 // =============================================================================
@@ -469,6 +470,75 @@ function getDayOfWeek(date) {
 // DAILY SNAPSHOT
 // =============================================================================
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-data-frozen failures (the warlock-style bug where the cron
+// runs successfully but always gets the same numbers back). Approach:
+//
+//   1) Compute a SHA-256 of the run's volatile fields (reserves + total_share
+//      across all pools). Excludes timestamps and pool addresses — those
+//      always drift even when the underlying data is frozen.
+//   2) Fetch our previous heartbeat from GitHub and compare its fingerprint.
+//   3) Same fingerprint = 'suspicious'. Suspicious N times in a row = 'stuck'.
+//
+// Threshold for SS: 2 identical runs → suspicious, 3+ → stuck. LP-share counts
+// on Terra change with every deposit/withdraw — even small pools see daily
+// movement. Three identical daily runs would be extraordinary.
+
+const STUCK_THRESHOLD = 3;   // 3+ identical consecutive runs → 'stuck'
+const HEARTBEAT_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/data/heartbeat.json`;
+
+function computeDataFingerprint(poolsMetadata, chainResults) {
+  // Build a deterministic string from the volatile fields only.
+  // Order-stable: sort by pool_id so the hash doesn't depend on input order.
+  const items = [];
+  for (let i = 0; i < poolsMetadata.length; i++) {
+    const meta = poolsMetadata[i];
+    const res = chainResults[i];
+    if (res && res.ok) {
+      items.push([meta.pool_id, res.value.reserve_0, res.value.reserve_1, res.value.total_share]);
+    } else {
+      // Failed pools still contribute (as 'FAIL') so the fingerprint changes
+      // when failure patterns change.
+      items.push([meta.pool_id, 'FAIL']);
+    }
+  }
+  items.sort((a, b) => a[0].localeCompare(b[0]));
+  const input = JSON.stringify(items);
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetches the previous heartbeat from GitHub raw so we can carry forward the
+// 'consecutiveStuckRuns' counter and compare fingerprints. Returns null on any
+// error — a missing/unreachable previous heartbeat must NOT fail the cron run.
+async function fetchPreviousHeartbeat() {
+  try {
+    const data = await fetchJson(HEARTBEAT_URL, { retries: 1, timeoutMs: 8000 });
+    return data;
+  } catch (e) {
+    console.log(`  [freshness] no previous heartbeat available (${e.message.slice(0, 60)})`);
+    return null;
+  }
+}
+
+function classifyFreshness(currentFp, prev) {
+  if (!prev || !prev.dataFingerprint) {
+    return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+  }
+  const previousFingerprint = prev.dataFingerprint;
+  if (currentFp !== previousFingerprint) {
+    return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+  }
+  // Fingerprint matches previous run. Increment the counter from the previous heartbeat.
+  const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+  const consecutive = priorCount + 1;
+  const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+  return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
+
 async function runDaily() {
   console.log('\n========== DAILY SNAPSHOT ==========\n');
 
@@ -586,13 +656,30 @@ async function runDaily() {
     await calculate6DayAverage();
   }
 
+  // -- Step 6: data freshness check (catches upstream-frozen failures) -------
+  console.log('Computing data fingerprint...');
+  const dataFingerprint = computeDataFingerprint(pools, chainResults);
+  const prevHeartbeat = await fetchPreviousHeartbeat();
+  const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+  const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+  console.log(`  fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+  console.log(`  ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+              (freshness.consecutiveStuckRuns > 1
+                ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                : ''));
+  console.log();
+
   return {
     pools: pools.length,
     file: filename,
     priced: pools.length - unpriced.length - chainFailed.length,
     unpriced: unpriced.length,
     chainFailed: chainFailed.length,
-    tvlSum: Math.round(tvlSum * 100) / 100
+    tvlSum: Math.round(tvlSum * 100) / 100,
+    dataFingerprint,
+    previousFingerprint: freshness.previousFingerprint,
+    dataFreshness: freshness.dataFreshness,
+    consecutiveStuckRuns: freshness.consecutiveStuckRuns
   };
 }
 
@@ -1020,12 +1107,17 @@ function writeHeartbeat(mode, result) {
     yearly:  365 * 24 * 60 * 60 * 1000,
   }[mode] || 24 * 60 * 60 * 1000;
 
-  // Status: 'ok' when every pool successfully queried the chain. Pools that
-  // queried fine but lacked a price for one side don't fail the run (they
-  // write empty TVL — intentional), so unpriced count is reported as info
-  // only and does not flip the status. Chain query failure does flip it.
+  // Compose overall status. Tier order (worst wins):
+  //   stuck (dataFreshness)  >  chainFailed > 0  >  ok
+  // 'suspicious' freshness is reported as a field but does NOT escalate the
+  // overall status — one identical run can legitimately happen on quiet pools.
+  // Only 3+ consecutive identical runs ('stuck') flips status.
   const chainFailed = result?.chainFailed ?? 0;
-  const status = chainFailed === 0 ? 'ok' : 'partial';
+  const freshness = result?.dataFreshness ?? 'fresh';
+  let status;
+  if (freshness === 'stuck')      status = 'stuck';
+  else if (chainFailed > 0)       status = 'partial';
+  else                            status = 'ok';
 
   const heartbeat = {
     schemaVersion: 1,
@@ -1044,12 +1136,17 @@ function writeHeartbeat(mode, result) {
       tvlSumUsd:      result?.tvlSum ?? null,
       fileWritten:    result?.file ?? null,
     },
+    // Freshness-monitoring fields (catches warlock-style upstream freezes)
+    dataFingerprint:       result?.dataFingerprint ?? null,
+    previousFingerprint:   result?.previousFingerprint ?? null,
+    dataFreshness:         result?.dataFreshness ?? null,
+    consecutiveStuckRuns:  result?.consecutiveStuckRuns ?? 0,
     next_expected_run_at: new Date(now.getTime() + cadenceMs).toISOString(),
   };
   // Ensure data/ exists then write
   if (!fs.existsSync('data')) fs.mkdirSync('data', { recursive: true });
   fs.writeFileSync('data/heartbeat.json', JSON.stringify(heartbeat, null, 2));
-  console.log(`📍 Heartbeat written: data/heartbeat.json (mode=${mode}, epoch=${epoch}, status=${status})`);
+  console.log(`📍 Heartbeat written: data/heartbeat.json (mode=${mode}, epoch=${epoch}, status=${status}, freshness=${freshness})`);
 }
 
 // =============================================================================
