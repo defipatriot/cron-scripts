@@ -39,6 +39,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION
@@ -385,6 +386,77 @@ async function pushToGithub(filepath, content, message) {
 // MAIN
 // -----------------------------------------------------------------------------
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-frozen failures (PD DAODAO proposal queries stuck, or
+// bribe-manager contract reads returning identical data across runs).
+//
+// Bribes-history runs daily. Two volatile signals are mixed:
+//   1. PD proposal counter (only goes up — new bribes get proposed/executed)
+//   2. Active bribe state (changes intra-epoch as claimers withdraw amounts)
+//
+// Fingerprint excludes `currentEpoch` (counter that auto-changes weekly,
+// would mask freezes around epoch boundaries). Includes the substantive
+// state: aggregate counters + per-bribe gauge + asset + amounts.
+//
+// 3 identical daily runs in a row → 'stuck'. Note: false-positive risk is
+// slightly higher than other crons because quiet PD weeks with no claims
+// are plausible — but over 3 days SOMEONE usually claims something, so
+// fully-identical bribe amounts for 3 days running would be unusual.
+
+const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(masterFile, currentStateFile) {
+    // Per-active-bribe volatile signals (amounts change as claimers withdraw)
+    const bribeItems = [];
+    for (const b of currentStateFile.active_bribes || []) {
+        const assetKey = b.asset?.cw20 || b.asset?.native || JSON.stringify(b.asset || {});
+        const amounts = (b.assets || []).map(a => a.amount).sort();
+        bribeItems.push([b.gauge || '?', assetKey, ...amounts]);
+    }
+    bribeItems.sort((a, b) => `${a[0]}|${a[1]}`.localeCompare(`${b[0]}|${b[1]}`));
+
+    const input = JSON.stringify({
+        stats: masterFile.stats || {},
+        active_bribes: bribeItems,
+    });
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our previous heartbeat — graceful failure (returns null).
+function fetchPreviousHeartbeat() {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/data/heartbeat.json`;
+        const req = https.get(url, { timeout: 8000 }, (res) => {
+            if (res.statusCode !== 200) { resolve(null); return; }
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); }
+                catch (e) { resolve(null); }
+            });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureBribesHistory() {
     const startedAt = new Date();
     // currentEpoch is 1-indexed canonical, matching `epoch_1-300_date.json` and
@@ -458,6 +530,22 @@ async function captureBribesHistory() {
         bribers,
     };
 
+    // Compute data fingerprint and check freshness vs previous run.
+    // Catches frozen PD proposal queries or frozen bribe-manager contract reads.
+    console.log('🔍 Computing data fingerprint...');
+    const dataFingerprint = computeDataFingerprint(masterFile, currentStateFile);
+    const prevHeartbeat = await fetchPreviousHeartbeat();
+    const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+    const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+    console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+    console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                (freshness.consecutiveStuckRuns > 1
+                    ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                    : ''));
+
+    // Status: stuck overrides ok (no chain-failure concept here)
+    const status = freshness.dataFreshness === 'stuck' ? 'stuck' : 'ok';
+
     // Publish or save locally
     if (GITHUB_TOKEN) {
         console.log('\n📤 Publishing to GitHub...');
@@ -485,8 +573,13 @@ async function captureBribesHistory() {
             runId: `bribes-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'daily',
             currentEpoch,
-            status: 'ok',
+            status,
             stats: masterFile.stats,
+            // Freshness-monitoring fields (catches PD/bribe-manager frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
         };
         await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
@@ -504,13 +597,18 @@ async function captureBribesHistory() {
                 epoch: parseInt(sampleEp), bribes: byEpoch[sampleEp],
             }, null, 2));
         }
-        // Heartbeat — local
+        // Heartbeat — local (still includes freshness fields for schema consistency)
         fs.writeFileSync('heartbeat.json', JSON.stringify({
             schemaVersion: 1, cron: 'bribes-history',
             capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
             runId: `bribes-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
-            runMode: 'daily', currentEpoch, status: 'ok',
+            runMode: 'daily', currentEpoch, status,
             stats: masterFile.stats,
+            // Freshness-monitoring fields
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: new Date(startedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
         }, null, 2));
         console.log(`  Saved: pd-bribes-history.json, current-state.json, bribers-registry.json, epoch-${sampleEp}.json, heartbeat.json`);
