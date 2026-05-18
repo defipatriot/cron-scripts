@@ -59,6 +59,7 @@
 
 const https = require('https');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION
@@ -564,6 +565,92 @@ async function pushToGithub(filepath, content, message) {
 // MAIN
 // -----------------------------------------------------------------------------
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-frozen failures (Eris backend stuck, LCD frozen, CG stuck).
+// Votion runs WEEKLY (Sunday 23:55 UTC) so the cadence is slow, but the
+// underlying data should always move week-to-week:
+//   - LUNA price changes constantly
+//   - LST ratios (ampLUNA, arbLUNA) grow weekly via staking rewards
+//   - VP allocations shift when members re-vote
+//
+// Excludes `period` from fingerprint — that's a counter and would mask freezes
+// by always changing. Excludes timestamps. Includes substantive financial data.
+//
+// 3 identical weekly runs → 'stuck' (3 weeks of unchanged Eris data = real bug)
+
+const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(snapshot) {
+    // Per-lockup volatile signals
+    const lockupItems = [];
+    for (const lk of snapshot.lockups || []) {
+        lockupItems.push([
+            lk.type || '?',
+            lk.duration || '?',
+            lk.vp ?? null,
+            lk.amount ?? null,
+            lk.luna ?? null,
+        ]);
+    }
+    lockupItems.sort((a, b) => `${a[0]}|${a[1]}`.localeCompare(`${b[0]}|${b[1]}`));
+
+    // Per-pool volatile signals (votion.pools is a dict keyed by "<name>|<dex>")
+    const poolItems = [];
+    for (const [key, p] of Object.entries(snapshot.pools || {})) {
+        poolItems.push([
+            key,
+            p.current_vp ?? null,
+            p.optimized_vp ?? null,
+        ]);
+    }
+    poolItems.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+
+    const input = JSON.stringify({
+        total_vp:     snapshot.total_vp ?? null,
+        luna_usd:     snapshot.prices?.LUNA_USD ?? null,
+        ratio_arb:    snapshot.ratios?.arbLUNA?.ratio ?? snapshot.ratios?.arbLUNA ?? null,
+        ratio_amp:    snapshot.ratios?.ampLUNA?.ratio ?? snapshot.ratios?.ampLUNA ?? null,
+        lockups:      lockupItems,
+        pools:        poolItems,
+    });
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our previous heartbeat from GitHub raw — graceful failure (returns null).
+function fetchPreviousHeartbeat() {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/data/heartbeat.json`;
+        const req = https.get(url, { timeout: 8000 }, (res) => {
+            if (res.statusCode !== 200) { resolve(null); return; }
+            let body = '';
+            res.on('data', c => body += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(body)); }
+                catch (e) { resolve(null); }
+            });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureVotionSnapshot() {
     const startedAt = new Date();
     console.log(`\n📸 Votion Epoch Snapshot (v2 — rich shape)`);
@@ -663,6 +750,23 @@ async function captureVotionSnapshot() {
         console.log(`\n📤 Pushing to GitHub: ${filename} (${(content.length/1024).toFixed(1)} KB)...`);
         await pushToGithub(filename, content, message);
 
+        // Compute data fingerprint and check freshness vs previous run.
+        // Catches frozen Eris backend, frozen LCD, or frozen CoinGecko.
+        console.log('🔍 Computing data fingerprint...');
+        const dataFingerprint = computeDataFingerprint(snapshot);
+        const prevHeartbeat = await fetchPreviousHeartbeat();
+        const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+        const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+        console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+        console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                    (freshness.consecutiveStuckRuns > 1
+                        ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                        : ''));
+
+        // Status: stuck overrides ok (no chain-failure concept here — Eris fetch
+        // failures are recorded inline in fetchErrors but don't fail the run).
+        const status = freshness.dataFreshness === 'stuck' ? 'stuck' : 'ok';
+
         // Heartbeat — uniform freshness contract across all crons
         const heartbeat = {
             schemaVersion: 1,
@@ -672,12 +776,17 @@ async function captureVotionSnapshot() {
             runId: `votion-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'weekly',
             currentEpoch: period,
-            status: 'ok',
+            status,
             stats: {
                 lockups_captured: Array.isArray(snapshot.lockups) ? snapshot.lockups.length
                                 : Array.isArray(snapshot.wallets) ? snapshot.wallets.length
                                 : null,
             },
+            // Freshness-monitoring fields (catches Eris/LCD/CG frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         };
         await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
@@ -686,11 +795,19 @@ async function captureVotionSnapshot() {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally only');
         const filename = `votion-epoch-${period || 'test'}.json`;
         fs.writeFileSync(filename, JSON.stringify(snapshot, null, 2));
+        // Local-save branch: still compute the fingerprint so the local heartbeat
+        // contains the same schema, but no remote previous to compare against.
+        const dataFingerprint = computeDataFingerprint(snapshot);
         fs.writeFileSync('heartbeat.json', JSON.stringify({
             schemaVersion: 1, cron: 'votion',
             capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
             runId: `votion-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'weekly', currentEpoch: period, status: 'ok',
+            // Freshness-monitoring fields (local-only, no comparison)
+            dataFingerprint,
+            previousFingerprint: null,
+            dataFreshness: 'fresh',
+            consecutiveStuckRuns: 0,
             next_expected_run_at: new Date(startedAt.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         }, null, 2));
         console.log(`   Saved: ${filename}, heartbeat.json`);
