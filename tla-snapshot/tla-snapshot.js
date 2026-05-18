@@ -27,6 +27,7 @@
 
 const https = require('https');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // -----------------------------------------------------------------------------
 // CONFIG
@@ -1422,6 +1423,70 @@ async function pushToGithub(filepath, content, message) {
 // MAIN
 // -----------------------------------------------------------------------------
 
+// =============================================================================
+// DATA FRESHNESS MONITORING
+// =============================================================================
+//
+// Detects upstream-stuck or chain-stuck failures. TLA-snapshot is an aggregator
+// of votion, bribes, astroport, ss, and network-and-prices PLUS live chain
+// queries. If everything froze at once (warlock-style), per-pool values would
+// be identical across runs.
+//
+// Fingerprint contents per pool: name + voting_power.vp + depth_usd +
+// staked_in_tla_usd — the three most-volatile signals that combine upstream
+// data with chain state. Plus aggregate totals as a quick top-line check.
+//
+// Hourly cadence + 3-run threshold means stuck detection within ~3 hours of
+// a total-system freeze.
+
+const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
+
+function computeDataFingerprint(snapshot) {
+    const items = [];
+    const pools = snapshot.pools || [];
+    for (const p of pools) {
+        items.push([
+            p.name || p.pool_address || '?',
+            p.voting_power?.vp ?? null,
+            p.depth_usd ?? null,
+            p.staked_in_tla_usd ?? null,
+        ]);
+    }
+    items.sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    const input = JSON.stringify({
+        pools: items,
+        tla_tvl_usd:        snapshot.totals?.tla_tvl_usd ?? null,
+        depth_total:        snapshot.totals?.depth_usd_total ?? null,
+        active_pools_count: snapshot.totals?.active_pools_count ?? null,
+    });
+    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+// Fetch our own previous heartbeat — graceful failure (returns null).
+async function fetchPreviousHeartbeat() {
+    try {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/data/heartbeat.json`;
+        return await fetchJson(url, 'previous-heartbeat');
+    } catch (e) {
+        console.log(`   [freshness] no previous heartbeat available (${(e.message || '').slice(0, 60)})`);
+        return null;
+    }
+}
+
+function classifyFreshness(currentFp, prev) {
+    if (!prev || !prev.dataFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
+    }
+    const previousFingerprint = prev.dataFingerprint;
+    if (currentFp !== previousFingerprint) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
+    }
+    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
+    const consecutive = priorCount + 1;
+    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
+    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
+}
+
 async function captureTlaSnapshot() {
     const startedAt = new Date();
     const epochInfo = currentEpochInfo();
@@ -1583,8 +1648,28 @@ async function captureTlaSnapshot() {
         } else {
             console.log(`  (skipping daily archive — only written at 23:xx UTC)`);
         }
+        // Compute data fingerprint and check freshness vs previous run.
+        // Catches whole-system stalls (warlock-style) — when all upstream sources
+        // and chain queries return identical data across consecutive runs.
+        console.log('🔍 Computing data fingerprint...');
+        const dataFingerprint = computeDataFingerprint(snapshot);
+        const prevHeartbeat = await fetchPreviousHeartbeat();
+        const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
+        const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
+        console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+        console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
+                    (freshness.consecutiveStuckRuns > 1
+                        ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
+                        : ''));
+
         // Heartbeat — uniform freshness contract across all crons
         const sourceFailures = Object.values(snapshot.sources || {}).filter(v => v === false).length;
+        // Status escalation (worst wins): stuck > partial > ok
+        let status;
+        if (freshness.dataFreshness === 'stuck') status = 'stuck';
+        else if (sourceFailures > 0)             status = 'partial';
+        else                                     status = 'ok';
+
         const heartbeat = {
             schemaVersion: 1,
             cron: 'tla-snapshot',
@@ -1593,13 +1678,18 @@ async function captureTlaSnapshot() {
             runId: `tla-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: isEndOfDay ? 'hourly+daily-archive' : 'hourly',
             currentEpoch: epochInfo.currentEpoch,
-            status: sourceFailures === 0 ? 'ok' : 'partial',
+            status,
             stats: {
                 total_pools: (snapshot.pools || []).length,
                 active_pools: totals.active_pools_count,
                 voted_pools: totals.voted_pools_count,
                 source_failures: sourceFailures,
             },
+            // Freshness-monitoring fields (catches upstream/chain-frozen failures)
+            dataFingerprint,
+            previousFingerprint:  freshness.previousFingerprint,
+            dataFreshness:        freshness.dataFreshness,
+            consecutiveStuckRuns: freshness.consecutiveStuckRuns,
             next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
         };
         await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeat, null, 2),
@@ -1607,12 +1697,19 @@ async function captureTlaSnapshot() {
     } else {
         console.log('\n⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('tla-snapshot.json', content);
+        // Compute fingerprint for local-save branch too (no remote previous to compare against)
+        const dataFingerprint = computeDataFingerprint(snapshot);
         fs.writeFileSync('heartbeat.json', JSON.stringify({
             schemaVersion: 1, cron: 'tla-snapshot',
             capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
             runId: `tla-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'hourly', currentEpoch: epochInfo.currentEpoch, status: 'ok',
             stats: { total_pools: (snapshot.pools || []).length, active_pools: totals.active_pools_count },
+            // Freshness-monitoring fields (local-only, no comparison)
+            dataFingerprint,
+            previousFingerprint: null,
+            dataFreshness: 'fresh',
+            consecutiveStuckRuns: 0,
             next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
         }, null, 2));
         console.log(`  Saved: tla-snapshot.json, heartbeat.json`);
