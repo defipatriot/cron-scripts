@@ -7,7 +7,37 @@ const { execSync } = require('child_process');
 // CONFIGURATION
 // =============================================================================
 
-const API_URL = 'https://dex.warlock.backbonelabs.io/api/pools/phoenix-1';
+// -----------------------------------------------------------------------------
+// Data sources for the new Skeleton Swap architecture (2026-05-18).
+//
+// Background: the old bulk endpoint at dex.warlock.backbonelabs.io/api/pools/phoenix-1
+// went stale on 2026-04-16 — the API still responds, but every pool's data is
+// frozen at the 2026-04-16T17:00:00Z snapshot (verified in HAR trace + repo
+// inspection). Skeleton Swap's own front-end migrated to a hybrid architecture
+// that queries the chain directly for reserves and ignores warlock for those
+// fields. We mirror that approach here.
+//
+// Fresh fields (computed every run):
+//   - reserve_0, reserve_1, total_share  → LCD smart query {"pool":{}}
+//   - tvl_usd                            → reserves × prices from network-and-prices cron
+//
+// Permanently null fields (no longer have a trustworthy source):
+//   - volume_24h_usd, volume_7d_usd, apr_7d
+//   These would require indexing swap events from chain history.
+//   The pre-2026-04-16 backups in this repo are the only volume history we have.
+// -----------------------------------------------------------------------------
+const POOLS_LIST_URL = 'https://skeletonswap.backbonelabs.io/mainnet/phoenix-1/pools_list.json';
+const PRICES_URL = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const LCD_URL = process.env.TERRA_LCD || 'https://terra-lcd.publicnode.com';
+
+// Concurrency cap when querying pools in parallel. Public LCD endpoints tolerate
+// ~10-15 in-flight requests comfortably; 34 pools at 8 concurrent ≈ 5 batches.
+const POOL_QUERY_CONCURRENCY = 8;
+
+// Sandbox / local-testing escape hatch. When set, read pools_list.json from disk
+// instead of fetching it (skeletonswap.backbonelabs.io isn't always reachable
+// from CI sandboxes). Production on Render leaves this unset and fetches live.
+const POOLS_LIST_FIXTURE = process.env.SS_POOLS_LIST_FIXTURE || '';
 
 // GitHub config (set via environment variables)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -39,21 +69,63 @@ const AGG_HEADERS = 'period,period_start,period_end,snapshots_used,snapshots_exp
 // UTILITIES
 // =============================================================================
 
-function fetch(url) {
+// HTTP helper with redirect-following, timeout, headers, and retry.
+// Used for all three external calls (pools_list, prices file, LCD smart queries).
+function httpRequest(url, { method = 'GET', headers = {}, body = null, timeoutMs = 15000 } = {}) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
+    const u = new URL(url);
+    const reqOpts = {
+      method,
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + (u.search || ''),
+      headers: {
+        'User-Agent': 'ss-cron/1.0',
+        ...(body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {}),
+        ...headers
+      },
+      timeout: timeoutMs
+    };
+    const req = https.request(reqOpts, (res) => {
+      // Follow redirects (GitHub raw → S3)
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, url).toString();
+        return resolve(httpRequest(next, { method, headers, body, timeoutMs }));
+      }
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(new Error('Failed to parse JSON'));
+        if (res.statusCode >= 400) {
+          return reject(new Error(`HTTP ${res.statusCode} from ${url}: ${data.slice(0, 200)}`));
         }
+        resolve({ status: res.statusCode, body: data });
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error(`Timeout after ${timeoutMs}ms: ${url}`)); });
+    if (body) req.write(body);
+    req.end();
   });
 }
+
+async function fetchJson(url, opts = {}) {
+  const { retries = 2 } = opts;
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const { body } = await httpRequest(url, opts);
+      return JSON.parse(body);
+    } catch (e) {
+      lastErr = e;
+      if (i < retries) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw new Error(`fetchJson failed after ${retries + 1} attempts: ${lastErr.message}`);
+}
+
+// Backward-compat shim — kept in case any other function still calls fetch()
+function fetch(url) { return fetchJson(url); }
 
 function ensureDirs() {
   // Create weekly-avg and monthly-avg folders if needed
@@ -235,6 +307,146 @@ function computeAggMetadata(filesRead, expectedCount) {
 function rowPoolName(row) { return row.pool_name || row.pool_id || ''; }
 
 // =============================================================================
+// SKELETON SWAP DATA ACQUISITION (new architecture — replaces stale warlock API)
+// =============================================================================
+
+// 1) Load pool metadata (canonical list of active pools + denoms + decimals).
+//    Uses the same source the live Skeleton Swap front-end uses.
+async function loadPoolsList() {
+  if (POOLS_LIST_FIXTURE && fs.existsSync(POOLS_LIST_FIXTURE)) {
+    console.log(`  [pools_list] reading from fixture: ${POOLS_LIST_FIXTURE}`);
+    return JSON.parse(fs.readFileSync(POOLS_LIST_FIXTURE, 'utf-8'));
+  }
+  console.log(`  [pools_list] fetching: ${POOLS_LIST_URL}`);
+  return await fetchJson(POOLS_LIST_URL, { retries: 2, timeoutMs: 15000 });
+}
+
+// 2) Load token prices from our existing network-and-prices cron's output.
+//    No new external dependency — reuses the prices we already publish hourly.
+async function loadPrices() {
+  console.log(`  [prices] fetching: ${PRICES_URL}`);
+  return await fetchJson(PRICES_URL, { retries: 2, timeoutMs: 15000 });
+}
+
+// 3) Build a fast symbol → USD-price lookup, handling SS's symbol idiosyncrasies
+//    and deriving ampROAR from its LST ratio (it's not in token_prices directly).
+//
+//    SS pool_assets[].symbol → canonical symbol used in network-and-prices.json:
+//      - USDt        → USDT          (case)
+//      - wstETH      → WSTETH        (case)
+//      - EURe        → EURE          (case)
+//      - wBTC.osmo   → WBTC          (different bridge, same underlying)
+//      - wBTC.axl    → WBTC          (different bridge, same underlying)
+//      - ampROAR     → derived: ROAR_usd × lst_ratios.ampROAR.ratio
+//      - dATOM       → null (no price source — pool TVL will be null)
+function buildPriceLookup(napData) {
+  const tokenPrices = napData.token_prices || {};
+  const lstRatios = napData.lst_ratios || {};
+
+  // Map of symbols (lowercased) → final_price_usd, with explicit aliases for
+  // SS-specific symbol shapes.
+  const lookup = {};
+  for (const [name, entry] of Object.entries(tokenPrices)) {
+    const price = entry?.prices?.astroport?.final_price_usd
+      ?? entry?.final_price_usd
+      ?? null;
+    if (price != null) {
+      lookup[name.toLowerCase()] = price;
+    }
+  }
+
+  // SS symbol aliases pointing at the same canonical price entry.
+  const alias = (from, to) => {
+    if (lookup[to.toLowerCase()] != null) lookup[from.toLowerCase()] = lookup[to.toLowerCase()];
+  };
+  alias('usdt',         'USDT');
+  alias('wsteth',       'WSTETH');
+  alias('eure',         'EURE');
+  alias('wbtc.osmo',    'WBTC');
+  alias('wbtc.axl',     'WBTC');
+  alias('axlusdc',      'USDC');     // Axelar-bridged USDC, par with native USDC
+  alias('astro.cw20',   'ASTRO');    // legacy CW20 ASTRO, same underlying token
+
+  // ampROAR derived from ROAR + LST ratio.
+  const roarPrice = lookup['roar'];
+  const ampRoarRatio = lstRatios['ampROAR']?.ratio;
+  if (roarPrice != null && ampRoarRatio != null) {
+    lookup['amproar'] = roarPrice * ampRoarRatio;
+  }
+
+  return lookup;
+}
+
+function priceForSymbol(symbol, lookup) {
+  if (!symbol) return null;
+  const v = lookup[symbol.toLowerCase()];
+  return (typeof v === 'number' && isFinite(v)) ? v : null;
+}
+
+// 4) Query one pool's on-chain state via LCD smart-contract query.
+//    Returns { reserve_0, reserve_1, total_share } as raw chain strings (no
+//    decimal scaling — preserves precision for the CSV's reserve_0/reserve_1
+//    columns which have always been raw chain integers).
+async function queryPoolChain(swapAddress) {
+  const queryB64 = Buffer.from('{"pool":{}}').toString('base64');
+  const url = `${LCD_URL}/cosmwasm/wasm/v1/contract/${swapAddress}/smart/${queryB64}`;
+  const resp = await fetchJson(url, { retries: 2, timeoutMs: 12000 });
+  const d = resp?.data;
+  if (!d || !Array.isArray(d.assets) || d.assets.length < 2) {
+    throw new Error(`Unexpected pool response shape for ${swapAddress}`);
+  }
+  return {
+    reserve_0: d.assets[0].amount,
+    reserve_1: d.assets[1].amount,
+    total_share: d.total_share
+  };
+}
+
+// 5) Compute TVL = (reserve_0 / 10^dec_0) * price_0 + (reserve_1 / 10^dec_1) * price_1
+//    Returns { tvl_usd, missing: [symbol,...] } — caller can mark pool as unpriced
+//    if any side is missing a price.
+function computePoolTvl(poolMeta, chainData, priceLookup) {
+  const assets = poolMeta.pool_assets;
+  const missing = [];
+  let tvl = 0;
+  for (let i = 0; i < 2; i++) {
+    const a = assets[i];
+    const price = priceForSymbol(a.symbol, priceLookup);
+    const rawAmount = i === 0 ? chainData.reserve_0 : chainData.reserve_1;
+    if (price == null) {
+      missing.push(a.symbol);
+      continue;
+    }
+    const amount = Number(rawAmount) / Math.pow(10, a.decimals);
+    tvl += amount * price;
+  }
+  if (missing.length > 0) {
+    return { tvl_usd: null, missing };
+  }
+  return { tvl_usd: Math.round(tvl * 100) / 100, missing: [] };
+}
+
+// 6) Concurrency-limited Promise.all replacement for the per-pool chain queries.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (true) {
+      const i = idx++;
+      if (i >= items.length) return;
+      try {
+        results[i] = { ok: true, value: await fn(items[i], i) };
+      } catch (e) {
+        results[i] = { ok: false, error: e };
+      }
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// =============================================================================
 // EPOCH CALCULATION (replaces week number)
 // =============================================================================
 
@@ -259,58 +471,107 @@ function getDayOfWeek(date) {
 
 async function runDaily() {
   console.log('\n========== DAILY SNAPSHOT ==========\n');
-  
+
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   const timeStr = now.toISOString().split('T')[1].split('.')[0];
   const dayNum = getDayOfWeek(now);
   const epoch = getEpochNumber(now);
-  
+
   console.log(`Date: ${dateStr} (Day ${dayNum} of week)`);
   console.log(`Time: ${timeStr} UTC`);
-  console.log(`Current Epoch: ${epoch}\n`);
-  
-  // Fetch API
-  console.log('Fetching pool data...');
-  const data = await fetch(API_URL);
-  
-  if (!data.pools || !Array.isArray(data.pools)) {
-    throw new Error('Invalid API response');
-  }
-  
-  const pools = data.pools;
-  console.log(`Found ${pools.length} pools\n`);
-  
-  // Build CSV content
+  console.log(`Current Epoch: ${epoch}`);
+  console.log(`LCD: ${LCD_URL}\n`);
+
+  // -- Step 1: pool metadata -------------------------------------------------
+  console.log('Loading pool metadata...');
+  const poolsList = await loadPoolsList();
+  const pools = poolsList.pools || [];
+  if (pools.length === 0) throw new Error('pools_list.json returned zero pools');
+  console.log(`  ✓ ${pools.length} active pools\n`);
+
+  // -- Step 2: token prices --------------------------------------------------
+  console.log('Loading token prices (from network-and-prices cron)...');
+  const napData = await loadPrices();
+  const priceLookup = buildPriceLookup(napData);
+  console.log(`  ✓ ${Object.keys(priceLookup).length} symbols priced (captured ${napData.capturedAt})\n`);
+
+  // -- Step 3: per-pool chain queries (parallel, bounded) --------------------
+  console.log(`Querying chain for ${pools.length} pools (concurrency=${POOL_QUERY_CONCURRENCY})...`);
+  const t0 = Date.now();
+  const chainResults = await mapWithConcurrency(pools, POOL_QUERY_CONCURRENCY, (p) => queryPoolChain(p.swap_address));
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  const okCount = chainResults.filter(r => r.ok).length;
+  const failCount = chainResults.length - okCount;
+  console.log(`  ✓ ${okCount}/${pools.length} pools queried in ${elapsed}s${failCount ? ` (${failCount} failed)` : ''}\n`);
+
+  // -- Step 4: build CSV -----------------------------------------------------
   let csv = DAILY_HEADERS + '\n';
-  
-  for (const pool of pools) {
+  const unpriced = [];
+  const chainFailed = [];
+  let tvlSum = 0;
+
+  for (let i = 0; i < pools.length; i++) {
+    const meta = pools[i];
+    const res = chainResults[i];
+    let tvlUsd = '';
+    let r0 = '', r1 = '', ts = '';
+    if (res.ok) {
+      r0 = res.value.reserve_0;
+      r1 = res.value.reserve_1;
+      ts = res.value.total_share;
+      const { tvl_usd, missing } = computePoolTvl(meta, res.value, priceLookup);
+      if (tvl_usd != null) {
+        tvlUsd = tvl_usd;
+        tvlSum += tvl_usd;
+      } else {
+        unpriced.push({ pool: meta.pool_id, missing });
+      }
+    } else {
+      chainFailed.push({ pool: meta.pool_id, error: res.error.message });
+    }
+
     const row = [
       dateStr,
       timeStr,
       'skeletonswap',
-      `"${pool.pool_id}"`,
-      pool.pool_address,
-      pool.tvl_usd ?? '',
-      pool.volume_24h_usd ?? '',
-      pool.volume_7d_usd ?? '',
-      pool.apr_7d ?? '',
-      pool.reserve_0 ?? '',
-      pool.reserve_1 ?? '',
-      pool.total_share ?? ''
+      `"${meta.pool_id}"`,
+      meta.swap_address,
+      tvlUsd,
+      '', // volume_24h_usd — no trustworthy source
+      '', // volume_7d_usd  — no trustworthy source
+      '', // apr_7d         — no trustworthy source
+      r0,
+      r1,
+      ts
     ].join(',');
     csv += row + '\n';
-    
-    console.log(`  ${pool.pool_id.padEnd(20)} TVL: $${(pool.tvl_usd || 0).toLocaleString().padStart(10)}`);
+
+    const tvlDisplay = (typeof tvlUsd === 'number')
+      ? `$${tvlUsd.toLocaleString()}`
+      : (res.ok ? 'no-price' : 'CHAIN-FAIL');
+    console.log(`  ${meta.pool_id.padEnd(22)} TVL: ${tvlDisplay.padStart(14)}${res.ok ? '' : '  ✗'}`);
   }
-  
+
+  // -- Step 5: summary + write files -----------------------------------------
+  console.log(`\n  Total TVL (priced pools): $${tvlSum.toLocaleString()}`);
+  if (unpriced.length) {
+    console.log(`  Pools without full pricing (${unpriced.length}):`);
+    for (const u of unpriced) console.log(`    - ${u.pool} missing: ${u.missing.join(', ')}`);
+  }
+  if (chainFailed.length) {
+    console.log(`  Chain query failures (${chainFailed.length}):`);
+    for (const f of chainFailed) console.log(`    - ${f.pool}: ${f.error}`);
+  }
+  console.log();
+
   // Save daily file to ROOT (e.g., ./day-1.csv)
   const filename = `day-${dayNum}.csv`;
   const filepath = `./${filename}`;
   fs.writeFileSync(filepath, csv);
-  console.log(`\nSaved: ${filepath}`);
-  
-  // Save dated backup to month folder (e.g., ./january_backup/2026-01-18.csv)
+  console.log(`Saved: ${filepath}`);
+
+  // Save dated backup to month folder (e.g., ./april_backup/2026-04-18.csv)
   const backupDir = getBackupFolder();
   if (!fs.existsSync(backupDir)) {
     fs.mkdirSync(backupDir, { recursive: true });
@@ -319,13 +580,20 @@ async function runDaily() {
   const backupFile = path.join(backupDir, `${dateStr}.csv`);
   fs.writeFileSync(backupFile, csv);
   console.log(`Backup saved: ${backupFile}`);
-  
+
   // If it's Saturday (day 6), calculate 6-day rolling average
   if (dayNum === 6) {
     await calculate6DayAverage();
   }
-  
-  return { pools: pools.length, file: filename };
+
+  return {
+    pools: pools.length,
+    file: filename,
+    priced: pools.length - unpriced.length - chainFailed.length,
+    unpriced: unpriced.length,
+    chainFailed: chainFailed.length,
+    tvlSum: Math.round(tvlSum * 100) / 100
+  };
 }
 
 // =============================================================================
@@ -751,6 +1019,14 @@ function writeHeartbeat(mode, result) {
     monthly: 30 * 24 * 60 * 60 * 1000,
     yearly:  365 * 24 * 60 * 60 * 1000,
   }[mode] || 24 * 60 * 60 * 1000;
+
+  // Status: 'ok' when every pool successfully queried the chain. Pools that
+  // queried fine but lacked a price for one side don't fail the run (they
+  // write empty TVL — intentional), so unpriced count is reported as info
+  // only and does not flip the status. Chain query failure does flip it.
+  const chainFailed = result?.chainFailed ?? 0;
+  const status = chainFailed === 0 ? 'ok' : 'partial';
+
   const heartbeat = {
     schemaVersion: 1,
     cron: 'skeletonswap-lp_data',
@@ -759,17 +1035,21 @@ function writeHeartbeat(mode, result) {
     runId: `ss-${now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
     runMode: mode,
     currentEpoch: epoch,
-    status: 'ok',
+    status,
     stats: {
       poolsProcessed: result?.pools ?? null,
-      fileWritten: result?.file ?? null,
+      poolsPriced:    result?.priced ?? null,
+      poolsUnpriced:  result?.unpriced ?? null,
+      poolsChainFailed: result?.chainFailed ?? null,
+      tvlSumUsd:      result?.tvlSum ?? null,
+      fileWritten:    result?.file ?? null,
     },
     next_expected_run_at: new Date(now.getTime() + cadenceMs).toISOString(),
   };
   // Ensure data/ exists then write
   if (!fs.existsSync('data')) fs.mkdirSync('data', { recursive: true });
   fs.writeFileSync('data/heartbeat.json', JSON.stringify(heartbeat, null, 2));
-  console.log(`📍 Heartbeat written: data/heartbeat.json (mode=${mode}, epoch=${epoch})`);
+  console.log(`📍 Heartbeat written: data/heartbeat.json (mode=${mode}, epoch=${epoch}, status=${status})`);
 }
 
 // =============================================================================
