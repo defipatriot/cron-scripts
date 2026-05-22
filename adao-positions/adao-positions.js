@@ -103,7 +103,14 @@ const POOL_AT_RISK_THRESHOLD_PCT = 1.5;  // active but < 1.5% gets flagged
 // HTTP
 const HTTP_TIMEOUT_MS = 25000;
 const PFPK_TIMEOUT_MS = 8000;  // faster timeout for non-critical lookups
-const BATCH_CONCURRENCY = 15;
+// v1.3.0 — reduced from 15 to 5. At 15 we were saturating the LCD endpoint
+// (46 members × 17 queries each = ~780 chain queries, batched 15 at a time
+// meant ~255 concurrent in-flight requests). publicnode.com silently dropped
+// some responses under that load, returning null from queryContract — which
+// then short-circuited via `Array.isArray(r) ? r : []` to empty entries,
+// silently losing entire positions. At 5 we should stay well under the
+// rate limit. If runtime gets too slow, raise gradually and monitor _errors.
+const BATCH_CONCURRENCY = 5;
 
 // GitHub publish
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
@@ -233,23 +240,40 @@ function encodeQuery(q) {
     return Buffer.from(JSON.stringify(q)).toString('base64');
 }
 
+// v1.3.0 — added retry-with-backoff. Previously a single transient LCD
+// failure (rate limit, brief timeout, dropped connection) caused queryContract
+// to return null, which downstream callers couldn't distinguish from "no
+// data exists" — so positions silently vanished from the output. Now we
+// retry up to 3 times total (primary → primary → fallback) with brief
+// backoff before giving up.
 async function queryContract(contractAddr, query, attemptFallback = true) {
     const qb = encodeQuery(query);
     const path = `/cosmwasm/wasm/v1/contract/${contractAddr}/smart/${qb}`;
-    try {
-        const r = await fetchJson(TERRA_LCD_PRIMARY + path, `query ${contractAddr.slice(0,20)}`);
-        return r.data;
-    } catch (e) {
-        if (attemptFallback) {
-            try {
-                const r = await fetchJson(TERRA_LCD_FALLBACK + path, `query-fallback ${contractAddr.slice(0,20)}`);
-                return r.data;
-            } catch (e2) {
-                return null;
+    const label = `query ${contractAddr.slice(0,20)}`;
+
+    // Try primary endpoint up to 2x with brief backoff
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const r = await fetchJson(TERRA_LCD_PRIMARY + path, `${label} (try ${attempt})`);
+            return r.data;
+        } catch (e) {
+            if (attempt < 2) {
+                // Brief jittered backoff before retry
+                await new Promise(res => setTimeout(res, 200 + Math.random() * 300));
             }
         }
-        return null;
     }
+
+    // Both primary attempts failed — try fallback endpoint
+    if (attemptFallback) {
+        try {
+            const r = await fetchJson(TERRA_LCD_FALLBACK + path, `${label} (fallback)`);
+            return r.data;
+        } catch (e) {
+            return null;
+        }
+    }
+    return null;
 }
 
 async function fetchBankBalances(address) {
@@ -734,11 +758,22 @@ async function fetchMemberPortfolio(member, ctx) {
         _errors: [],
     };
 
-    // Run all the per-bucket queries in parallel
+    // Run all the per-bucket queries in parallel.
+    // v1.3.0 — surface null responses (query failed after retries) instead of
+    // silently coercing them to empty arrays. Previously a transient LCD
+    // failure on `all_staked_balances` would silently drop an entire bucket's
+    // non-amp positions for that member.
     const stakingPromises = BUCKETS.map(b => Promise.all([
         queryContract(TLA_STAKING_CONTRACTS[b], { all_staked_balances: { address: wallet } }),
         queryContract(TLA_STAKING_CONTRACTS[b], { all_pending_rewards: { address: wallet } }),
-    ]).then(([staked, pending]) => ({ bucket: b, staked: staked || [], pending: pending || [] })));
+    ]).then(([staked, pending]) => ({
+        bucket: b,
+        staked: staked || [],
+        pending: pending || [],
+        // Track which sub-queries failed so the processing loop can record them
+        _stakedErr: staked === null ? 'all_staked_balances returned null after retries' : null,
+        _pendingErr: pending === null ? 'all_pending_rewards returned null after retries' : null,
+    })));
 
     // Plus per-user queries in parallel
     const otherPromises = Promise.all([
@@ -752,12 +787,30 @@ async function fetchMemberPortfolio(member, ctx) {
     // Amplified positions query (one batch per bucket — each bucket has ≤21 amp pools)
     // These are stored in the asset-compounder, not the staking contract, so the 
     // staking contract returns only stale dust entries for these.
-    const ampPromises = Promise.all(BUCKETS.map(bucket => {
+    //
+    // v1.3.0 — distinguish "query failed" from "no positions". Previously a null
+    // response from queryContract was silently coerced to an empty array, dropping
+    // entire buckets of amp positions without any signal. Now failures propagate
+    // to portfolio._errors so they're visible, and the entries field stays null
+    // (not []) so downstream code can choose to handle the difference.
+    const ampPromises = Promise.all(BUCKETS.map(async bucket => {
         const assets = ctx.ampConfigsByGauge?.[bucket];
-        if (!assets || assets.length === 0) return Promise.resolve(null);
-        return queryContract(TLA_ASSET_COMPOUNDER, { user_infos: { addr: wallet, assets } })
-            .then(r => ({ bucket, entries: Array.isArray(r) ? r : [] }))
-            .catch(() => ({ bucket, entries: [], _err: true }));
+        if (!assets || assets.length === 0) {
+            // Bucket genuinely has no amp configs registered — return empty (not null)
+            return { bucket, entries: [], queried: false };
+        }
+        try {
+            const r = await queryContract(TLA_ASSET_COMPOUNDER, { user_infos: { addr: wallet, assets } });
+            if (r === null) {
+                // queryContract already retried internally and still returned null —
+                // record the failure so it surfaces in _errors instead of silently
+                // becoming empty entries.
+                return { bucket, entries: null, queried: true, _err: 'user_infos query returned null after retries' };
+            }
+            return { bucket, entries: Array.isArray(r) ? r : [], queried: true };
+        } catch (e) {
+            return { bucket, entries: null, queried: true, _err: e.message };
+        }
     }));
 
     let stakingResults, otherResults, ampResults;
@@ -779,6 +832,13 @@ async function fetchMemberPortfolio(member, ctx) {
     // Step 1: NON-AMPLIFIED positions from staking contracts.
     // The staking contracts also return DUST entries (shares=1, amount=0) for users who
     // ever interacted with a pool but withdrew everything. We filter those out.
+    //
+    // v1.3.0 — record any per-bucket query failures so they surface in _errors.
+    for (const result of stakingResults) {
+        if (result._stakedErr) {
+            portfolio._errors.push(`Staking query [${result.bucket}] all_staked_balances: ${result._stakedErr}`);
+        }
+    }
     for (const { bucket, staked } of stakingResults) {
         for (const entry of staked) {
             try {
@@ -851,8 +911,16 @@ async function fetchMemberPortfolio(member, ctx) {
     // Step 2: AMPLIFIED positions from the asset-compounder.
     // These are stored in the compounder, not the staking contract. Each entry has
     // user_amplp (user's share of the compounder) and user_lp (the underlying LP amount).
+    //
+    // v1.3.0 — handle null entries (query failed) by recording the error so it
+    // surfaces in portfolio._errors. Previously failures were silently dropped.
     for (const ampBucket of ampResults || []) {
-        if (!ampBucket?.entries) continue;
+        if (!ampBucket) continue;
+        if (ampBucket._err) {
+            portfolio._errors.push(`Amp query [${ampBucket.bucket}] failed: ${ampBucket._err}`);
+            continue;
+        }
+        if (!ampBucket.entries) continue;
         const { bucket, entries } = ampBucket;
         for (const entry of entries) {
             try {
@@ -951,7 +1019,14 @@ async function fetchMemberPortfolio(member, ctx) {
     // Rewards are paid in zluna (Alliance reward shares). 1 zluna ≠ 1 LUNA;
     // zluna accrues yield over time so its LUNA-equivalent value > 1.
     // Use the zluna→LUNA ratio fetched at shared-data load time.
+    //
+    // v1.3.0 — also surface per-bucket all_pending_rewards failures.
     portfolio.pending_rewards = [];
+    for (const result of stakingResults) {
+        if (result._pendingErr) {
+            portfolio._errors.push(`Staking query [${result.bucket}] all_pending_rewards: ${result._pendingErr}`);
+        }
+    }
     const zlunaRatio = ctx.zlunaToLunaRatio || 1;
     for (const { bucket, pending } of stakingResults) {
         for (const entry of pending) {
