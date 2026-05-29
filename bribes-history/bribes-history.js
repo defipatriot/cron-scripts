@@ -387,42 +387,86 @@ async function pushToGithub(filepath, content, message) {
 // -----------------------------------------------------------------------------
 
 // =============================================================================
-// DATA FRESHNESS MONITORING
+// DATA FRESHNESS MONITORING — epoch-coverage variant
 // =============================================================================
 //
-// Detects upstream-frozen failures (PD DAODAO proposal queries stuck, or
-// bribe-manager contract reads returning identical data across runs).
+// IMPORTANT: bribes-history uses a DIFFERENT freshness model than the other crons.
 //
-// Bribes-history runs daily. Two volatile signals are mixed:
-//   1. PD proposal counter (only goes up — new bribes get proposed/executed)
-//   2. Active bribe state (changes intra-epoch as claimers withdraw amounts)
+// Other crons fingerprint volatile data (reserves, prices, VP) and flag stuck when
+// 3 consecutive runs produce identical hashes. That approach doesn't work for
+// bribes because PD posts bribe proposals in batches (typically once a month,
+// funding ~4 epochs at a time). Between batches, the on-chain bribe state
+// legitimately doesn't change for weeks — which would false-positive a hash-based
+// detector permanently.
 //
-// Fingerprint excludes `currentEpoch` (counter that auto-changes weekly,
-// would mask freezes around epoch boundaries). Includes the substantive
-// state: aggregate counters + per-bribe gauge + asset + amounts.
+// Instead, we check whether bribes are FUNDED for the current epoch:
+//   - Each executed bribe has `start_epoch` and `end_epoch` fields
+//   - `max_funded_epoch` = max(end_epoch) across all bribes
+//   - The "stuck" condition is when current_epoch has surpassed max_funded_epoch
+//     by 2 or more — meaning PD missed posting a new prop within the grace epoch
 //
-// 3 identical daily runs in a row → 'stuck'. Note: false-positive risk is
-// slightly higher than other crons because quiet PD weeks with no claims
-// are plausible — but over 3 days SOMEONE usually claims something, so
-// fully-identical bribe amounts for 3 days running would be unusual.
+// Threshold:
+//   current_epoch <= max_funded_epoch + 1  → fresh (PD still has time to post)
+//   current_epoch >= max_funded_epoch + 2  → stuck (a full epoch passed unfunded)
+//
+// No 'suspicious' middle state — PD's monthly batch cadence makes the warning
+// state redundant. Either bribes are covered or PD has missed an epoch.
+//
+// `dataFingerprint` is preserved for schema consistency with other crons, but is
+// derived from coverage state (not random hashing): it only changes when coverage
+// changes. `previousFingerprint` is preserved so the dashboard schema is uniform.
 
-const STUCK_THRESHOLD = 3;  // 3+ identical consecutive runs → 'stuck'
-
-function computeDataFingerprint(masterFile, currentStateFile) {
-    // Per-active-bribe volatile signals (amounts change as claimers withdraw)
-    const bribeItems = [];
-    for (const b of currentStateFile.active_bribes || []) {
-        const assetKey = b.asset?.cw20 || b.asset?.native || JSON.stringify(b.asset || {});
-        const amounts = (b.assets || []).map(a => a.amount).sort();
-        bribeItems.push([b.gauge || '?', assetKey, ...amounts]);
+function computeEpochCoverage(masterFile, currentStateFile) {
+    const currentEpoch = currentStateFile.currentEpoch
+                      ?? masterFile.currentEpoch
+                      ?? null;
+    let maxFundedEpoch = null;
+    const proposalsByEpoch = {};
+    for (const b of masterFile.bribes || []) {
+        const endEp = b.end_epoch;
+        if (typeof endEp !== 'number') continue;
+        if (maxFundedEpoch === null || endEp > maxFundedEpoch) maxFundedEpoch = endEp;
+        // Track which proposals cover which epochs (useful for diagnostics)
+        const startEp = typeof b.start_epoch === 'number' ? b.start_epoch : endEp;
+        for (let ep = startEp; ep <= endEp; ep++) {
+            if (!proposalsByEpoch[ep]) proposalsByEpoch[ep] = new Set();
+            proposalsByEpoch[ep].add(b.proposal_id);
+        }
     }
-    bribeItems.sort((a, b) => `${a[0]}|${a[1]}`.localeCompare(`${b[0]}|${b[1]}`));
+    const epochsAhead = (maxFundedEpoch !== null && currentEpoch !== null)
+        ? maxFundedEpoch - currentEpoch
+        : null;
+    return { currentEpoch, maxFundedEpoch, epochsAhead, proposalsByEpoch };
+}
 
-    const input = JSON.stringify({
-        stats: masterFile.stats || {},
-        active_bribes: bribeItems,
-    });
-    return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
+function classifyBribeCoverage(coverage) {
+    const { currentEpoch, maxFundedEpoch, epochsAhead } = coverage;
+    if (currentEpoch === null || maxFundedEpoch === null) {
+        // Can't determine — be safe, report unknown via the heartbeat status
+        return { dataFreshness: 'unknown', consecutiveStuckRuns: 0, reason: 'no epoch data' };
+    }
+    // The rule: fine through (max_funded_epoch + 1). Stuck at (max_funded_epoch + 2) or beyond.
+    // epochsAhead = maxFundedEpoch - currentEpoch
+    //   ahead >= 0:  current is funded or has buffer → fresh
+    //   ahead == -1: current is the grace epoch (one past last funded) → fresh
+    //   ahead <= -2: a full epoch has passed with no new funding → stuck
+    if (epochsAhead >= -1) {
+        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0 };
+    }
+    // Stuck — current_epoch is 2+ beyond max_funded_epoch
+    const epochsMissed = -epochsAhead - 1;  // 1 if at +2, 2 if at +3, etc.
+    return {
+        dataFreshness: 'stuck',
+        consecutiveStuckRuns: epochsMissed,
+        reason: `${epochsMissed} epoch${epochsMissed === 1 ? '' : 's'} unfunded since max_funded_epoch=${maxFundedEpoch}`,
+    };
+}
+
+// Derive a stable fingerprint from coverage state.
+// Changes only when coverage shifts → for schema consistency with other crons.
+function fingerprintFromCoverage(coverage) {
+    const s = `epoch_coverage:current=${coverage.currentEpoch},max_funded=${coverage.maxFundedEpoch}`;
+    return crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
 }
 
 // Fetch our previous heartbeat — graceful failure (returns null).
@@ -441,20 +485,6 @@ function fetchPreviousHeartbeat() {
         req.on('error', () => resolve(null));
         req.on('timeout', () => { req.destroy(); resolve(null); });
     });
-}
-
-function classifyFreshness(currentFp, prev) {
-    if (!prev || !prev.dataFingerprint) {
-        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint: null };
-    }
-    const previousFingerprint = prev.dataFingerprint;
-    if (currentFp !== previousFingerprint) {
-        return { dataFreshness: 'fresh', consecutiveStuckRuns: 0, previousFingerprint };
-    }
-    const priorCount = Number(prev.consecutiveStuckRuns) || 1;
-    const consecutive = priorCount + 1;
-    const dataFreshness = consecutive >= STUCK_THRESHOLD ? 'stuck' : 'suspicious';
-    return { dataFreshness, consecutiveStuckRuns: consecutive, previousFingerprint };
 }
 
 async function captureBribesHistory() {
@@ -530,18 +560,26 @@ async function captureBribesHistory() {
         bribers,
     };
 
-    // Compute data fingerprint and check freshness vs previous run.
-    // Catches frozen PD proposal queries or frozen bribe-manager contract reads.
-    console.log('🔍 Computing data fingerprint...');
-    const dataFingerprint = computeDataFingerprint(masterFile, currentStateFile);
+    // Check bribe coverage: is current_epoch funded? Are future epochs funded?
+    // (See classifyBribeCoverage above for the full rule.)
+    console.log('🔍 Computing bribe coverage...');
+    const coverage = computeEpochCoverage(masterFile, currentStateFile);
+    const classification = classifyBribeCoverage(coverage);
+    const dataFingerprint = fingerprintFromCoverage(coverage);
     const prevHeartbeat = await fetchPreviousHeartbeat();
-    const freshness = classifyFreshness(dataFingerprint, prevHeartbeat);
-    const freshnessIcon = { fresh: '✓', suspicious: '⚠', stuck: '🔴' }[freshness.dataFreshness];
-    console.log(`   fingerprint: ${dataFingerprint}  previous: ${freshness.previousFingerprint || '(none)'}`);
+    const previousFingerprint = prevHeartbeat?.dataFingerprint || null;
+
+    const freshness = {
+        dataFreshness: classification.dataFreshness,
+        consecutiveStuckRuns: classification.consecutiveStuckRuns,
+        previousFingerprint,
+    };
+
+    const freshnessIcon = { fresh: '✓', stuck: '🔴', unknown: '?' }[freshness.dataFreshness] || '?';
+    console.log(`   current_epoch=${coverage.currentEpoch}, max_funded_epoch=${coverage.maxFundedEpoch}, ahead=${coverage.epochsAhead}`);
+    console.log(`   fingerprint: ${dataFingerprint}  previous: ${previousFingerprint || '(none)'}`);
     console.log(`   ${freshnessIcon} dataFreshness: ${freshness.dataFreshness}` +
-                (freshness.consecutiveStuckRuns > 1
-                    ? `  (${freshness.consecutiveStuckRuns} consecutive identical runs)`
-                    : ''));
+                (classification.reason ? `  — ${classification.reason}` : ''));
 
     // Status: stuck overrides ok (no chain-failure concept here)
     const status = freshness.dataFreshness === 'stuck' ? 'stuck' : 'ok';
@@ -574,8 +612,12 @@ async function captureBribesHistory() {
             runMode: 'daily',
             currentEpoch,
             status,
-            stats: masterFile.stats,
-            // Freshness-monitoring fields (catches PD/bribe-manager frozen failures)
+            stats: {
+                ...masterFile.stats,
+                max_funded_epoch:    coverage.maxFundedEpoch,
+                epochs_funded_ahead: coverage.epochsAhead,
+            },
+            // Freshness-monitoring fields (epoch-coverage variant — see top of file)
             dataFingerprint,
             previousFingerprint:  freshness.previousFingerprint,
             dataFreshness:        freshness.dataFreshness,
@@ -603,8 +645,12 @@ async function captureBribesHistory() {
             capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
             runId: `bribes-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
             runMode: 'daily', currentEpoch, status,
-            stats: masterFile.stats,
-            // Freshness-monitoring fields
+            stats: {
+                ...masterFile.stats,
+                max_funded_epoch:    coverage.maxFundedEpoch,
+                epochs_funded_ahead: coverage.epochsAhead,
+            },
+            // Freshness-monitoring fields (epoch-coverage variant)
             dataFingerprint,
             previousFingerprint:  freshness.previousFingerprint,
             dataFreshness:        freshness.dataFreshness,
