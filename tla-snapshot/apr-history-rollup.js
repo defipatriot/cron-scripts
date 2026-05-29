@@ -1,152 +1,134 @@
 #!/usr/bin/env node
 /**
- * apr-history-rollup.js
+ * apr-history-rollup.js  —  self-contained Render cron
  * ---------------------------------------------------------------------------
- * Per-epoch APR rollup for the TLA Stats dashboard.
+ * Per-epoch APR rollup for the TLA Stats dashboard "Top by APR" movement badge.
  *
- * WHY THIS EXISTS
- *   Volume & liquidity get clean per-epoch history "for free" because the
- *   Astroport cron writes an epochs{} map in one file. APR has no such file —
- *   its inputs live scattered across the tla-snapshot DAILY archives
- *   (data/daily/{YYYY-MM-DD}.json). This script rolls those daily archives up
- *   into ONE compact per-epoch file so the dashboard can treat APR exactly like
- *   it treats volume/liquidity: one small fetch, a baseline epoch to diff
- *   against, and a rank-movement badge.
+ * HOW IT FITS THE EXISTING SETUP
+ *   The tla-snapshot cron writes a daily archive to data/daily/{YYYY-MM-DD}.json
+ *   in the tla-snapshot-data_2026 repo (via the GitHub API — there is NO local
+ *   data/daily folder). This script reads those daily archives straight from
+ *   GitHub, averages each epoch's APR per pool, and pushes data/apr-history.json
+ *   back to the same repo using the SAME push mechanism the snapshot cron uses.
  *
- * WHAT IT READS
- *   Every data/daily/*.json file in the tla-snapshot data repo. Each daily file
- *   already self-reports its epoch via `epoch.currentEpoch`, so grouping is done
- *   off that tag (robust to capture-time-vs-epoch-boundary timing). Per pool it
- *   reads: name, dex, bucket, rewards.approx_apr_pct, staked_in_tla_usd.
+ * DEPLOY ON RENDER
+ *   Add as a scheduled job (daily, shortly after the snapshot cron's 23:xx UTC
+ *   daily-archive write — e.g. 23:40 UTC). Reuse the SAME env vars the
+ *   tla-snapshot cron already has:
+ *     GITHUB_TOKEN   (required to push)
+ *     GITHUB_REPO    (default defipatriot/tla-snapshot-data_2026)
+ *     GITHUB_BRANCH  (default main)
+ *   Command:  node apr-history-rollup.js
+ *   You can run this and pool-status-history-rollup.js in one job:
+ *     node apr-history-rollup.js && node pool-status-history-rollup.js
  *
- * WHAT IT WRITES  ->  data/apr-history.json
- *   {
- *     schemaVersion: 1,
- *     cron: "apr-history",
- *     generatedAt: ISO,
- *     sourceDailyFiles: <int>,
- *     epochs: [185, 186, 187],
- *     pools: [
- *       { name, dex, bucket,
- *         epochs: { "186": { apr_pct_avg, staked_usd_avg, days } } }
- *     ]
- *   }
- *   NOTE: we store the RAW non-amplified approx_apr_pct plus avg staked. The
- *   dashboard applies the SAME amp-factor + $20K filter + 200% cap it uses for
- *   the live number, so historical and current APR are transformed identically
- *   (single source of truth for the business logic stays in the page).
+ * LOCAL / TEST MODE
+ *   node apr-history-rollup.js --daily ./some/local/daily --out ./apr-history.json
+ *   reads a local folder and writes a local file (no GitHub calls).
  *
- * HOW TO RUN / SCHEDULE
- *   node apr-history-rollup.js [--daily <dir>] [--out <file>]
- *   Defaults: --daily ./data/daily  --out ./data/apr-history.json
- *   Idempotent: safe to re-run; recomputes from whatever daily files exist.
- *   Recommended cadence: run right after the tla-snapshot DAILY archive step
- *   (once per day is plenty — APR only changes meaningfully at epoch rollover).
- *   Adopt this repo's existing heartbeat/commit conventions to match siblings.
- *
- * SCALE NOTE
- *   Reads ALL daily files each run. At ~1 file/day this is fine for years. If
- *   the daily archive ever grows large, bound the read to the most recent
- *   ~2 epochs of files and merge into the existing apr-history.json (older
- *   completed epochs are frozen once computed).
+ * APR SEMANTICS (unchanged)
+ *   Stores RAW approx_apr_pct + avg staked per pool per epoch; the dashboard
+ *   applies the same amp-factor + $20K filter + 200% cap as the live number.
  */
-
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
+const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/tla-snapshot-data_2026';
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
+const OUT_PATH      = 'data/apr-history.json';
+
 function parseArgs() {
-  const a = process.argv.slice(2);
-  const out = { daily: './data/daily', out: './data/apr-history.json' };
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] === '--daily') out.daily = a[++i];
-    else if (a[i] === '--out') out.out = a[++i];
-  }
-  return out;
+  const a = process.argv.slice(2); const o = { daily: null, out: null };
+  for (let i = 0; i < a.length; i++) { if (a[i] === '--daily') o.daily = a[++i]; else if (a[i] === '--out') o.out = a[++i]; }
+  return o;
+}
+const epochOf = (doc) => (doc?.epoch && typeof doc.epoch === 'object') ? Number(doc.epoch.currentEpoch) : Number(doc?.epoch);
+const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0; };
+
+// ---- GitHub helpers (mirrors the tla-snapshot cron verbatim) ----
+function githubApiRequest(method, apiPath, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname: 'api.github.com', path: apiPath, method,
+      headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'User-Agent': 'aDAO-apr-history/1.0',
+        'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' } },
+      (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve({ status: res.statusCode, data: JSON.parse(d || '{}') }); } catch { resolve({ status: res.statusCode, data: {} }); } }); });
+    req.on('error', reject); if (body) req.write(JSON.stringify(body)); req.end();
+  });
+}
+async function pushToGithub(filepath, content, message) {
+  const apiPath = `/repos/${GITHUB_REPO}/contents/${filepath}`;
+  const existing = await githubApiRequest('GET', apiPath);
+  const sha = existing.data?.sha;
+  const body = { message, content: Buffer.from(content).toString('base64'), branch: GITHUB_BRANCH, ...(sha ? { sha } : {}) };
+  const result = await githubApiRequest('PUT', apiPath, body);
+  if (result.status === 200 || result.status === 201) { console.log(`  ✅ ${filepath}`); return true; }
+  console.error(`  ❌ Push failed (HTTP ${result.status}): ${result.data?.message || '<no message>'}`); return false;
+}
+function fetchJsonUrl(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'aDAO-apr-history/1.0' } }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
+      let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+}
+async function listDailyDocsFromGithub() {
+  const res = await githubApiRequest('GET', `/repos/${GITHUB_REPO}/contents/data/daily?ref=${GITHUB_BRANCH}`);
+  if (!Array.isArray(res.data)) throw new Error(`list data/daily failed: ${res.data?.message || res.status}`);
+  const files = res.data.filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
+  console.log(`  found ${files.length} daily archives on GitHub`);
+  const docs = [];
+  for (const f of files) { try { docs.push(await fetchJsonUrl(f.download_url)); } catch (e) { console.warn(`  skip ${f.name}: ${e.message}`); } }
+  return docs;
+}
+function loadDailyDocsLocal(dir) {
+  const files = fs.readdirSync(dir).filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort();
+  return files.map(f => { try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { return null; } }).filter(Boolean);
 }
 
-function main() {
-  const { daily, out } = parseArgs();
-
-  if (!fs.existsSync(daily)) {
-    console.error(`[apr-history] daily dir not found: ${daily}`);
-    process.exit(1);
-  }
-
-  const files = fs.readdirSync(daily)
-    .filter(f => /^\d{4}-\d{2}-\d{2}\.json$/.test(f))
-    .sort();
-
-  if (files.length === 0) {
-    console.error(`[apr-history] no daily files in ${daily}`);
-    process.exit(1);
-  }
-
-  // accumulator: key "name|dex" -> { name, dex, bucket, epochs: { ep -> {aprSum, stakedSum, days} } }
-  const acc = new Map();
-  const epochSet = new Set();
-
-  for (const f of files) {
-    let doc;
-    try {
-      doc = JSON.parse(fs.readFileSync(path.join(daily, f), 'utf8'));
-    } catch (e) {
-      console.warn(`[apr-history] skip unreadable ${f}: ${e.message}`);
-      continue;
-    }
-    const ep = doc?.epoch?.currentEpoch;
-    if (!Number.isFinite(ep)) {
-      console.warn(`[apr-history] skip ${f}: no epoch.currentEpoch`);
-      continue;
-    }
-    epochSet.add(ep);
-    const pools = Array.isArray(doc.pools) ? doc.pools : [];
-    for (const p of pools) {
-      const name = p?.name;
-      const dex = p?.dex;
-      if (!name || !dex) continue;
-      const apr = Number(p?.rewards?.approx_apr_pct);
-      if (!Number.isFinite(apr)) continue;             // only days with a real APR
-      const staked = Number(p?.staked_in_tla_usd) || 0;
-
+// ---- compute (unchanged semantics) ----
+function buildAprHistory(docs) {
+  const acc = new Map(); const epochSet = new Set();
+  for (const doc of docs) {
+    const ep = epochOf(doc); if (!Number.isFinite(ep)) continue; epochSet.add(ep);
+    for (const p of (Array.isArray(doc.pools) ? doc.pools : [])) {
+      const name = p?.name, dex = p?.dex; if (!name || !dex) continue;
+      const apr = Number(p?.rewards?.approx_apr_pct); if (!Number.isFinite(apr)) continue;
+      const staked = num(p?.staked_in_tla_usd);
       const key = `${name}|${dex}`;
       if (!acc.has(key)) acc.set(key, { name, dex, bucket: p.bucket || null, epochs: {} });
-      const rec = acc.get(key);
-      if (p.bucket) rec.bucket = p.bucket;             // keep latest bucket label
+      const rec = acc.get(key); if (p.bucket) rec.bucket = p.bucket;
       if (!rec.epochs[ep]) rec.epochs[ep] = { aprSum: 0, stakedSum: 0, days: 0 };
-      const e = rec.epochs[ep];
-      e.aprSum += apr;
-      e.stakedSum += staked;
-      e.days += 1;
+      const e = rec.epochs[ep]; e.aprSum += apr; e.stakedSum += staked; e.days += 1;
     }
   }
-
-  // finalize -> averages
-  const poolsOut = [];
+  const pools = [];
   for (const rec of acc.values()) {
     const epochs = {};
-    for (const [ep, e] of Object.entries(rec.epochs)) {
-      epochs[ep] = {
-        apr_pct_avg: e.days ? e.aprSum / e.days : 0,
-        staked_usd_avg: e.days ? e.stakedSum / e.days : 0,
-        days: e.days,
-      };
-    }
-    poolsOut.push({ name: rec.name, dex: rec.dex, bucket: rec.bucket, epochs });
+    for (const [ep, e] of Object.entries(rec.epochs))
+      epochs[ep] = { apr_pct_avg: e.days ? e.aprSum / e.days : 0, staked_usd_avg: e.days ? e.stakedSum / e.days : 0, days: e.days };
+    pools.push({ name: rec.name, dex: rec.dex, bucket: rec.bucket, epochs });
   }
-  poolsOut.sort((a, b) => a.name.localeCompare(b.name));
-
-  const output = {
-    schemaVersion: 1,
-    cron: 'apr-history',
-    generatedAt: new Date().toISOString(),
-    sourceDailyFiles: files.length,
-    epochs: [...epochSet].sort((a, b) => a - b),
-    pools: poolsOut,
-  };
-
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  fs.writeFileSync(out, JSON.stringify(output, null, 2));
-  console.log(`[apr-history] wrote ${out}: ${poolsOut.length} pools across epochs ${output.epochs.join(', ')} from ${files.length} daily files`);
+  pools.sort((a, b) => a.name.localeCompare(b.name));
+  return { schemaVersion: 1, cron: 'apr-history', generatedAt: new Date().toISOString(),
+    sourceDailyFiles: docs.length, epochs: [...epochSet].sort((a, b) => a - b), pools };
 }
 
-main();
+async function main() {
+  const { daily, out } = parseArgs();
+  let docs;
+  if (daily) { console.log(`[apr-history] LOCAL mode: ${daily}`); docs = loadDailyDocsLocal(daily); }
+  else {
+    if (!GITHUB_TOKEN) { console.error('[apr-history] GITHUB_TOKEN not set and no --daily; aborting.'); process.exit(1); }
+    console.log(`[apr-history] GitHub mode: ${GITHUB_REPO}@${GITHUB_BRANCH}`); docs = await listDailyDocsFromGithub();
+  }
+  if (!docs.length) { console.error('[apr-history] no daily docs found'); process.exit(1); }
+  const output = buildAprHistory(docs);
+  const json = JSON.stringify(output, null, 2);
+  console.log(`[apr-history] ${output.pools.length} pools across epochs ${output.epochs.join(', ')} from ${docs.length} daily files`);
+  if (daily || out) { const target = out || './apr-history.json'; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, json); console.log(`  wrote ${target}`); }
+  else { await pushToGithub(OUT_PATH, json, `📊 APR history rollup — epochs ${output.epochs.join(', ')}`); }
+}
+main().catch(e => { console.error('[apr-history] FATAL', e); process.exit(1); });
