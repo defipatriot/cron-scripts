@@ -116,19 +116,40 @@ function buildAprHistory(docs) {
     sourceDailyFiles: docs.length, epochs: [...epochSet].sort((a, b) => a - b), pools };
 }
 
-async function main() {
-  const { daily, out } = parseArgs();
-  let docs;
-  if (daily) { console.log(`[apr-history] LOCAL mode: ${daily}`); docs = loadDailyDocsLocal(daily); }
-  else {
-    if (!GITHUB_TOKEN) { console.error('[apr-history] GITHUB_TOKEN not set and no --daily; aborting.'); process.exit(1); }
-    console.log(`[apr-history] GitHub mode: ${GITHUB_REPO}@${GITHUB_BRANCH}`); docs = await listDailyDocsFromGithub();
-  }
-  if (!docs.length) { console.error('[apr-history] no daily docs found'); process.exit(1); }
+// ---- callable entry point (used when required by the tla-snapshot cron) ----
+// GitHub mode: list+fetch daily archives from GitHub, compute, push the rollup.
+async function run() {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN not set');
+  console.log('[apr-history] GitHub mode: ' + GITHUB_REPO + '@' + GITHUB_BRANCH);
+  const docs = await listDailyDocsFromGithub();
+  if (!docs.length) throw new Error('no daily docs found');
   const output = buildAprHistory(docs);
   const json = JSON.stringify(output, null, 2);
-  console.log(`[apr-history] ${output.pools.length} pools across epochs ${output.epochs.join(', ')} from ${docs.length} daily files`);
-  if (daily || out) { const target = out || './apr-history.json'; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, json); console.log(`  wrote ${target}`); }
-  else { await pushToGithub(OUT_PATH, json, `📊 APR history rollup — epochs ${output.epochs.join(', ')}`); }
+  console.log('[apr-history] ' + output.pools.length + ' pools across epochs ' + output.epochs.join(', ') + ' from ' + docs.length + ' daily files');
+  await pushToGithub(OUT_PATH, json, '📊 APR history rollup — epochs ' + output.epochs.join(', '));
+  return output;
 }
-main().catch(e => { console.error('[apr-history] FATAL', e); process.exit(1); });
+
+// CLI: --daily <dir> [--out <file>] = local mode (no GitHub); otherwise GitHub mode.
+async function main() {
+  const { daily, out } = parseArgs();
+  if (daily) {
+    console.log('[apr-history] LOCAL mode: ' + daily);
+    const docs = loadDailyDocsLocal(daily);
+    if (!docs.length) { console.error('[apr-history] no daily docs found'); process.exit(1); }
+    const output = buildAprHistory(docs);
+    const target = out || './apr-history.json';
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify(output, null, 2));
+    console.log('[apr-history] wrote ' + target + ' (' + output.pools.length + ' pools, epochs ' + output.epochs.join(', ') + ')');
+    return;
+  }
+  await run();
+}
+
+// Only auto-run when executed directly (`node apr-history-rollup.js`), NOT when require()'d by the cron.
+if (require.main === module) {
+  main().catch(e => { console.error('[apr-history] FATAL', e); process.exit(1); });
+}
+
+module.exports = { run };

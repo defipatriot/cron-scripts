@@ -120,19 +120,40 @@ function buildPoolStatusHistory(entries) {
     sourceDailyFiles: entries.length, epochs: [...repByEpoch.keys()].sort((a, b) => a - b), pools };
 }
 
-async function main() {
-  const { daily, out } = parseArgs();
-  let entries;
-  if (daily) { console.log(`[pool-status] LOCAL mode: ${daily}`); entries = loadDailyDocsLocal(daily); }
-  else {
-    if (!GITHUB_TOKEN) { console.error('[pool-status] GITHUB_TOKEN not set and no --daily; aborting.'); process.exit(1); }
-    console.log(`[pool-status] GitHub mode: ${GITHUB_REPO}@${GITHUB_BRANCH}`); entries = await listDailyDocsFromGithub();
-  }
-  if (!entries.length) { console.error('[pool-status] no daily docs found'); process.exit(1); }
+// ---- callable entry point (used when required by the tla-snapshot cron) ----
+// GitHub mode: list+fetch daily archives from GitHub, compute, push the rollup.
+async function run() {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN not set');
+  console.log('[pool-status] GitHub mode: ' + GITHUB_REPO + '@' + GITHUB_BRANCH);
+  const entries = await listDailyDocsFromGithub();
+  if (!entries.length) throw new Error('no daily docs found');
   const output = buildPoolStatusHistory(entries);
   const json = JSON.stringify(output, null, 2);
-  console.log(`[pool-status] ${output.pools.length} pools across epochs ${output.epochs.join(', ')} from ${entries.length} daily files (schema v2)`);
-  if (daily || out) { const target = out || './pool-status-history.json'; fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, json); console.log(`  wrote ${target}`); }
-  else { await pushToGithub(OUT_PATH, json, `📈 Pool status history rollup — epochs ${output.epochs.join(', ')}`); }
+  console.log('[pool-status] ' + output.pools.length + ' pools across epochs ' + output.epochs.join(', ') + ' from ' + entries.length + ' daily files');
+  await pushToGithub(OUT_PATH, json, '📈 Pool status history rollup — epochs ' + output.epochs.join(', '));
+  return output;
 }
-main().catch(e => { console.error('[pool-status] FATAL', e); process.exit(1); });
+
+// CLI: --daily <dir> [--out <file>] = local mode (no GitHub); otherwise GitHub mode.
+async function main() {
+  const { daily, out } = parseArgs();
+  if (daily) {
+    console.log('[pool-status] LOCAL mode: ' + daily);
+    const entries = loadDailyDocsLocal(daily);
+    if (!entries.length) { console.error('[pool-status] no daily docs found'); process.exit(1); }
+    const output = buildPoolStatusHistory(entries);
+    const target = out || './pool-status-history.json';
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify(output, null, 2));
+    console.log('[pool-status] wrote ' + target + ' (' + output.pools.length + ' pools, epochs ' + output.epochs.join(', ') + ')');
+    return;
+  }
+  await run();
+}
+
+// Only auto-run when executed directly (`node pool-status-history-rollup.js`), NOT when require()'d by the cron.
+if (require.main === module) {
+  main().catch(e => { console.error('[pool-status] FATAL', e); process.exit(1); });
+}
+
+module.exports = { run };
