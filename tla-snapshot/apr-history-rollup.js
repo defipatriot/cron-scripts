@@ -1,34 +1,42 @@
 #!/usr/bin/env node
 /**
- * apr-history-rollup.js  —  self-contained Render cron
- * ---------------------------------------------------------------------------
- * Per-epoch APR rollup for the TLA Stats dashboard "Top by APR" movement badge.
+ * apr-history-rollup.js  —  schema v2
+ * ============================================================================
+ * Per-epoch APR rollup for the TLA Stats dashboard.
  *
- * HOW IT FITS THE EXISTING SETUP
- *   The tla-snapshot cron writes a daily archive to data/daily/{YYYY-MM-DD}.json
- *   in the tla-snapshot-data_2026 repo (via the GitHub API — there is NO local
- *   data/daily folder). This script reads those daily archives straight from
- *   GitHub, averages each epoch's APR per pool, and pushes data/apr-history.json
- *   back to the same repo using the SAME push mechanism the snapshot cron uses.
+ * WHAT CHANGED (v1 → v2, 2026-05-30)
+ * ----------------------------------------------------------------------------
+ * Driven by CRON-FIXES-BRIEF item 1.1 (gauge_pool_id keying) and 2.6 (carry
+ * dex_subtype). Previous version keyed on `name|dex` which collides when the
+ * same pool pair exists as multiple gauges (active + voted_but_below_threshold
+ * leftovers, or post-migration corpses with the same name but different curve).
  *
- * DEPLOY ON RENDER
- *   Add as a scheduled job (daily, shortly after the snapshot cron's 23:xx UTC
- *   daily-archive write — e.g. 23:40 UTC). Reuse the SAME env vars the
- *   tla-snapshot cron already has:
- *     GITHUB_TOKEN   (required to push)
- *     GITHUB_REPO    (default defipatriot/tla-snapshot-data_2026)
- *     GITHUB_BRANCH  (default main)
+ *   v1 key: `${name}|${dex}`                — collides across variants
+ *   v2 key: `${gauge_pool_id}|${bucket}`    — actually unique
+ *
+ * Per-pool fields preserved across epochs:
+ *   - gauge_pool_id, name, dex, bucket
+ *   - dex_subtype        (NEW — needed for IL/value-split interpretation)
+ *   - pool_address       (NEW — additional id for audit)
+ *   - status_at_epoch    (NEW — distinguishes active vs voted-below-threshold)
+ *
+ * INVARIANTS (recorded per epoch in `_invariants` block)
+ * ----------------------------------------------------------------------------
+ *   - multiple_active_per_name_dex_bucket: at most 1 active row per (n,d,b)
+ *   - migration_corpse_candidates: name/dex/bucket where lower-VP variants
+ *     exist alongside a dominant active variant
+ * Violations don't throw — they're recorded for dashboard/audit consumption.
+ *
+ * SAFE LEGACY KEYS — output still includes `name`/`dex` per pool for humans,
+ * and `legacy_name_dex_key` so a v1 consumer can migrate gracefully.
+ *
+ * DEPLOY ON RENDER  (same as v1)
+ *   GITHUB_TOKEN, GITHUB_REPO (default defipatriot/tla-snapshot-data_2026),
+ *   GITHUB_BRANCH (default main).
  *   Command:  node apr-history-rollup.js
- *   You can run this and pool-status-history-rollup.js in one job:
- *     node apr-history-rollup.js && node pool-status-history-rollup.js
  *
  * LOCAL / TEST MODE
  *   node apr-history-rollup.js --daily ./some/local/daily --out ./apr-history.json
- *   reads a local folder and writes a local file (no GitHub calls).
- *
- * APR SEMANTICS (unchanged)
- *   Stores RAW approx_apr_pct + avg staked per pool per epoch; the dashboard
- *   applies the same amp-factor + $20K filter + 200% cap as the live number.
  */
 const https = require('https');
 const fs = require('fs');
@@ -47,11 +55,21 @@ function parseArgs() {
 const epochOf = (doc) => (doc?.epoch && typeof doc.epoch === 'object') ? Number(doc.epoch.currentEpoch) : Number(doc?.epoch);
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0; };
 
+// Canonical pool key. gauge_pool_id is THE unique id on Eris. The same gauge
+// can legitimately appear in two buckets (e.g. USDC-USDT in `bluechip` and
+// `single`) so the key includes bucket. Fall back to pool_address|bucket
+// then name|dex|bucket for old daily archives pre-dating gauge_pool_id.
+function canonicalKey(p) {
+  if (p.gauge_pool_id && p.bucket) return `${p.gauge_pool_id}|${p.bucket}`;
+  if (p.pool_address  && p.bucket) return `addr:${p.pool_address}|${p.bucket}`;
+  return `name:${p.name}|${p.dex}|${p.bucket || '?'}`;
+}
+
 // ---- GitHub helpers (mirrors the tla-snapshot cron verbatim) ----
 function githubApiRequest(method, apiPath, body = null) {
   return new Promise((resolve, reject) => {
     const req = https.request({ hostname: 'api.github.com', path: apiPath, method,
-      headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'User-Agent': 'aDAO-apr-history/1.0',
+      headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'User-Agent': 'aDAO-apr-history/2.0',
         'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' } },
       (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve({ status: res.statusCode, data: JSON.parse(d || '{}') }); } catch { resolve({ status: res.statusCode, data: {} }); } }); });
     req.on('error', reject); if (body) req.write(JSON.stringify(body)); req.end();
@@ -68,7 +86,7 @@ async function pushToGithub(filepath, content, message) {
 }
 function fetchJsonUrl(url) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'aDAO-apr-history/1.0' } }, (res) => {
+    https.get(url, { headers: { 'User-Agent': 'aDAO-apr-history/2.0' } }, (res) => {
       if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
       let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
     }).on('error', reject);
@@ -88,68 +106,166 @@ function loadDailyDocsLocal(dir) {
   return files.map(f => { try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { return null; } }).filter(Boolean);
 }
 
-// ---- compute (unchanged semantics) ----
+// Invariant checks for a single snapshot's pools.
+function snapshotInvariants(doc) {
+  const pools = Array.isArray(doc.pools) ? doc.pools : [];
+  const violations = [];
+  const activeByNDB = {};
+  for (const p of pools) {
+    if (p.status !== 'active') continue;
+    const k = `${p.name}|${p.dex}|${p.bucket}`;
+    activeByNDB[k] = (activeByNDB[k] || 0) + 1;
+  }
+  for (const [k, n] of Object.entries(activeByNDB)) {
+    if (n > 1) violations.push({ kind: 'multiple_active_per_name_dex_bucket', key: k, count: n });
+  }
+  const ndbGroups = {};
+  for (const p of pools) {
+    const k = `${p.name}|${p.dex}|${p.bucket}`;
+    (ndbGroups[k] = ndbGroups[k] || []).push(p);
+  }
+  for (const [k, group] of Object.entries(ndbGroups)) {
+    if (group.length < 2) continue;
+    const sorted = [...group].sort((a, b) =>
+      num(b?.voting_power?.vp_human) - num(a?.voting_power?.vp_human));
+    const dominant = sorted[0];
+    const dominantVp = num(dominant?.voting_power?.vp_human);
+    for (let i = 1; i < sorted.length; i++) {
+      const corpse = sorted[i];
+      const corpseVp = num(corpse?.voting_power?.vp_human);
+      if (dominantVp > 0 && corpseVp / dominantVp < 0.05) {
+        violations.push({
+          kind: 'migration_corpse_candidate',
+          name_dex_bucket: k,
+          dominant_gauge: dominant.gauge_pool_id || dominant.pool_address,
+          dominant_subtype: dominant.dex_subtype,
+          corpse_gauge: corpse.gauge_pool_id || corpse.pool_address,
+          corpse_subtype: corpse.dex_subtype,
+          corpse_vp: corpseVp,
+        });
+      }
+    }
+  }
+  return violations;
+}
+
+// ---- compute ----
 function buildAprHistory(docs) {
-  const acc = new Map(); const epochSet = new Set();
+  const acc = new Map();
+  const epochSet = new Set();
+  const invariantsPerEpoch = {};
+
+  const repDocByEpoch = new Map();
+  for (const doc of docs) {
+    const ep = epochOf(doc); if (!Number.isFinite(ep)) continue;
+    const cap = doc.capturedAt || doc.generatedAt || '';
+    const cur = repDocByEpoch.get(ep);
+    if (!cur || String(cap) > String(cur.capturedAt)) repDocByEpoch.set(ep, { capturedAt: cap, doc });
+  }
+  for (const [ep, { doc }] of repDocByEpoch.entries()) {
+    invariantsPerEpoch[String(ep)] = snapshotInvariants(doc);
+  }
+
   for (const doc of docs) {
     const ep = epochOf(doc); if (!Number.isFinite(ep)) continue; epochSet.add(ep);
     for (const p of (Array.isArray(doc.pools) ? doc.pools : [])) {
       const name = p?.name, dex = p?.dex; if (!name || !dex) continue;
       const apr = Number(p?.rewards?.approx_apr_pct); if (!Number.isFinite(apr)) continue;
       const staked = num(p?.staked_in_tla_usd);
-      const key = `${name}|${dex}`;
-      if (!acc.has(key)) acc.set(key, { name, dex, bucket: p.bucket || null, epochs: {} });
-      const rec = acc.get(key); if (p.bucket) rec.bucket = p.bucket;
-      if (!rec.epochs[ep]) rec.epochs[ep] = { aprSum: 0, stakedSum: 0, days: 0 };
-      const e = rec.epochs[ep]; e.aprSum += apr; e.stakedSum += staked; e.days += 1;
+      const key = canonicalKey(p);
+      if (!acc.has(key)) {
+        acc.set(key, {
+          gauge_pool_id:  p.gauge_pool_id || null,
+          pool_address:   p.pool_address || null,
+          name, dex,
+          bucket:         p.bucket || null,
+          dex_subtype:    p.dex_subtype || null,
+          legacy_name_dex_key: `${name}|${dex}`,
+          epochs: {},
+        });
+      }
+      const rec = acc.get(key);
+      if (p.gauge_pool_id && !rec.gauge_pool_id) rec.gauge_pool_id = p.gauge_pool_id;
+      if (p.pool_address && !rec.pool_address)   rec.pool_address  = p.pool_address;
+      if (p.dex_subtype  && !rec.dex_subtype)    rec.dex_subtype   = p.dex_subtype;
+      if (p.bucket       && !rec.bucket)         rec.bucket        = p.bucket;
+      if (!rec.epochs[ep]) rec.epochs[ep] = { aprSum: 0, stakedSum: 0, days: 0, statuses: {} };
+      const e = rec.epochs[ep];
+      e.aprSum += apr; e.stakedSum += staked; e.days += 1;
+      const st = p.status || 'unknown';
+      e.statuses[st] = (e.statuses[st] || 0) + 1;
     }
   }
+
   const pools = [];
   for (const rec of acc.values()) {
     const epochs = {};
-    for (const [ep, e] of Object.entries(rec.epochs))
-      epochs[ep] = { apr_pct_avg: e.days ? e.aprSum / e.days : 0, staked_usd_avg: e.days ? e.stakedSum / e.days : 0, days: e.days };
-    pools.push({ name: rec.name, dex: rec.dex, bucket: rec.bucket, epochs });
+    for (const [ep, e] of Object.entries(rec.epochs)) {
+      const dominantStatus = Object.entries(e.statuses).sort((a, b) => b[1] - a[1])[0]?.[0] || 'unknown';
+      epochs[ep] = {
+        apr_pct_avg:    e.days ? e.aprSum / e.days : 0,
+        staked_usd_avg: e.days ? e.stakedSum / e.days : 0,
+        days:           e.days,
+        status:         dominantStatus,
+        status_breakdown: e.statuses,
+      };
+    }
+    pools.push({
+      gauge_pool_id: rec.gauge_pool_id,
+      pool_address:  rec.pool_address,
+      name:          rec.name,
+      dex:           rec.dex,
+      bucket:        rec.bucket,
+      dex_subtype:   rec.dex_subtype,
+      legacy_name_dex_key: rec.legacy_name_dex_key,
+      epochs,
+    });
   }
-  pools.sort((a, b) => a.name.localeCompare(b.name));
-  return { schemaVersion: 1, cron: 'apr-history', generatedAt: new Date().toISOString(),
-    sourceDailyFiles: docs.length, epochs: [...epochSet].sort((a, b) => a - b), pools };
+  pools.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  return {
+    schemaVersion: 2,
+    cron: 'apr-history',
+    generatedAt: new Date().toISOString(),
+    sourceDailyFiles: docs.length,
+    epochs: [...epochSet].sort((a, b) => a - b),
+    pools,
+    _invariants: invariantsPerEpoch,
+  };
 }
 
-// ---- callable entry point (used when required by the tla-snapshot cron) ----
-// GitHub mode: list+fetch daily archives from GitHub, compute, push the rollup.
 async function run() {
   if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN not set');
-  console.log('[apr-history] GitHub mode: ' + GITHUB_REPO + '@' + GITHUB_BRANCH);
+  console.log('[apr-history v2] GitHub mode: ' + GITHUB_REPO + '@' + GITHUB_BRANCH);
   const docs = await listDailyDocsFromGithub();
   if (!docs.length) throw new Error('no daily docs found');
   const output = buildAprHistory(docs);
   const json = JSON.stringify(output, null, 2);
-  console.log('[apr-history] ' + output.pools.length + ' pools across epochs ' + output.epochs.join(', ') + ' from ' + docs.length + ' daily files');
-  await pushToGithub(OUT_PATH, json, '📊 APR history rollup — epochs ' + output.epochs.join(', '));
+  const totalViolations = Object.values(output._invariants).reduce((s, v) => s + v.length, 0);
+  console.log(`[apr-history v2] ${output.pools.length} pools across epochs ${output.epochs.join(', ')} from ${docs.length} daily files`);
+  if (totalViolations > 0) console.log(`[apr-history v2] ⚠ ${totalViolations} invariant violations recorded — see _invariants in output`);
+  await pushToGithub(OUT_PATH, json, '📊 APR history rollup v2 — epochs ' + output.epochs.join(', '));
   return output;
 }
 
-// CLI: --daily <dir> [--out <file>] = local mode (no GitHub); otherwise GitHub mode.
 async function main() {
   const { daily, out } = parseArgs();
   if (daily) {
-    console.log('[apr-history] LOCAL mode: ' + daily);
+    console.log('[apr-history v2] LOCAL mode: ' + daily);
     const docs = loadDailyDocsLocal(daily);
-    if (!docs.length) { console.error('[apr-history] no daily docs found'); process.exit(1); }
+    if (!docs.length) { console.error('[apr-history v2] no daily docs found'); process.exit(1); }
     const output = buildAprHistory(docs);
     const target = out || './apr-history.json';
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, JSON.stringify(output, null, 2));
-    console.log('[apr-history] wrote ' + target + ' (' + output.pools.length + ' pools, epochs ' + output.epochs.join(', ') + ')');
+    const totalViolations = Object.values(output._invariants).reduce((s, v) => s + v.length, 0);
+    console.log(`[apr-history v2] wrote ${target} (${output.pools.length} pools, epochs ${output.epochs.join(', ')}, ${totalViolations} invariant violations)`);
     return;
   }
   await run();
 }
 
-// Only auto-run when executed directly (`node apr-history-rollup.js`), NOT when require()'d by the cron.
 if (require.main === module) {
-  main().catch(e => { console.error('[apr-history] FATAL', e); process.exit(1); });
+  main().catch(e => { console.error('[apr-history v2] FATAL', e); process.exit(1); });
 }
-
-module.exports = { run };
+module.exports = { run, buildAprHistory, canonicalKey, snapshotInvariants };
