@@ -359,6 +359,39 @@ async function captureHourly() {
 
         console.log(`\n✅ Hourly snapshot saved — $${price.toFixed(8)}\n`);
     }
+
+    // ─── HEARTBEAT (CRON-FIXES-BRIEF 1.6) ──────────────────────────────────
+    // Emit a heartbeat file in the same shape as the other 7 production crons
+    // so the footer Cron Health widget can show fuel's freshness.
+    //
+    // No data-fingerprint here because fuel price + TVL change every block;
+    // the cron is effectively self-validating via continuous movement.
+    // (If a `stuck` signal is ever wanted, fingerprint `price` + `tvl` and
+    // mirror the pattern used in the other crons.)
+    try {
+        const heartbeat = {
+            schemaVersion:    1,
+            cron:             'fuel',
+            capturedAt:       now.toISOString(),
+            capturedAtUnix:   now.getTime(),
+            runId:            `fuel-${now.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
+            runMode:          isFinal ? 'hourly+daily-aggregation' : 'hourly',
+            status:           'ok',
+            stats: {
+                price_usd:    price,
+                tvl_usd:      liq.latestTvl ?? null,
+                vol_24h_luna: volTotalPreview,
+            },
+            // Hourly cadence; allow ~15 min jitter / late runs before "stale"
+            next_expected_run_at: new Date(now.getTime() + 75 * 60 * 1000).toISOString(),
+        };
+        await pushToGithub('snapshots/heartbeat.json',
+            JSON.stringify(heartbeat, null, 2),
+            `📍 FUEL heartbeat ${dateStr} ${hourStr}:50`);
+    } catch (e) {
+        console.error(`   ⚠ heartbeat push failed: ${e.message || e}`);
+        // Don't fail the whole run for a heartbeat issue — log and continue.
+    }
 }
 
 // ============================================================
