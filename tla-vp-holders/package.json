@@ -1,0 +1,13 @@
+{
+  "name": "tla-vp-holders",
+  "version": "1.0.0",
+  "description": "Per-wallet TLA voting-power census + concentration metrics. Pure Node, no dependencies.",
+  "private": true,
+  "main": "tla-vp-holders.js",
+  "scripts": {
+    "start": "node tla-vp-holders.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
