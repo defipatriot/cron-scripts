@@ -487,6 +487,95 @@ function fetchPreviousHeartbeat() {
     });
 }
 
+// -----------------------------------------------------------------------------
+// PHASE 0 HELPERS: USD-at-capture valuation (CRON-FIXES-BRIEF 2.3)
+// -----------------------------------------------------------------------------
+//
+// Pull the latest network-and-prices snapshot once per run and build a lookup
+// keyed by both symbol (for cw20-known-by-symbol tokens) and chain denom (for
+// native/IBC tokens by their exact denom). When a bribe is enriched we then
+// know to record:
+//   bribe_amount_usd_at_capture (number)
+//   price_used                  (USD per 1 token, post-decimals)
+//   price_source                ('astroport'|'coingecko_bulk'|'direct'|...)
+//   price_captured_at           (when network-and-prices was last refreshed)
+
+const NETWORK_PRICES_URL = process.env.NETWORK_PRICES_URL ||
+    'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+
+function httpFetchJsonUrl(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers: { 'User-Agent': 'aDAO-bribes/1.1' } }, (res) => {
+            if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} for ${url}`)); }
+            let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+        }).on('error', reject);
+    });
+}
+
+async function fetchPriceLookup() {
+    const nap = await httpFetchJsonUrl(NETWORK_PRICES_URL);
+    const capturedAt = nap?.capturedAt || null;
+    const tp = nap?.token_prices || {};
+    // Common decimals: most CW20s are 6, native tokens are 6, wBTC variants are 8.
+    // We pull decimals from the price record where available.
+    const bySymbol = {};
+    const byDenom  = {};
+    for (const [sym, entry] of Object.entries(tp)) {
+        const price = entry?.final_price_usd
+            ?? entry?.prices?.astroport?.final_price_usd
+            ?? entry?.prices?.coingecko_bulk?.final_price_usd
+            ?? null;
+        if (price == null) continue;
+        const source = entry?.prices?.astroport?.ok
+            ? 'astroport'
+            : (entry?.prices?.coingecko_bulk?.ok ? 'coingecko_bulk' : 'direct');
+        const decimals = entry?.decimals ?? 6;
+        const rec = { symbol: sym, price_usd: price, price_source: source, decimals };
+        bySymbol[sym.toLowerCase()] = rec;
+        // The price file may carry the on-chain denom under entry.contract or entry.denom
+        const denom = entry?.contract || entry?.denom || null;
+        if (denom) byDenom[denom] = rec;
+    }
+    // Hard-coded native LUNA — the prices file usually has it under "LUNA"
+    if (!byDenom['uluna'] && bySymbol['luna']) {
+        byDenom['uluna'] = { ...bySymbol['luna'], decimals: 6 };
+    }
+    return { bySymbol, byDenom, capturedAt };
+}
+
+// Resolve a bribe_token shape `{ native: 'uluna' }` or `{ cw20: 'terra1...' }`
+// to a price record. Returns null if no match.
+function resolveBribeTokenPrice(bribeToken, priceLookup) {
+    if (!bribeToken || !priceLookup) return null;
+    if (bribeToken.native) {
+        return priceLookup.byDenom[bribeToken.native] || null;
+    }
+    if (bribeToken.cw20) {
+        return priceLookup.byDenom[bribeToken.cw20] || null;
+    }
+    return null;
+}
+
+function enrichBribeWithUsd(bribe, priceLookup) {
+    const rec = resolveBribeTokenPrice(bribe.bribe_token, priceLookup);
+    if (!rec) {
+        bribe.bribe_amount_usd_at_capture = null;
+        bribe.price_used = null;
+        bribe.price_source = null;
+        bribe.price_captured_at = priceLookup?.capturedAt || null;
+        bribe.price_decimals = null;
+        return;
+    }
+    const raw = bribe.bribe_amount || '0';
+    // Convert chain-units → token units → USD
+    const tokenAmount = Number(raw) / Math.pow(10, rec.decimals);
+    bribe.bribe_amount_usd_at_capture = Math.round(tokenAmount * rec.price_usd * 100) / 100;
+    bribe.price_used = rec.price_usd;
+    bribe.price_source = rec.price_source;
+    bribe.price_captured_at = priceLookup.capturedAt;
+    bribe.price_decimals = rec.decimals;
+}
+
 async function captureBribesHistory() {
     const startedAt = new Date();
     // currentEpoch is 1-indexed canonical, matching `epoch_1-300_date.json` and
@@ -496,6 +585,19 @@ async function captureBribesHistory() {
     console.log(`\n📸 Bribes History Capture`);
     console.log(`   Started: ${startedAt.toISOString()}`);
     console.log(`   Current epoch: ${currentEpoch}\n`);
+
+    // Phase 0: Load token prices for USD-at-capture (CRON-FIXES-BRIEF 2.3).
+    // Bribes are denominated in tokens; their USD value drifts with price.
+    // Capturing USD-at-time lets the dashboard separate "more tokens added"
+    // from "token price moved" when showing bribe history.
+    let priceLookup = null;
+    try {
+        console.log('💵 Fetching token prices for USD-at-capture valuation...');
+        priceLookup = await fetchPriceLookup();
+        console.log(`  ✓ ${Object.keys(priceLookup.bySymbol).length} symbols + ${Object.keys(priceLookup.byDenom).length} denoms in lookup`);
+    } catch (e) {
+        console.warn(`  ⚠ price load failed: ${e.message} — bribes will lack usd_at_capture`);
+    }
 
     // Phase 1: Walk PD's proposals, extract every add_bribe
     const proposals = await fetchAllProposals();
@@ -507,6 +609,16 @@ async function captureBribesHistory() {
         allBribes = allBribes.concat(bribes);
     }
     console.log(`  ✓ Found ${allBribes.length} add_bribe records across ${proposals.length} proposals`);
+
+    // Phase 1.5: Enrich each bribe with USD-at-capture
+    if (priceLookup) {
+        let priced = 0;
+        for (const b of allBribes) {
+            enrichBribeWithUsd(b, priceLookup);
+            if (b.bribe_amount_usd_at_capture != null) priced++;
+        }
+        console.log(`  ✓ Enriched ${priced}/${allBribes.length} bribes with USD-at-capture (${allBribes.length - priced} had no price match)`);
+    }
 
     // Status breakdown
     const statusCounts = {};
