@@ -434,6 +434,8 @@ function indexAstroport(astroportData) {
     if (!Array.isArray(pools)) return idx;
     for (const p of pools) {
         const assets = p.assets || [];
+
+        // 1. Index the underlying assets within each pool
         for (const asset of assets) {
             const addr = asset.address || asset.denom;
             if (!addr) continue;
@@ -444,6 +446,29 @@ function indexAstroport(astroportData) {
                 price_usd: asset.price ?? null,
             };
         }
+
+        // 2. NEW: also index the LP token itself with a derived "X-Y LP" name.
+        // Astroport returns the LP token under various field names depending on
+        // pool type and API version. We try each known location.
+        const lpAddr = p.liquidity_token || p.lp_address || p.lp_token
+                    || p.lpAddress || p.share_token || p.lpToken
+                    || (p.lp && (p.lp.address || p.lp.denom));
+        if (lpAddr) {
+            const lpKey = lpAddr.startsWith('cw20:') ? lpAddr.slice(5) : lpAddr;
+            const symbols = assets.map(a => a.symbol).filter(Boolean);
+            const lpName = symbols.length >= 2 ? `${symbols.join('-')} LP` : 'Astroport LP';
+            const poolType = p.pool_type || p.type || p.poolType;
+            const typeBadge = poolType ? ` (${poolType})` : '';
+            idx[lpKey] = {
+                symbol: lpName,
+                name: lpName + typeBadge,
+                decimals: 6,
+                is_lp_token: true,
+                pool_type: poolType,
+                underlying_addresses: assets.map(a => a.address || a.denom).filter(Boolean),
+                underlying_symbols: symbols,
+            };
+        }
     }
     return idx;
 }
@@ -452,12 +477,31 @@ function indexSkeletonSwap(ssData) {
     const idx = {};
     const pools = ssData?.pools || [];
     for (const p of pools) {
-        for (const tk of [p.token_0, p.token_1].filter(Boolean)) {
+        // 1. Underlying assets
+        const assetTokens = [p.token_0, p.token_1].filter(Boolean);
+        for (const tk of assetTokens) {
             if (!tk.denom) continue;
             const key = tk.denom.startsWith('cw20:') ? tk.denom.slice(5) : tk.denom;
             idx[key] = {
                 symbol: tk.symbol, name: tk.name || tk.symbol,
                 decimals: tk.decimals, logo_url: tk.logo_url,
+            };
+        }
+
+        // 2. LP token itself
+        const lpAddr = p.liquidity_token || p.lp_address || p.lp_token
+                    || p.lpAddress || p.share_token;
+        if (lpAddr) {
+            const lpKey = lpAddr.startsWith('cw20:') ? lpAddr.slice(5) : lpAddr;
+            const symbols = assetTokens.map(t => t.symbol).filter(Boolean);
+            const lpName = symbols.length >= 2 ? `${symbols.join('-')} LP` : 'Skeleton Swap LP';
+            idx[lpKey] = {
+                symbol: lpName, name: lpName,
+                decimals: 6,
+                is_lp_token: true,
+                underlying_addresses: assetTokens.map(t => t.denom).filter(Boolean),
+                underlying_symbols: symbols,
+                dex: 'SkeletonSwap',
             };
         }
     }
@@ -688,6 +732,41 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         }
     }
 
+    // Post-pass: tier classification (signal-to-noise classification)
+    //   'core'    → must show: in TLA pool, has CG mapping, LP token, curated override, or
+    //                acquisition guide. Things we actively care about.
+    //   'tracked' → has a real name from a quality source (chain registry, Eris, Astroport) but
+    //                no strong participation signal. Worth keeping searchable, lower priority.
+    //   'noise'   → unnamed addresses, no participation, no external mapping. Hidden by default.
+    //
+    // Important: chain-registry alone is NOT enough for 'core' because the Cosmos Chain Registry
+    // contains many random Terra cw20 tokens (e.g. dinheiro/DINHEIROS, alentejo.money) that have
+    // no TLA relevance and no external price source. Chain registry → 'tracked'.
+    for (const t of Object.values(tokens)) {
+        const isAddressShaped = (s) => !s
+            || s.startsWith('terra1') || s.startsWith('ibc/')
+            || s.startsWith('factory/') || s.startsWith('neutron1')
+            || s.startsWith('osmo1') || s.startsWith('inj1');
+        const hasRealName = t.display_name && !isAddressShaped(t.display_name);
+        const hasSymbol   = t.symbol && !isAddressShaped(t.symbol);
+        const hasCG       = !!t.coingecko_id;
+        const inTLAPool   = t.appears_in.tla_pools_count > 0;
+        const isAmplpUnderlying = t.appears_in.is_amplp_underlying;
+        const hasOverride = !!t.override;
+        const hasAcq      = !!t.acquisition;
+        const isLpToken   = t.category === 'lp_tokens';
+        const isLst       = t.subtype === 'lst';
+        const hasBridgeInfo = !!t.bridge;  // chain registry attached bridge metadata = known cross-chain asset
+
+        if (hasCG || inTLAPool || isAmplpUnderlying || hasOverride || hasAcq || isLpToken || isLst || hasBridgeInfo) {
+            t.tier = 'core';
+        } else if (hasRealName || hasSymbol) {
+            t.tier = 'tracked';
+        } else {
+            t.tier = 'noise';
+        }
+    }
+
     return tokens;
 }
 
@@ -882,6 +961,11 @@ async function main() {
     if (freshness.dataFreshness === 'stuck') status = 'stuck';
     else if (errors.length > 0 || Object.keys(external.source_errors).length > 0) status = 'partial';
 
+    const tierCounts = { core: 0, tracked: 0, noise: 0 };
+    for (const t of Object.values(tokens)) {
+        if (t.tier && tierCounts[t.tier] != null) tierCounts[t.tier]++;
+    }
+
     const heartbeat = {
         schemaVersion: SCHEMA_VERSION, cron: CRON_NAME,
         capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
@@ -892,6 +976,9 @@ async function main() {
             pool_count: pools.length,
             bucket_count: Object.keys(buckets).length,
             tokens_catalog: Object.keys(tokens).length,
+            tokens_core: tierCounts.core,
+            tokens_tracked: tierCounts.tracked,
+            tokens_noise: tierCounts.noise,
             contracts_catalog: Object.keys(contracts).length,
             wallets_catalog: Object.keys(wallets).length,
             amplp_mappings: Object.keys(amplpInfo.mapping).length,
