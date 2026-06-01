@@ -283,7 +283,7 @@ async function captureChainRegistry() {
             if (!gaugeName || !gaugeData) continue;
 
             const totalGaugeVp = gaugeData.total_gauge_vp || gaugeData.total_vp || null;
-            const dists = gaugeData.distribution || gaugeData.distributions || [];
+            const dists = gaugeData.assets || gaugeData.distribution || gaugeData.distributions || [];
             buckets[gaugeName] = { total_gauge_vp: totalGaugeVp, pool_count: 0 };
 
             for (const d of (Array.isArray(dists) ? dists : [])) {
