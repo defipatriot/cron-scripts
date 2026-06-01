@@ -823,6 +823,103 @@ function buildContractsCatalog({ directory, curated }) {
     return { contracts, wallets };
 }
 
+// -----------------------------------------------------------------------------
+// DAODAO STAKER ENRICHMENT
+// -----------------------------------------------------------------------------
+// For every contract tagged protocol='DAODAO' and subtype='staking' in our catalog,
+// we paginate `list_stakers` and add each staker as a wallet entry. These entries
+// are tagged with discovery_source='daodao_staker' so the UI can distinguish them
+// from curated/named entities.
+//
+// Staker entries are NOT auto-labeled — they stay as raw addresses in the dropdown
+// but become recognizable when pasted (the picker shows their source DAO).
+// To "promote" a staker to a named wallet, edit it via tla-catalog.html → the
+// label gets saved to wallets.json as a curated override.
+//
+// Pagination: each `list_stakers` call returns at most 30. We follow `start_after`
+// pagination up to a hard cap to avoid runaway calls on unbounded DAOs.
+async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
+    const MAX_PAGES_PER_DAO = 20;       // ≈ 600 stakers max per DAO
+    const PAGE_SIZE = 30;
+    let totalDiscovered = 0;
+    const perDaoCounts = {};
+
+    const stakingContracts = Object.entries(contracts).filter(([, c]) =>
+        c.protocol === 'DAODAO' && c.subtype === 'staking'
+    );
+
+    if (stakingContracts.length === 0) {
+        console.log('[daodao_stakers] No DAODAO staking contracts in catalog — skipping');
+        return { totalDiscovered: 0, perDaoCounts };
+    }
+
+    for (const [contractAddr, contract] of stakingContracts) {
+        const daoName = contract.label || contract.name || contractAddr.slice(0, 16);
+        let pageStart = null;
+        let pageCount = 0;
+        let daoCount = 0;
+
+        try {
+            while (pageCount < MAX_PAGES_PER_DAO) {
+                pageCount++;
+                const msg = { list_stakers: { limit: PAGE_SIZE, ...(pageStart ? { start_after: pageStart } : {}) } };
+                const result = await queryContract(contractAddr, msg, `${daoName}.list_stakers[p${pageCount}]`);
+                const batch = result?.stakers || result || [];
+                if (!Array.isArray(batch) || batch.length === 0) break;
+
+                for (const s of batch) {
+                    const walletAddr = s.address || s.staker || s.owner;
+                    if (!walletAddr || !walletAddr.startsWith('terra1')) continue;
+
+                    if (wallets[walletAddr]) {
+                        // Already in catalog (curated or previously discovered) — just
+                        // annotate with DAO membership and stake balance.
+                        const w = wallets[walletAddr];
+                        w.dao_memberships = w.dao_memberships || [];
+                        if (!w.dao_memberships.find(d => d.staking_contract === contractAddr)) {
+                            w.dao_memberships.push({
+                                dao: daoName,
+                                staking_contract: contractAddr,
+                                stake_balance: s.balance || s.amount || null,
+                            });
+                        }
+                    } else {
+                        wallets[walletAddr] = {
+                            address: walletAddr,
+                            category: 'wallets',
+                            subtype: 'member',
+                            protocol: 'DAODAO',
+                            source: 'auto_discovered',
+                            discovery_source: 'daodao_staker',
+                            dao_memberships: [{
+                                dao: daoName,
+                                staking_contract: contractAddr,
+                                stake_balance: s.balance || s.amount || null,
+                            }],
+                            verified: false,
+                        };
+                        daoCount++;
+                        totalDiscovered++;
+                    }
+
+                    pageStart = walletAddr;
+                }
+
+                if (batch.length < PAGE_SIZE) break; // last page
+            }
+            perDaoCounts[daoName] = daoCount;
+            console.log(`[daodao_stakers] ${daoName}: +${daoCount} new stakers (${pageCount} page${pageCount === 1 ? '' : 's'})`);
+        } catch (e) {
+            // Don't fail the cron — log and continue. The staking contract might use
+            // a different query schema (some DAODAO modules don't expose list_stakers).
+            console.warn(`[daodao_stakers] ${daoName} failed: ${e.message}`);
+            perDaoCounts[daoName] = null; // null = failed (vs 0 = empty)
+        }
+    }
+
+    return { totalDiscovered, perDaoCounts };
+}
+
 function findUnmapped({ tokens }) {
     const unmappedTokens = [];
     for (const [addr, t] of Object.entries(tokens)) {
@@ -924,8 +1021,20 @@ async function main() {
     const unmapped = findUnmapped({ tokens });
     console.log(`   tokens:    ${Object.keys(tokens).length}`);
     console.log(`   contracts: ${Object.keys(contracts).length}`);
-    console.log(`   wallets:   ${Object.keys(wallets).length}`);
+    console.log(`   wallets:   ${Object.keys(wallets).length} (curated only)`);
     console.log(`   unmapped:  ${unmapped.tokens.length}`);
+
+    // Enrich wallets with DAODAO stakers (Lion DAO, Pixel Lions, etc.)
+    console.log('\n🦁 Enriching wallets from DAODAO staking contracts...');
+    let stakerEnrichment = { totalDiscovered: 0, perDaoCounts: {} };
+    try {
+        stakerEnrichment = await enrichWalletsWithDaodaoStakers(wallets, contracts);
+        console.log(`   discovered: ${stakerEnrichment.totalDiscovered} new staker wallets`);
+        console.log(`   wallets now: ${Object.keys(wallets).length} (curated + discovered)`);
+    } catch (e) {
+        console.warn(`   ⚠ Staker enrichment failed entirely: ${e.message}`);
+        errors.push({ stage: 'daodao_stakers', error: e.message });
+    }
 
     const snapshot = {
         schemaVersion: SCHEMA_VERSION, cron: CRON_NAME,
@@ -981,6 +1090,8 @@ async function main() {
             tokens_noise: tierCounts.noise,
             contracts_catalog: Object.keys(contracts).length,
             wallets_catalog: Object.keys(wallets).length,
+            wallets_discovered_via_daodao: stakerEnrichment.totalDiscovered,
+            wallets_per_dao: stakerEnrichment.perDaoCounts,
             amplp_mappings: Object.keys(amplpInfo.mapping).length,
             unmapped_tokens: unmapped.tokens.length,
             chain_errors: errors.length,
