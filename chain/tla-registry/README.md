@@ -1,9 +1,14 @@
-# tla-chain-registry (cron source)
+# tla-registry (cron source)
 
 **Layer 0 of the TLA chain-native data pipeline.**
 
 This is the script source. It writes its output to a separate data repo:
 `defipatriot/tla-chain-registry`.
+
+> **Naming note:** the source folder is `chain/tla-registry/` (short) but the
+> data repo is `tla-chain-registry` (descriptive). Folder and repo names
+> deliberately differ — folders cluster cleanly inside `cron-scripts/chain/`,
+> while public data repos keep the "chain-native" signal in their name.
 
 ## What it does
 
@@ -44,13 +49,13 @@ Each file has:
 | Field | Value |
 |---|---|
 | Service type | Cron Job |
-| Name | `tla-chain-registry-v2` |
+| Name | `tla-registry-v2` (or `tla-chain-registry-v2` — just a label) |
 | Region | Oregon (matches other crons) |
 | Schedule | `5 0 * * *` (daily 00:05 UTC) |
 | Source repo | `defipatriot/cron-scripts` |
-| Root directory | `tla-chain-registry` |
+| Root directory | `chain/tla-registry` |
 | Build command | `npm install` |
-| Start command | `node tla-chain-registry.js` |
+| Start command | `node tla-registry.js` |
 
 ### Env vars (required)
 
@@ -74,10 +79,10 @@ To run without pushing to GitHub (prints output to stdout):
 
 ```bash
 # Leave GITHUB_TOKEN unset
-node tla-chain-registry.js
+node tla-registry.js
 ```
 
-With GITHUB_TOKEN set, it pushes to whatever `GITHUB_REPO` points at —
+With `GITHUB_TOKEN` set, it pushes to whatever `GITHUB_REPO` points at —
 **use a test repo name for development** to avoid clobbering production data.
 
 ## Failure modes
@@ -103,7 +108,23 @@ This layer has to come first because:
 
 ## Migration safety (Part 5.6)
 
-Named `-v2` per the parallel-run convention. The existing 7-cron pipeline
-keeps running unchanged during this build. This layer publishes to a NEW
-repo (`tla-chain-registry`, no `_2026` suffix). Diff against old system
-is the verification step before any tile is migrated to read from here.
+The existing 7-cron pipeline keeps running unchanged during this build.
+This layer publishes to a NEW repo (`tla-chain-registry`). Diff against
+old system is the verification step before any tile is migrated to read
+from here.
+
+## Future siblings
+
+When Layers 1-4 land, they'll join this folder structure:
+
+```
+cron-scripts/chain/
+├── tla-registry/     ← Layer 0 (this)
+├── tla-pricing/      ← Layer 1
+├── tla-pools/        ← Layer 2 (entities)
+├── tla-participants/ ← Layer 3
+└── tla-rollups/      ← Layer 4
+```
+
+Each writes to a matching public data repo
+(`tla-chain-pricing`, `tla-chain-pools`, etc.).
