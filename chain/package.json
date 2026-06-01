@@ -1,1 +1,13 @@
-PLace
+{
+  "name": "tla-chain-registry",
+  "version": "1.0.0",
+  "description": "Layer 0 of the TLA chain-native data pipeline. Reads global-config + asset-gauge from Eris ve3 contracts on Terra.",
+  "private": true,
+  "main": "tla-chain-registry.js",
+  "scripts": {
+    "start": "node tla-chain-registry.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
