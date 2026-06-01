@@ -509,7 +509,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         };
     }
 
-    // Stage 2: Eris (canonical display name)
+    // Stage 2: Eris (canonical display name, but skip if Eris's key is just an address)
     for (const [addr, info] of Object.entries(erisIdx)) {
         const t = get(addr);
         if (!t.type) {
@@ -517,11 +517,22 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                    : addr.startsWith('factory/') ? 'factory'
                    : addr.startsWith('terra1') ? 'cw20' : 'native';
         }
+        // Only use Eris's name as display if it's NOT just an address or hash.
+        // (Eris sometimes uses the contract address as the price-endpoint key
+        // when it doesn't have a friendly name configured.)
+        const erisNameLooksLikeAddress = info.eris_name && (
+            info.eris_name.startsWith('terra1') ||
+            info.eris_name.startsWith('ibc/') ||
+            info.eris_name.startsWith('factory/')
+        );
         t.sources.eris = {
             eris_name: info.eris_name, symbol: info.symbol,
             decimals: info.decimals, price_usd: info.price_usd,
+            looks_like_address: erisNameLooksLikeAddress,
         };
-        t.display_name = info.eris_name || t.display_name;
+        if (!erisNameLooksLikeAddress && info.eris_name) {
+            t.display_name = info.eris_name;
+        }
         if (info.decimals != null && t.decimals == null) t.decimals = info.decimals;
         if (info.coingecko_id && !t.coingecko_id) t.coingecko_id = info.coingecko_id;
     }
@@ -623,14 +634,18 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         let score = 100;
         const flags = [];
 
-        const namesAcrossSources = [
-            t.sources.cosmos_chain_registry?.symbol, t.sources.eris?.symbol,
-            t.sources.astroport?.symbol, t.sources.skeletonswap?.symbol,
-        ].filter(Boolean);
-        const distinctNames = [...new Set(namesAcrossSources.map(n => n.toLowerCase().replace(/\.[a-z]+$/, '')))];
+        // Helper: a "name" that's actually just the address shouldn't count as a real source-named token
+        const isNameLikeAddress = (n) => n && (n.startsWith('terra1') || n.startsWith('ibc/') || n.startsWith('factory/'));
+        const realNamesAcrossSources = [
+            t.sources.cosmos_chain_registry?.symbol,
+            t.sources.eris?.symbol,
+            t.sources.astroport?.symbol,
+            t.sources.skeletonswap?.symbol,
+        ].filter(n => n && !isNameLikeAddress(n));
+        const distinctNames = [...new Set(realNamesAcrossSources.map(n => n.toLowerCase().replace(/\.[a-z]+$/, '')))];
         if (distinctNames.length > 1) {
             score -= 15;
-            flags.push('cross_source_name_mismatch:' + namesAcrossSources.join(','));
+            flags.push('cross_source_name_mismatch:' + realNamesAcrossSources.join(','));
         }
 
         if (!t.coingecko_id) {
