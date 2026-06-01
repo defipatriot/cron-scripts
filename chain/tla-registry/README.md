@@ -1,55 +1,104 @@
-# tla-registry (cron source)
+# tla-registry (cron source) — v2.0
 
 **Layer 0 of the TLA chain-native data pipeline.**
+Now produces a full ecosystem catalog (tokens + contracts + wallets +
+acquisition guides) by merging chain queries + external registries + curated data.
 
-This is the script source. It writes its output to a separate data repo:
-`defipatriot/tla-chain-registry`.
+This is the script source. It writes its output to:
+`defipatriot/tla-chain-registry/2026/`.
 
 > **Naming note:** the source folder is `chain/tla-registry/` (short) but the
 > data repo is `tla-chain-registry` (descriptive). Folder and repo names
-> deliberately differ — folders cluster cleanly inside `cron-scripts/chain/`,
-> while public data repos keep the "chain-native" signal in their name.
+> deliberately differ.
 
 ## What it does
 
-Reads the canonical contract directory + pool registry from the Eris ve3
-contracts on Terra. Every other layer in the new pipeline bootstraps from
-what this writes — no more hardcoded contract addresses.
+Reads from THREE kinds of sources, merges by Terra address, publishes a unified catalog.
 
-## Queries (5 per run)
+### Chain queries (Q1-Q6)
 
 | # | Contract | Query | Purpose |
 |---|---|---|---|
-| 1 | global-config | `all_addresses` | Master contract directory (the bootstrap) |
-| 2 | asset-gauge | `distributions` | Canonical pool registry (gauge_pool_id, bucket, share %) |
+| 1 | global-config | `all_addresses` | Master contract directory (bootstrap) |
+| 2 | asset-gauge | `distributions` | Pool registry (gauge_pool_id, bucket, share %) |
 | 3 | asset-gauge | `last_distribution_period` | Canonical current epoch |
 | 4 | asset-gauge | `config` | Gauge list, global_config_addr, rebase asset |
-| 5 | voting-escrow | `num_tokens` | Sanity ping (~431 currently) |
+| 5 | voting-escrow | `num_tokens` | Sanity ping |
+| 6 | asset-compounder | `asset_configs` | amplp ↔ LP mapping (NEW in v2) |
 
-Only the global-config address is hardcoded. Everything else is discovered.
+Only the global-config address is hardcoded. Everything else discovered.
 
-## Output schema
+### External sources (each optional)
 
-Written to `defipatriot/tla-chain-registry/2026/`:
+If any single one fails, the catalog still publishes using the rest. Status becomes `partial`.
 
-- `current.json` — latest snapshot (the dashboard / other layers read this)
-- `heartbeat.json` — freshness signal for the cron-health widget
-- `daily/YYYY-MM-DD.json` — per-day archive (permanent history)
+- **Cosmos Chain Registry** (`raw.githubusercontent.com/cosmos/chain-registry`) — 58 Terra2 assets with CoinGecko IDs, IBC traces, decimals
+- **Eris prices** (`backend.erisprotocol.com/prices`) — canonical display names
+- **Astroport REST** (`app.astroport.fi/api/pools`)
+- **Skeleton Swap** (`dex.warlock.backbonelabs.io/api/pools/phoenix-1`)
 
-Each file has:
-- `schemaVersion` + `capturedAt` + `canonicalEpoch`
-- `raw.*` — unmodified query responses (per Part 5.0: capture RAW, never lose source)
-- `directory` — parsed role → address map
-- `pools[]` — flattened pool registry, keyed by `gauge_pool_id|bucket`
-- `buckets{}` — per-bucket totals (total_gauge_vp, pool_count)
-- `_errors[]` — failed queries (distinct from empty results)
+### Curated files (in the same data repo, edit via GitHub UI)
+
+The cron pulls these from `defipatriot/tla-chain-registry/curated/` each run:
+
+- `categories.json` — taxonomy
+- `wallets.json` — known wallet labels
+- `protocols.json` — protocol metadata
+- `known_contracts.json` — contract labels (seeded from aDAO registry)
+- `token_overrides.json` — display name preferences
+- `acquisition_guides.json` — how to safely acquire each token
+
+See `defipatriot/tla-chain-registry/curated/README.md` for the editing guide.
+
+## Output schema (`current.json` v2)
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "canonicalEpoch": 187,
+
+  // Chain-derived
+  "directory": { "ASSET_GAUGE": "terra1...", ... },
+  "pools": [ {gauge_pool_id, bucket, distribution_pct, ...} ],
+  "buckets": {...},
+
+  // Catalog
+  "tokens": {
+    "<terra_address>": {
+      "address", "type", "category", "subtype",
+      "symbol", "display_name", "decimals",
+      "coingecko_id", "coingecko_match",
+      "sources": { cosmos_chain_registry, eris, astroport, skeletonswap },
+      "bridge": { source_chain, original_denom, channel_id, via },
+      "appears_in": { tla_pools_count, tla_pools, is_lockable, is_amplp_underlying },
+      "wallet_import": { symbol, name, decimals, address },
+      "scoring": { confusion_score, flags },
+      "override": null,                  // from token_overrides.json
+      "acquisition": null,               // from acquisition_guides.json
+      "related_variants": []             // other token addrs sharing base symbol
+    }
+  },
+  "amplp_mappings": { "<amplp_denom>": { underlying_lp_address, bucket, ... } },
+  "lp_to_amplp": { "<lp>": "<amplp_denom>" },
+  "contracts_catalog": { "<addr>": { label, protocol, category, subtype, source } },
+  "wallets_catalog":   { "<addr>": { label, subtype, ... } },
+  "protocols": {...},
+  "categories": {...},
+
+  // Worklist
+  "_unmapped": { tokens: [...], contracts: [], wallets: [] },
+
+  // Raw chain responses preserved
+  "raw": {...}
+}
+```
 
 ## Deploy on Render
 
 | Field | Value |
 |---|---|
 | Service type | Cron Job |
-| Name | `tla-registry-v2` (or `tla-chain-registry-v2` — just a label) |
+| Name | `tla-registry-v2` |
 | Region | Oregon (matches other crons) |
 | Schedule | `5 0 * * *` (daily 00:05 UTC) |
 | Source repo | `defipatriot/cron-scripts` |
@@ -61,70 +110,57 @@ Each file has:
 
 | Var | Value |
 |---|---|
-| `GITHUB_TOKEN` | Same token used by other crons (needs write to `defipatriot/tla-chain-registry`) |
+| `GITHUB_TOKEN` | Token with write access to `defipatriot/tla-chain-registry` |
 | `GITHUB_REPO` | `defipatriot/tla-chain-registry` |
 
-### Env vars (optional, sensible defaults baked in)
+### Env vars (optional, defaults baked in)
 
-| Var | Default | Override when |
-|---|---|---|
-| `GITHUB_BRANCH` | `main` | If using a non-main branch |
-| `TERRA_LCD_PRIMARY` | `https://terra-lcd.publicnode.com` | LCD primary changes |
-| `TERRA_LCD_FALLBACK` | `https://terra-rest.publicnode.com` | LCD fallback changes |
-| `GLOBAL_CONFIG_ADDR` | `terra1hwxg6s732eparz3ys7sa4t5f64ngpd2w8syrca6z7ckv3fs9uqnsvrpcqa` | Should never change |
+| Var | Default |
+|---|---|
+| `GITHUB_BRANCH` | `main` |
+| `TERRA_LCD_PRIMARY` | `https://terra-lcd.publicnode.com` |
+| `TERRA_LCD_FALLBACK` | `https://terra-rest.publicnode.com` |
+| `GLOBAL_CONFIG_ADDR` | `terra1hwxg6s732eparz3ys7sa4t5f64ngpd2w8syrca6z7ckv3fs9uqnsvrpcqa` |
 
 ## Local test
 
-To run without pushing to GitHub (prints output to stdout):
-
 ```bash
-# Leave GITHUB_TOKEN unset
+# Without GITHUB_TOKEN, prints summary instead of pushing
 node tla-registry.js
 ```
 
-With `GITHUB_TOKEN` set, it pushes to whatever `GITHUB_REPO` points at —
-**use a test repo name for development** to avoid clobbering production data.
-
 ## Failure modes
 
-- **Both LCDs unreachable** → exit code 1, no GitHub write. Old snapshot stays in place.
-- **Watchdog (5 min ceiling)** → exit code 2. Designed to never run away.
-- **Downstream query fails (gauge / escrow)** → recorded in `_errors[]` but snapshot publishes with what DID succeed. Status set to `partial`.
-- **`global-config.all_addresses` returns null** → fatal; can't proceed without the bootstrap.
+- **Both LCDs unreachable** → exit 1, no GitHub write, old snapshot stays.
+- **Watchdog (5 min ceiling)** → exit 2.
+- **External source fails** (chain-registry / Eris / Astroport / SS) → recorded in `source_errors`, snapshot still publishes with remaining sources, status=`partial`.
+- **Missing curated file** → cron continues without it.
+- **`global-config.all_addresses` returns null** → fatal; can't proceed.
 
 ## Why this design
 
-Per `CRON-FIXES-BRIEF` Part 5.1:
-- Layer 0 = discovery / bootstrap (this).
-- Layer 1 = pricing (next).
-- Layer 2 = entities (pools, locks, staking).
-- Layer 3 = participants (the expensive one; daily only).
-- Layer 4 = rollups (zero chain queries; pure functions of 0-3).
+Per `CRON-FIXES-BRIEF` Parts 5.1 + 5.0:
+- Layer 0 = discovery / bootstrap / catalog (this).
+- Layer 1 = pricing (next session).
+- Layer 2 = entities (pools reserves, locks, staking).
+- Layer 3 = participants.
+- Layer 4 = rollups.
 
-This layer has to come first because:
-1. Every downstream layer needs the contract directory.
-2. The pool registry self-discovers (no manual list maintenance).
-3. The canonical epoch number settles off-by-one issues at the source.
+**Address-first** identity is non-negotiable: the wBTC.atom vs wBTC.axl
+case proves that names lie but addresses don't. Names from sources
+become metadata; the catalog primary key is always the Terra address.
 
-## Migration safety (Part 5.6)
-
-The existing 7-cron pipeline keeps running unchanged during this build.
-This layer publishes to a NEW repo (`tla-chain-registry`). Diff against
-old system is the verification step before any tile is migrated to read
-from here.
+**Catalog merging is layered**: chain registry → Eris → Astroport → SS →
+pool participation → amplp → curated overrides → acquisition guides →
+scoring. Each stage non-destructively augments. Eris wins on display name.
 
 ## Future siblings
 
-When Layers 1-4 land, they'll join this folder structure:
-
 ```
 cron-scripts/chain/
-├── tla-registry/     ← Layer 0 (this)
-├── tla-pricing/      ← Layer 1
-├── tla-pools/        ← Layer 2 (entities)
-├── tla-participants/ ← Layer 3
-└── tla-rollups/      ← Layer 4
+├── tla-registry/      ← Layer 0 (this) — discovery + catalog
+├── tla-pricing/       ← Layer 1 — multi-source token prices
+├── tla-pools/         ← Layer 2 — pool entities (reserves, APR)
+├── tla-participants/  ← Layer 3 — voter/locker/staker enumeration
+└── tla-rollups/       ← Layer 4 — pure functions of 0-3
 ```
-
-Each writes to a matching public data repo
-(`tla-chain-pricing`, `tla-chain-pools`, etc.).

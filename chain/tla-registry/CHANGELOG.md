@@ -1,33 +1,53 @@
-# Changelog — tla-chain-registry
+# Changelog — tla-registry
 
 All notable changes to this cron's code. Daily auto-runs not listed.
 
-## v1.0.0 — 2026-06-01
+## v2.0.0 — 2026-06-01
 
-Initial release. Layer 0 of the chain-native pipeline.
+**Major expansion: Layer 0 now produces the full ecosystem catalog.**
 
 ### Added
-- `tla-chain-registry.js` — 5-query daily capture:
-  - `global-config.all_addresses`
-  - `asset-gauge.distributions`
-  - `asset-gauge.last_distribution_period`
-  - `asset-gauge.config`
-  - `voting-escrow.num_tokens`
-- Output schema v1: `raw.*` (unmodified source responses) + `directory` +
-  `pools[]` (keyed by `gauge_pool_id|bucket` per Part 1.1) + `buckets{}` +
-  `_errors[]` (per Part 3.2: failed ≠ empty).
-- Heartbeat with freshness fingerprint (matches the schema used by the
-  other 7 production crons). Stuck threshold widened to 20 consecutive
-  identical runs because the registry legitimately moves only weekly
-  (on epoch boundaries).
-- Watchdog: 5-min hard runtime ceiling (Part 5.3).
-- Both LCDs unreachable → fail clean (exit 1), no GitHub write, old
-  snapshot stays in place.
+- **Q6 chain query**: `asset-compounder.asset_configs` → amplp ↔ underlying-LP mapping
+- **External source pulls** (each optional, isolated failures):
+  - Cosmos Chain Registry (`raw.githubusercontent.com/cosmos/chain-registry/master/terra2/assetlist.json`)
+    — 58 Terra2 assets with coingecko_id, IBC traces, decimals, logos
+  - Eris prices (`backend.erisprotocol.com/prices`) — canonical display names
+  - Astroport REST (`app.astroport.fi/api/pools?chainId=phoenix-1`) — cross-source names
+  - Skeleton Swap (`dex.warlock.backbonelabs.io/api/pools/phoenix-1`)
+- **Curated file system**: cron reads `curated/*.json` from same data repo
+  - `categories.json` — taxonomy definition
+  - `wallets.json` — known wallet labels
+  - `protocols.json` — protocol metadata
+  - `known_contracts.json` — contract labels (seeded from aDAO registry)
+  - `token_overrides.json` — display name preferences
+  - `acquisition_guides.json` — safe-acquisition steps per token
+- **Address-first catalog assembly**:
+  - Tokens indexed by Terra address (not name) — the only stable identity
+  - 9-stage merge: chain-registry → Eris → Astroport → SS → pools → amplp → overrides → guides → scoring
+  - Eris is the source-of-truth for display names (Camron's call)
+  - Post-pass: cross-token variant detection (the wBTC.atom/.axl/.osmo case)
+- **Confusion scoring per token** (0-100):
+  - `-25` no CoinGecko mapping (no external price source)
+  - `-15` cross-source name mismatch
+  - `-15` not in active use anywhere
+  - `-10` no acquisition guide
+  - `-10` shared base symbol with other variants
+- **LP-token category** (separate from regular tokens): pool gauge_pool_id IS an LP, not the underlying asset
+- **`_unmapped[]` worklist**: surfaces tokens cron saw but couldn't name, distinguishing LP tokens (expected, named by DEX in production) from regular tokens (truly need curation)
+- **Schema bumped to v2** — heartbeat and snapshot now carry richer stats:
+  - `tokens_catalog`, `contracts_catalog`, `wallets_catalog`, `amplp_mappings`, `unmapped_tokens`, `external_source_errors`
 
-### Notes
-- Only the global-config contract address is hardcoded. Everything else
-  is discovered from that bootstrap query.
-- Output repo: `defipatriot/tla-chain-registry` (NEW). Year-folder
-  structure `2026/...` so the repo itself outlives the calendar year.
-- Render service named `tla-chain-registry-v2` per Part 5.6 parallel-run
-  convention. The existing 7-cron pipeline is unaffected.
+### Changed
+- File renamed: `tla-chain-registry.js` → `tla-registry.js`
+- Folder moved: `tla-chain-registry/` → `chain/tla-registry/`
+- Cron status logic: `partial` now triggers when external source errors > 0 too (not just chain errors)
+- Heartbeat stats expanded with catalog-side counts
+
+### Architecture notes
+- The cron is **resilient by design**: if Astroport REST is down, catalog still publishes with chain-registry + Eris + SS data. Failure is recorded in `source_errors`, status flips to `partial`, but cron exit code stays 0.
+- The cron is **address-first**: identity is by terra address (not display name). Names are metadata. This is the only safe primary key given the wBTC/USDC multi-variant reality.
+- The curated folder is read from THIS SAME REPO each run — no external dependency for curation. Edit in GitHub web UI → next run picks it up.
+
+## v1.0.0 — 2026-06-01
+
+Initial release. Layer 0 of the chain-native pipeline. 5 queries, basic registry capture.

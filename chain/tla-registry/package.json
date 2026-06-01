@@ -1,11 +1,11 @@
 {
-  "name": "tla-chain-registry",
-  "version": "1.0.0",
-  "description": "Layer 0 of the TLA chain-native data pipeline. Reads global-config + asset-gauge from Eris ve3 contracts on Terra.",
+  "name": "tla-registry",
+  "version": "2.0.0",
+  "description": "Layer 0 of the TLA chain-native data pipeline. Ecosystem catalog merging chain queries + Cosmos Chain Registry + Eris/Astroport/SS APIs + curated data.",
   "private": true,
-  "main": "tla-chain-registry.js",
+  "main": "tla-registry.js",
   "scripts": {
-    "start": "node tla-chain-registry.js"
+    "start": "node tla-registry.js"
   },
   "engines": {
     "node": ">=18"
