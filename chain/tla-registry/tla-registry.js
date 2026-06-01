@@ -805,6 +805,8 @@ function buildContractsCatalog({ directory, curated }) {
                 if (info.canReceiveFunds != null) c.can_receive_funds = info.canReceiveFunds;
                 if (info.seen_in_props) c.seen_in_props = info.seen_in_props;
                 if (info.risk_level) c.risk_level = info.risk_level;
+                if (info.staking_module) c.staking_module = info.staking_module;
+                if (info.notes) c.notes = info.notes;
             }
         }
     }
@@ -824,18 +826,121 @@ function buildContractsCatalog({ directory, curated }) {
 }
 
 // -----------------------------------------------------------------------------
-// DAODAO STAKER ENRICHMENT
+// WALLET ENRICHMENT — Phase 0 catalog expansion
 // -----------------------------------------------------------------------------
-// For every contract tagged protocol='DAODAO' and subtype='staking' in our catalog,
-// we paginate `list_stakers` and add each staker as a wallet entry. These entries
-// are tagged with discovery_source='daodao_staker' so the UI can distinguish them
-// from curated/named entities.
+// Three independent paths, each defensive (failures don't break the cron):
 //
-// Staker entries are NOT auto-labeled — they stay as raw addresses in the dropdown
-// but become recognizable when pasted (the picker shows their source DAO).
-// To "promote" a staker to a named wallet, edit it via tla-catalog.html → the
-// label gets saved to wallets.json as a curated override.
+//   1. enrichWalletsWithDaodaoStakers  — direct list_stakers on cw20-staked DAOs
+//                                        (Lion DAO ROAR Staking works; ~346 stakers)
 //
+//   2. enrichWalletsWithDaodaoIndexer  — DAODAO indexer attempt for cw721 DAOs
+//                                        (Pixel Lions, aDAO NFT-staked, etc.)
+//                                        The on-chain contract doesn't expose
+//                                        list_stakers but the indexer can derive
+//                                        it from indexed wasm events.
+//
+//   3. enrichWalletsWithTLALocks       — voting-escrow.all_tokens then lock_info
+//                                        per token. ~431 chain queries at
+//                                        concurrency 3.
+//
+// Each adds to wallets[addr].dao_memberships[] so the picker UI can filter by
+// group (All / aDAO / Lion DAO / TLA) and sort by per-group stake/VP descending.
+// Staker entries are NOT auto-labeled — they stay as truncated addresses in
+// the dropdown but become recognizable on paste. To promote a discovered staker
+// to a named wallet, edit it via tla-catalog.html and save the label to
+// wallets.json as a curated override.
+
+// Batched concurrent execution helper. Keeps concurrency low (3) by default
+// because Terra LCDs rate-limit aggressively; the adao-positions cron learned
+// this the hard way (had to drop concurrency from 15 → 5).
+async function batchedAsync(items, concurrency, fn) {
+    const results = new Array(items.length);
+    for (let i = 0; i < items.length; i += concurrency) {
+        const batch = items.slice(i, i + concurrency);
+        const batchResults = await Promise.allSettled(batch.map((item, j) => fn(item, i + j)));
+        for (let k = 0; k < batchResults.length; k++) {
+            const r = batchResults[k];
+            results[i + k] = r.status === 'fulfilled' ? r.value : null;
+        }
+    }
+    return results;
+}
+
+// -----------------------------------------------------------------------------
+// BECH32 ADDRESS DECODER  (terra1xxxx... → 20-byte hex)
+// -----------------------------------------------------------------------------
+// Used to build DAODAO PFPK profile URLs which require the address in 20-byte
+// hex form, not bech32. Verified against a known HAR sample:
+//   terra1hr8zsfpch47qygc96c8e6rzkd2t7mafqx77ulw → b8ce282438bd7c022305d60f9d0c566a97edf520
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+function bech32ToHex(addr) {
+    const sepIdx = addr.lastIndexOf('1');
+    if (sepIdx < 1) throw new Error('Invalid bech32: no separator');
+    const data = addr.slice(sepIdx + 1);
+    if (data.length < 7) throw new Error('Invalid bech32: too short');
+    let acc = 0, bits = 0;
+    const bytes = [];
+    for (let i = 0; i < data.length - 6; i++) {
+        const v = BECH32_CHARSET.indexOf(data[i]);
+        if (v < 0) throw new Error('Invalid bech32 char: ' + data[i]);
+        acc = (acc << 5) | v;
+        bits += 5;
+        while (bits >= 8) {
+            bits -= 8;
+            bytes.push((acc >> bits) & 0xff);
+        }
+    }
+    return Buffer.from(bytes).toString('hex');
+}
+
+// -----------------------------------------------------------------------------
+// DAODAO PFPK PROFILE NAME ENRICHMENT
+// -----------------------------------------------------------------------------
+// DAODAO's PFPK service (Profile Friends Profile Pic K??) lets users register
+// a display name + NFT avatar tied to their wallet across multiple Cosmos chains.
+// We look up each discovered wallet to surface known names like "DeFi_Patriot",
+// "Crypto007", etc. so the picker shows real names instead of just addresses.
+//
+// Endpoint: https://pfpk.daodao.zone/bech32/{hex40}
+// Response: { uuid, name, nft, chains, createdAt, updatedAt }
+// Hit rate observed from HAR sample: ~28% of addresses have a registered name.
+//
+// We only look up wallets that DON'T already have a curated label (no point
+// overriding a manually-set name from wallets.json).
+async function enrichWalletsWithPfpkNames(wallets) {
+    const PFPK_BASE = 'https://pfpk.daodao.zone/bech32';
+    const candidates = Object.entries(wallets).filter(([_, w]) =>
+        !w.label && !w.daodao_name && w.discovery_source
+    );
+    if (candidates.length === 0) {
+        return { totalLookups: 0, namesFound: 0 };
+    }
+    let namesFound = 0;
+    await batchedAsync(candidates, 5, async ([addr, w]) => {
+        try {
+            const hex = bech32ToHex(addr);
+            const r = await fetch(`${PFPK_BASE}/${hex}`, {
+                signal: AbortSignal.timeout(5000),
+                headers: { 'User-Agent': 'tla-registry/2.0' },
+            });
+            if (!r.ok) return;
+            const data = await r.json();
+            if (data?.name) {
+                w.daodao_name = data.name;
+                // Capture the avatar URL too if present (lets the UI render it later)
+                if (data.nft?.imageUrl) {
+                    w.daodao_avatar = data.nft.imageUrl;
+                }
+                namesFound++;
+            }
+        } catch (e) { /* silent — name lookups are best-effort */ }
+    });
+    return { totalLookups: candidates.length, namesFound };
+}
+
+// -----------------------------------------------------------------------------
+// DAODAO STAKER ENRICHMENT (cw20-staked path)
+// -----------------------------------------------------------------------------
 // Pagination: each `list_stakers` call returns at most 30. We follow `start_after`
 // pagination up to a hard cap to avoid runaway calls on unbounded DAOs.
 async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
@@ -845,7 +950,7 @@ async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
     const perDaoCounts = {};
 
     const stakingContracts = Object.entries(contracts).filter(([, c]) =>
-        c.protocol === 'DAODAO' && c.subtype === 'staking'
+        c.subtype === 'staking' && (c.staking_module === 'cw20' || (!c.staking_module && c.protocol === 'DAODAO'))
     );
 
     if (stakingContracts.length === 0) {
@@ -855,6 +960,16 @@ async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
 
     for (const [contractAddr, contract] of stakingContracts) {
         const daoName = contract.label || contract.name || contractAddr.slice(0, 16);
+        // staking_module hint from known_contracts.json — 'cw20' or 'cw721'.
+        // cw721_staked DAOs use the dao_voting_cw721_staked module which does NOT expose
+        // list_stakers; trying it returns HTTP 500 from the LCD. Skip explicitly to keep logs clean.
+        const stakingModule = contract.staking_module || (contract.auto_data?.staking_module);
+        if (stakingModule === 'cw721') {
+            console.log(`[daodao_stakers] ${daoName}: skipped — cw721-staked (no enumeration query; needs NFT-contract walk, deferred to follow-up)`);
+            perDaoCounts[daoName] = 'unsupported_cw721';
+            continue;
+        }
+
         let pageStart = null;
         let pageCount = 0;
         let daoCount = 0;
@@ -919,6 +1034,206 @@ async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
 
     return { totalDiscovered, perDaoCounts };
 }
+
+// -----------------------------------------------------------------------------
+// TLA LOCK HOLDER ENRICHMENT (voting-escrow)
+// -----------------------------------------------------------------------------
+// Enumerates every veLUNA lock NFT on the voting-escrow contract, derives the
+// per-holder summary (lock_count, total_vp, token_ids), and adds each holder to
+// wallets_catalog with dao_memberships: [{dao: 'TLA', ...}].
+//
+// Cost: ~num_tokens chain queries (~431 today) at concurrency 3. The
+// voting-escrow contract has lock_info per token which returns owner + VP +
+// period in one call. We use lock_info instead of just owner_of so we can
+// compute total VP per holder for the picker's sort key.
+//
+// Bounded to MAX_LOCKS so a runaway num_tokens value can't DoS the cron.
+async function enrichWalletsWithTLALocks(wallets, votingEscrowAddr) {
+    const MAX_LOCKS = 2000;
+    const ENUMERATION_CONCURRENCY = 3;
+    const PAGE_SIZE = 30;
+
+    if (!votingEscrowAddr) {
+        console.log('[tla_locks] No voting-escrow address — skipping');
+        return { uniqueHolders: 0, totalLocks: 0, totalDiscovered: 0 };
+    }
+
+    // Step 1: paginate all_tokens to get every lock NFT ID
+    let tokenIds = [];
+    let pageStart = null;
+    let pageCount = 0;
+    try {
+        while (pageCount < 100 && tokenIds.length < MAX_LOCKS) {
+            pageCount++;
+            const msg = { all_tokens: { limit: PAGE_SIZE, ...(pageStart ? { start_after: pageStart } : {}) } };
+            const result = await queryContract(votingEscrowAddr, msg, `voting-escrow.all_tokens[p${pageCount}]`);
+            const batch = result?.tokens || result || [];
+            if (!Array.isArray(batch) || batch.length === 0) break;
+            tokenIds.push(...batch);
+            pageStart = batch[batch.length - 1];
+            if (batch.length < PAGE_SIZE) break;
+        }
+    } catch (e) {
+        console.warn(`[tla_locks] all_tokens enumeration failed: ${e.message}`);
+        return { uniqueHolders: 0, totalLocks: 0, totalDiscovered: 0 };
+    }
+    console.log(`[tla_locks] enumerated ${tokenIds.length} lock NFTs (${pageCount} pages)`);
+
+    if (tokenIds.length === 0) {
+        return { uniqueHolders: 0, totalLocks: 0, totalDiscovered: 0 };
+    }
+
+    // Step 2: fetch lock_info for each in batched parallel
+    const lockInfos = await batchedAsync(tokenIds, ENUMERATION_CONCURRENCY, async (token_id) => {
+        try {
+            const r = await queryContract(votingEscrowAddr, { lock_info: { token_id: String(token_id) } }, null);
+            return r ? { token_id, owner: r.owner, voting_power: r.voting_power, end_period: r.end?.period } : null;
+        } catch (e) {
+            return null;
+        }
+    });
+    const successfulInfos = lockInfos.filter(l => l && l.owner);
+    console.log(`[tla_locks] fetched lock_info for ${successfulInfos.length}/${tokenIds.length} locks`);
+
+    // Step 3: aggregate by owner
+    const byOwner = {};
+    for (const lock of successfulInfos) {
+        if (!byOwner[lock.owner]) {
+            byOwner[lock.owner] = { lock_count: 0, total_vp: 0, token_ids: [] };
+        }
+        byOwner[lock.owner].lock_count++;
+        byOwner[lock.owner].total_vp += parseFloat(lock.voting_power || 0);
+        byOwner[lock.owner].token_ids.push(lock.token_id);
+    }
+
+    // Step 4: add to wallets
+    let newWallets = 0;
+    for (const [owner, summary] of Object.entries(byOwner)) {
+        const tlaMembership = {
+            dao: 'TLA',
+            kind: 'velluna_locker',
+            total_vp: summary.total_vp,
+            lock_count: summary.lock_count,
+            token_ids: summary.token_ids,
+        };
+        if (!wallets[owner]) {
+            wallets[owner] = {
+                address: owner,
+                category: 'wallets',
+                subtype: 'member',
+                protocol: 'TLA',
+                source: 'auto_discovered',
+                discovery_source: 'velluna_locker',
+                dao_memberships: [tlaMembership],
+                verified: false,
+            };
+            newWallets++;
+        } else {
+            const w = wallets[owner];
+            w.dao_memberships = w.dao_memberships || [];
+            if (!w.dao_memberships.find(m => m.dao === 'TLA')) {
+                w.dao_memberships.push(tlaMembership);
+            }
+        }
+    }
+
+    return {
+        uniqueHolders: Object.keys(byOwner).length,
+        totalLocks: successfulInfos.length,
+        totalDiscovered: newWallets,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// DAODAO INDEXER (cw721-staked path)
+// -----------------------------------------------------------------------------
+// For DAODAO DAOs that use cw721 (NFT) staking, the on-chain contract doesn't
+// expose list_stakers. The DAODAO indexer at indexer.daodao.zone derives staker
+// lists from indexed wasm events and serves them via a public formula API.
+//
+// URL pattern (verified from DAODAO HAR captures):
+//   https://indexer.daodao.zone/phoenix-1/contract/{voting_module}/daoVotingCw721Staked/topStakers
+// Returns: [{ address, count, votingPowerPercent }, ...] sorted desc by count
+//
+// This is what powers the "Members" page on daodao.zone. If the indexer is
+// down (rare) we log and skip — no fallback enumeration path.
+async function enrichWalletsWithDaodaoIndexer(wallets, contracts) {
+    const CHAIN_ID = 'phoenix-1';
+    const INDEXER_BASE = 'https://indexer.daodao.zone';
+    const cw721Contracts = Object.entries(contracts).filter(([, c]) =>
+        c.subtype === 'staking' && c.staking_module === 'cw721'
+    );
+
+    if (cw721Contracts.length === 0) {
+        return { totalDiscovered: 0, perDaoCounts: {} };
+    }
+
+    let totalDiscovered = 0;
+    const perDaoCounts = {};
+
+    for (const [contractAddr, contract] of cw721Contracts) {
+        const daoName = contract.label || contract.name || contractAddr.slice(0, 16);
+        const url = `${INDEXER_BASE}/${CHAIN_ID}/contract/${contractAddr}/daoVotingCw721Staked/topStakers`;
+
+        try {
+            const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+            if (!r.ok) {
+                console.log(`[daodao_indexer] ${daoName}: HTTP ${r.status} from indexer — skipped`);
+                perDaoCounts[daoName] = 'http_error';
+                continue;
+            }
+            const stakers = await r.json();
+            if (!Array.isArray(stakers)) {
+                console.log(`[daodao_indexer] ${daoName}: unexpected response shape — skipped`);
+                perDaoCounts[daoName] = 'bad_shape';
+                continue;
+            }
+
+            let daoCount = 0;
+            for (const s of stakers) {
+                const addr = s.address;
+                if (!addr || !addr.startsWith('terra1')) continue;
+
+                const membership = {
+                    dao: daoName,
+                    kind: 'cw721_staker',
+                    staking_contract: contractAddr,
+                    nft_count: s.count || null,
+                    voting_power_percent: s.votingPowerPercent || null,
+                };
+
+                if (!wallets[addr]) {
+                    wallets[addr] = {
+                        address: addr,
+                        category: 'wallets',
+                        subtype: 'member',
+                        protocol: 'DAODAO',
+                        source: 'auto_discovered',
+                        discovery_source: 'daodao_indexer',
+                        dao_memberships: [membership],
+                        verified: false,
+                    };
+                    daoCount++;
+                    totalDiscovered++;
+                } else {
+                    const w = wallets[addr];
+                    w.dao_memberships = w.dao_memberships || [];
+                    if (!w.dao_memberships.find(m => m.staking_contract === contractAddr)) {
+                        w.dao_memberships.push(membership);
+                    }
+                }
+            }
+            perDaoCounts[daoName] = daoCount;
+            console.log(`[daodao_indexer] ${daoName}: ${stakers.length} stakers from indexer (+${daoCount} new wallets)`);
+        } catch (e) {
+            console.log(`[daodao_indexer] ${daoName}: ${e.message.slice(0, 80)} — skipped`);
+            perDaoCounts[daoName] = 'exception';
+        }
+    }
+
+    return { totalDiscovered, perDaoCounts };
+}
+
 
 function findUnmapped({ tokens }) {
     const unmappedTokens = [];
@@ -1025,16 +1340,50 @@ async function main() {
     console.log(`   unmapped:  ${unmapped.tokens.length}`);
 
     // Enrich wallets with DAODAO stakers (Lion DAO, Pixel Lions, etc.)
-    console.log('\n🦁 Enriching wallets from DAODAO staking contracts...');
+    console.log('\n🦁 Enriching wallets from DAODAO staking contracts (cw20 path)...');
     let stakerEnrichment = { totalDiscovered: 0, perDaoCounts: {} };
     try {
         stakerEnrichment = await enrichWalletsWithDaodaoStakers(wallets, contracts);
         console.log(`   discovered: ${stakerEnrichment.totalDiscovered} new staker wallets`);
-        console.log(`   wallets now: ${Object.keys(wallets).length} (curated + discovered)`);
     } catch (e) {
-        console.warn(`   ⚠ Staker enrichment failed entirely: ${e.message}`);
+        console.warn(`   ⚠ cw20 staker enrichment failed entirely: ${e.message}`);
         errors.push({ stage: 'daodao_stakers', error: e.message });
     }
+
+    // Enrich wallets via DAODAO indexer for cw721-staked DAOs (Pixel Lions, etc.)
+    console.log('\n🦁 Enriching wallets via DAODAO indexer (cw721 path)...');
+    let indexerEnrichment = { totalDiscovered: 0, perDaoCounts: {} };
+    try {
+        indexerEnrichment = await enrichWalletsWithDaodaoIndexer(wallets, contracts);
+        console.log(`   discovered: ${indexerEnrichment.totalDiscovered} new staker wallets via indexer`);
+    } catch (e) {
+        console.warn(`   ⚠ indexer enrichment failed entirely: ${e.message}`);
+        errors.push({ stage: 'daodao_indexer', error: e.message });
+    }
+
+    // Enrich wallets with TLA lock holders (voting-escrow enumeration)
+    console.log('\n🔒 Enriching wallets from TLA voting-escrow locks...');
+    let tlaEnrichment = { uniqueHolders: 0, totalLocks: 0, totalDiscovered: 0 };
+    try {
+        tlaEnrichment = await enrichWalletsWithTLALocks(wallets, chainData.votingEscrowAddr);
+        console.log(`   scanned ${tlaEnrichment.totalLocks} locks · ${tlaEnrichment.uniqueHolders} unique holders · ${tlaEnrichment.totalDiscovered} new wallets`);
+    } catch (e) {
+        console.warn(`   ⚠ TLA lock enrichment failed entirely: ${e.message}`);
+        errors.push({ stage: 'tla_locks', error: e.message });
+    }
+
+    // Look up DAODAO PFPK profile names for every discovered wallet
+    console.log('\n🎭 Looking up DAODAO profile names (PFPK)...');
+    let pfpkEnrichment = { totalLookups: 0, namesFound: 0 };
+    try {
+        pfpkEnrichment = await enrichWalletsWithPfpkNames(wallets);
+        console.log(`   ${pfpkEnrichment.totalLookups} addresses checked · ${pfpkEnrichment.namesFound} profile names found`);
+    } catch (e) {
+        console.warn(`   ⚠ PFPK lookup failed entirely: ${e.message}`);
+        errors.push({ stage: 'pfpk_names', error: e.message });
+    }
+
+    console.log(`\n   wallets total: ${Object.keys(wallets).length} (curated + discovered from all sources)`);
 
     const snapshot = {
         schemaVersion: SCHEMA_VERSION, cron: CRON_NAME,
@@ -1091,7 +1440,14 @@ async function main() {
             contracts_catalog: Object.keys(contracts).length,
             wallets_catalog: Object.keys(wallets).length,
             wallets_discovered_via_daodao: stakerEnrichment.totalDiscovered,
+            wallets_discovered_via_indexer: indexerEnrichment.totalDiscovered,
+            wallets_discovered_via_tla_locks: tlaEnrichment.totalDiscovered,
             wallets_per_dao: stakerEnrichment.perDaoCounts,
+            indexer_per_dao: indexerEnrichment.perDaoCounts,
+            tla_unique_holders: tlaEnrichment.uniqueHolders,
+            tla_total_locks_scanned: tlaEnrichment.totalLocks,
+            pfpk_names_found: pfpkEnrichment.namesFound,
+            pfpk_lookups_attempted: pfpkEnrichment.totalLookups,
             amplp_mappings: Object.keys(amplpInfo.mapping).length,
             unmapped_tokens: unmapped.tokens.length,
             chain_errors: errors.length,
