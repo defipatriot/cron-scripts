@@ -821,12 +821,47 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     // Note: gauge_pool_id is an LP TOKEN address (not underlying asset).
     // The LP token represents a position in a pool. We mark it as such; the
     // underlying-asset → "appears_in N pools" linkage is backfilled below.
+    //
+    // BUT: not everything in `pools` is an LP pair. The asset-staking
+    // whitelist also includes single-asset stakes (ampCAPA, xASTRO,
+    // wBTC.creda.a) — you can stake just one token, no pair involved.
+    // These show up in pools because they're stakeable assets, but
+    // categorizing them as `lp_tokens` is wrong — they're regular tokens
+    // that happen to be stakeable.
+    //
+    // Detection: Eris's display field tells us. LPs and AMPLPs have:
+    //   - a hyphen ("X-Y LP")
+    //   - or end with "LP" / "AMPLP"
+    //   - or "LP (S)" suffix for stableswap variants
+    // Single-asset stakes are just the token name ("ampCAPA", "xASTRO",
+    // "wBTC.creda.a").
+    const looksLikeLpName = (display) => {
+        if (!display) return null;  // unknown — can't decide
+        const d = display.toUpperCase();
+        return d.includes('-')                   // X-Y pattern
+            || /\b(LP|AMPLP)\b/.test(d)          // standalone LP / AMPLP word
+            || /\sLP(\s|\(|$)/.test(d);          // " LP" as suffix
+    };
     for (const pool of pools) {
         const addr = pool.gauge_pool_id?.replace(/^cw20:/, '').replace(/^native:/, '');
         if (!addr) continue;
         const t = get(addr);
-        t.category = 'lp_tokens';   // override — this is an LP, not a regular token
-        t.subtype  = pool.gauge_pool_id.startsWith('native:factory/') ? 'astroport_native_lp' : 'astroport_cw20_lp';
+
+        // Use Eris's display to tell apart LP from single-asset stake.
+        // If Eris doesn't know (display is missing), fall back to "looks like
+        // an LP" — assume it IS an LP since most things in pools are.
+        const erisDisplay = t.sources?.eris?.display;
+        const isLpShaped = erisDisplay != null ? looksLikeLpName(erisDisplay) : true;
+
+        if (isLpShaped) {
+            t.category = 'lp_tokens';
+            t.subtype  = pool.gauge_pool_id.startsWith('native:factory/') ? 'astroport_native_lp' : 'astroport_cw20_lp';
+        } else {
+            // Single-asset stake (ampCAPA, xASTRO, wBTC.creda.a etc.)
+            // Keep as a regular token; mark with a flag so consumers can tell.
+            t.category = 'tokens';
+            t.appears_in.is_single_asset_stake = true;
+        }
         t.appears_in.tla_pools_count += 1;
         t.appears_in.tla_pools.push(pool.bucket);
         t.appears_in.tla_distribution_pct = pool.distribution_pct;
@@ -1827,6 +1862,54 @@ async function main() {
         }
     }
     console.log(`   step C: +${amplpAdded} amplp denoms`);
+
+    // Step D: amplp wrapped-LP underlyings (brings wBTC.osmo, wBTC.axl, dATOM,
+    // SWTH, etc. into scope as their own token entries).
+    //
+    // Each amplp wraps an `underlying_lp_address`. Many of those LPs ARE in
+    // our TLA gauge whitelist already (so already in scope). But amplps also
+    // exist for LPs OUTSIDE TLA's gauge (broader Eris product). The
+    // underlyings of those LPs — wBTC.osmo, wBTC.axl, dATOM, SWTH, etc. —
+    // only appear in display names like "WBTC.axl-WBTC.osmo AMPLP" but never
+    // become real token entries in the catalog. This step fixes that.
+    let extraLpsResolved = 0;
+    let extraUnderlyings = 0;
+    for (const info of Object.values(amplpInfo.mapping)) {
+        const underlyingLp = info.underlying_lp_address;
+        if (!underlyingLp) continue;
+        // Skip if we already resolved this LP (TLA gauge LPs)
+        if (universe.lpAddrs.has(underlyingLp) && universe.lpToUnderlyings[underlyingLp]) continue;
+        // Pair-resolve it
+        let pairAddr = null;
+        if (underlyingLp.startsWith('factory/')) {
+            // Astroport native LP: factory/{PAIR_ADDR}/uLP — extract pair addr
+            const m = underlyingLp.match(/^factory\/(terra1[a-z0-9]+)\//);
+            if (m) pairAddr = m[1];
+        } else {
+            // cw20 LP: query minter → pair address
+            const minterResp = await queryContract(underlyingLp, { minter: {} }, `amplp-lp[${underlyingLp.slice(-8)}].minter`);
+            pairAddr = minterResp?.minter || minterResp?.address;
+        }
+        if (!pairAddr) continue;
+        const pairResp = await queryContract(pairAddr, { pair: {} }, `amplp-pair[${pairAddr.slice(-8)}].pair`);
+        if (!pairResp || !Array.isArray(pairResp.asset_infos)) continue;
+        extraLpsResolved++;
+        scopeAddrs.add(underlyingLp);  // also include the wrapped LP token
+        const u = [];
+        for (const ai of pairResp.asset_infos) {
+            const t = ai.token?.contract_addr || ai.native_token?.denom;
+            if (t && !scopeAddrs.has(t)) {
+                scopeAddrs.add(t);
+                extraUnderlyings++;
+                u.push(t);
+            } else if (t) {
+                u.push(t);  // already in scope but track underlying for the LP
+            }
+        }
+        if (u.length) universe.lpToUnderlyings[underlyingLp] = u;
+    }
+    console.log(`   step D: amplp wrapped-LP universe — resolved ${extraLpsResolved} extra LPs, +${extraUnderlyings} extra underlying tokens`);
+
     console.log(`   FINAL SCOPE: ${scopeAddrs.size} addresses (was ${Object.keys(chainRegIdx).length + Object.keys(erisIdx).length + Object.keys(astroIdx).length + Object.keys(ssIdx).length} candidates from external sources)`);
 
     // Save scope stats for the heartbeat
@@ -1839,6 +1922,8 @@ async function main() {
         native_lps_skipped:         universe.stats.nativeLpsSkipped,
         underlyings_discovered:     universe.underlyings.size,
         amplp_denoms_added:         amplpAdded,
+        amplp_wrapped_lps_resolved: extraLpsResolved,
+        amplp_extra_underlyings:    extraUnderlyings,
         total_in_scope_addresses:   scopeAddrs.size,
         whitelist_buckets_checked:  extraPoolsResult.stats.contractsChecked,
         whitelist_buckets_succeeded: extraPoolsResult.stats.contractsSucceeded,
