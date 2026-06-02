@@ -875,10 +875,30 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     }
 
     // Stage 7: curated overrides
+    //
+    // Skip entries whose KEY isn't a real chain address. The token_overrides
+    // file can contain documentation/example entries with placeholder keys
+    // like "_example_wBTCatom_disabled" — the convention is a leading
+    // underscore means "this is a template, ignore me." If we don't skip
+    // these, they become user-visible token cards with fake data alongside
+    // the real token, which is a trust problem (e.g. two "wBTC.atom" tiles).
+    //
+    // Real addresses on Terra: terra1..., ibc/..., factory/..., or a raw
+    // native denom (uluna). Anything else is a stub.
+    const isRealAddress = (a) => a && (
+        a.startsWith('terra1') || a.startsWith('ibc/') ||
+        a.startsWith('factory/') || /^u[a-z]+$/.test(a)
+    );
     if (curated.token_overrides) {
         const overrides = curated.token_overrides.tokens || curated.token_overrides;
         if (typeof overrides === 'object') {
             for (const [addr, override] of Object.entries(overrides)) {
+                if (!isRealAddress(addr)) {
+                    // Template/example entry — skip silently. The file author
+                    // signaled this is not real data via the underscore prefix
+                    // (or other non-address-shaped key).
+                    continue;
+                }
                 if (!tokens[addr]) tokens[addr] = emptyTokenRecord(addr);
                 const t = tokens[addr];
                 t.override = override;
