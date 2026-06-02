@@ -637,7 +637,7 @@ async function buildLpUniverse(pools) {
     const lpAddrs = new Set();
     const underlyings = new Set();
     const lpToUnderlyings = {};  // lpAddr → [tokenAddr, tokenAddr]
-    const stats = { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsSkipped: 0 };
+    const stats = { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsResolved: 0, nativeLpsSkipped: 0 };
 
     for (const pool of pools) {
         stats.totalLps++;
@@ -646,26 +646,39 @@ async function buildLpUniverse(pools) {
         if (!lpAddr) continue;
         lpAddrs.add(lpAddr);
 
+        let pairAddr = null;
         if (raw.native) {
-            // Factory/native LPs — the path to underlyings is different and
-            // not pinned down yet (skip for this batch; LP itself stays in scope).
-            stats.nativeLpsSkipped++;
-            continue;
+            // Factory/native LPs (Astroport newer pool format).
+            // The pair address is encoded in the denom path:
+            //   factory/{PAIR_ADDR}/uLP
+            // So we extract it directly — no minter query needed.
+            const m = lpAddr.match(/^factory\/(terra1[a-z0-9]+)\//);
+            if (m) pairAddr = m[1];
+            // If the denom doesn't follow the factory pattern (e.g. an IBC denom
+            // that ended up classified as an LP — unusual but possible), we skip
+            // and let the LP itself stay in scope without underlyings.
+            if (!pairAddr) {
+                stats.nativeLpsSkipped++;
+                continue;
+            }
+        } else {
+            // cw20 LP: minter query gives the pair address.
+            const minterResp = await queryContract(lpAddr, { minter: {} }, `lp[${lpAddr.slice(-8)}].minter`);
+            pairAddr = minterResp?.minter || minterResp?.address;
+            if (!pairAddr) {
+                stats.pairLookupFailed++;
+                continue;
+            }
         }
 
-        // cw20 LP: minter → pair address → pair{} → asset_infos
-        const minterResp = await queryContract(lpAddr, { minter: {} }, `lp[${lpAddr.slice(-8)}].minter`);
-        const pairAddr = minterResp?.minter || minterResp?.address;
-        if (!pairAddr) {
-            stats.pairLookupFailed++;
-            continue;
-        }
         const pairResp = await queryContract(pairAddr, { pair: {} }, `pair[${pairAddr.slice(-8)}].pair`);
         if (!pairResp || !Array.isArray(pairResp.asset_infos)) {
-            stats.pairLookupFailed++;
+            if (raw.native) stats.nativeLpsSkipped++;
+            else stats.pairLookupFailed++;
             continue;
         }
-        stats.pairLookupSucceeded++;
+        if (raw.native) stats.nativeLpsResolved++;
+        else stats.pairLookupSucceeded++;
 
         const u = [];
         for (const info of pairResp.asset_infos) {
@@ -682,7 +695,7 @@ async function buildLpUniverse(pools) {
 }
 
 
-function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs }) {
+function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings }) {
     const tokens = {};
     // scopeAddrs (Set<string>) is the in-scope set built from TLA gauge LPs +
     // their underlyings per brief 2.21. Stages 1-4 (chain registry / Eris /
@@ -932,7 +945,82 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         t.scoring.flags = flags;
     }
 
-    // Post-pass: variant detection
+    // -------------------------------------------------------------------------
+    // Stage 10: LP display-name composition (brief 2.21 follow-up)
+    // -------------------------------------------------------------------------
+    // For LP tokens that don't have a display_name from any external source
+    // (typical for inactive/abandoned LPs that data sources no longer track),
+    // we compose one from the underlying token symbols: "TOKEN_A-TOKEN_B LP".
+    //
+    // Source of truth is lpToUnderlyings (built in the scope phase). This runs
+    // AFTER stages 1-4 so external names always win — we only fill blanks.
+    if (lpToUnderlyings && typeof lpToUnderlyings === 'object') {
+        for (const [lpAddr, underlyingAddrs] of Object.entries(lpToUnderlyings)) {
+            const lp = tokens[lpAddr];
+            if (!lp || lp.display_name) continue;  // skip if already named
+            if (!Array.isArray(underlyingAddrs) || underlyingAddrs.length === 0) continue;
+            const names = underlyingAddrs.map(a => {
+                const u = tokens[a];
+                return (u && (u.symbol || u.display_name)) || a.slice(0, 8) + '…';
+            });
+            lp.display_name = names.join('-') + ' LP';
+            lp.scoring.flags.push('name_composed_from_underlyings');
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Stage 11: Buy-the-wrong-variant warning (brief 2.21)
+    // -------------------------------------------------------------------------
+    // Same display-name LP resolving to DIFFERENT underlying token addresses
+    // across pools = the danger described in brief 2.21:
+    //
+    //   "an abandoned-pool ampLUNA at a different address than the
+    //    active-pool ampLUNA"
+    //
+    // We group LPs by display name (after stage 10 has filled in any blanks)
+    // and compare each name-group's underlying addresses. If divergent, fire
+    // a warning on every member of the group with a reference to the others.
+    //
+    // Per the brief: "the hypothesis (hopeful case) is that variants share
+    // underlying token addresses and only the LP contract + amplp differ." So
+    // most name-groups will NOT trigger this — and that's the right outcome.
+    if (lpToUnderlyings && typeof lpToUnderlyings === 'object') {
+        // Group LPs by display name
+        const lpNameGroups = {};
+        for (const [lpAddr, ulst] of Object.entries(lpToUnderlyings)) {
+            const lp = tokens[lpAddr];
+            if (!lp || !lp.display_name) continue;
+            // Sort underlyings so two LPs with the same pair in different order match
+            const sortedU = [...ulst].sort();
+            const key = lp.display_name;
+            (lpNameGroups[key] = lpNameGroups[key] || []).push({ lpAddr, sortedU });
+        }
+        for (const [name, members] of Object.entries(lpNameGroups)) {
+            if (members.length < 2) continue;
+            // Check if any underlying address diverges across the group
+            const firstU = JSON.stringify(members[0].sortedU);
+            const allSame = members.every(m => JSON.stringify(m.sortedU) === firstU);
+            if (allSame) continue;  // benign — same name, same underlyings, just different LP contracts
+            // Divergent — fire the warning on every member
+            for (const m of members) {
+                const lp = tokens[m.lpAddr];
+                if (!lp) continue;
+                const others = members.filter(x => x.lpAddr !== m.lpAddr).map(x => x.lpAddr);
+                lp.scoring.flags.push(`buy_the_wrong_variant:${others.join(',')}`);
+                lp.scoring.confusion_score = Math.max(0, lp.scoring.confusion_score - 20);
+                lp.variant_warning = {
+                    display_name: name,
+                    this_lp_underlyings: m.sortedU,
+                    conflicting_lps: others.map(o => ({
+                        lp_address: o,
+                        underlyings: lpNameGroups[name].find(x => x.lpAddr === o).sortedU,
+                    })),
+                };
+            }
+        }
+    }
+
+
     const symbolGroups = {};
     for (const [addr, t] of Object.entries(tokens)) {
         const baseSym = (t.symbol || '').toLowerCase().split('.')[0].replace(/^w/, '');
@@ -1596,9 +1684,11 @@ async function main() {
     for (const a of universe.underlyings) scopeAddrs.add(a);
     // Step C: amplp denoms (auto-compounded LP wrappers) — these wrap an LP
     // that's already in scope, so the amplp's own factory denom should be too.
+    // The amplp denom IS the dict key in amplpInfo.mapping (e.g.
+    // "factory/.../single/amplp"). Earlier this code looked inside the value
+    // object for an amplp_denom field that doesn't exist — fixed to iterate keys.
     let amplpAdded = 0;
-    for (const info of Object.values(amplpInfo.mapping)) {
-        const amplpDenom = info.amplp_denom || info.amplp || info.denom;
+    for (const amplpDenom of Object.keys(amplpInfo.mapping)) {
         if (amplpDenom && !scopeAddrs.has(amplpDenom)) {
             scopeAddrs.add(amplpDenom);
             amplpAdded++;
@@ -1623,7 +1713,7 @@ async function main() {
     };
 
     console.log('\n🧬 Building catalog (scope-filtered)...');
-    const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs });
+    const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings: universe.lpToUnderlyings });
     const { contracts, wallets } = buildContractsCatalog({ directory, curated });
     const unmapped = findUnmapped({ tokens });
     console.log(`   tokens:    ${Object.keys(tokens).length} (in-scope only; previously enumerated whole chain)`);
