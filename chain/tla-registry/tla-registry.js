@@ -824,6 +824,40 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     }
 
     // Stage 9: subtype + wallet_import + scoring
+    //
+    // Acquisition classification (brief 2.21 follow-up — Camron's 4 buckets):
+    //   1. native_terra         — LUNA, cw20s minted on Terra, Terra factory tokens (LSTs ampLUNA/bLUNA/arbLUNA,
+    //                             SOLID, ROAR, CAPA, ampCAPA, ampROAR). Zero acquisition friction.
+    //   2. ibc_cosmos_native    — ibc/* assets that are native on their source Cosmos chain
+    //                             (ATOM, INJ, ASTRO, FUEL, stATOM, stLUNA). One-hop IBC, low friction.
+    //   3. wrapped_disclosed    — wrapped tokens that say so in the symbol (`.axl`, `.atom`, etc.).
+    //                             User can SEE it's wrapped — friction is medium.
+    //   4. wrapped_looks_native — wrapped tokens with a symbol that hides the wrapping
+    //                             (USDC, USDt, WBTC, PAXG, EURe). HIGH friction — without a guide,
+    //                             users may bridge from the wrong source chain and end up with a
+    //                             token that won't deposit into TLA (e.g. Polygon-USDC vs Noble-USDC).
+    //
+    // The `no_acquisition_guide` flag only fires on classes 3 and 4 — classes 1 and 2 don't need a guide.
+    // Class 4 is the highest-priority candidate for a curated guide entry.
+    const WRAPPED_LOOKS_NATIVE_SYMBOLS = new Set([
+        'USDC', 'USDt', 'USDT', 'wBTC', 'WBTC', 'wETH', 'WETH', 'PAXG', 'EURe', 'EURE', 'DAI',
+    ]);
+    const WRAPPED_DISCLOSED_PATTERNS = ['.axl', '.atom', '.eth', '.wormhole', '.gravity'];
+
+    function classifyAcquisition(t) {
+        // LP tokens aren't "acquired" the same way — they're minted by depositing
+        if (t.category === 'lp_tokens') return 'lp_token';
+        const sym = t.symbol || '';
+        // Bucket 3: wrapped + disclosed (bridge tag in symbol)
+        if (WRAPPED_DISCLOSED_PATTERNS.some(p => sym.includes(p))) return 'wrapped_disclosed';
+        // Bucket 4: IBC asset whose symbol hides the wrapping
+        if (t.type === 'ibc' && WRAPPED_LOOKS_NATIVE_SYMBOLS.has(sym)) return 'wrapped_looks_native';
+        // Bucket 2: any other IBC asset (one-hop Cosmos-native)
+        if (t.type === 'ibc') return 'ibc_cosmos_native';
+        // Bucket 1: anything else (cw20, factory, native — all Terra-native)
+        return 'native_terra';
+    }
+
     for (const t of Object.values(tokens)) {
         if (!t.subtype) {
             if (t.type === 'ibc') t.subtype = 'ibc';
@@ -835,6 +869,9 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         if (/^(amp|arb|b|st)/.test(t.symbol || '') && /luna/i.test(sym)) {
             t.subtype = 'lst';
         }
+
+        // Classify acquisition friction — used to gate `no_acquisition_guide`
+        t.acquisition_class = classifyAcquisition(t);
 
         if (t.symbol && t.decimals != null) {
             t.wallet_import = {
@@ -868,9 +905,21 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
             t.coingecko_match = 'matched';
         }
 
+        // no_acquisition_guide ONLY fires when a guide is genuinely needed:
+        //   - class 1 (native_terra)       — already on Terra, no guide ever needed
+        //   - class 2 (ibc_cosmos_native)  — one-hop IBC, no guide needed
+        //   - class 3 (wrapped_disclosed)  — guide useful; flag if missing
+        //   - class 4 (wrapped_looks_native) — guide REQUIRED; flag if missing (higher penalty)
+        //   - LP tokens                    — not acquired directly; flag not applicable
         if (!t.acquisition) {
-            score -= 10;
-            flags.push('no_acquisition_guide');
+            if (t.acquisition_class === 'wrapped_looks_native') {
+                score -= 20;  // higher penalty: this is the danger bucket
+                flags.push('no_acquisition_guide:required');
+            } else if (t.acquisition_class === 'wrapped_disclosed') {
+                score -= 10;
+                flags.push('no_acquisition_guide:useful');
+            }
+            // class 1, 2, and lp_token: silent — no flag, no penalty
         }
 
         if (t.appears_in.tla_pools_count === 0
@@ -1674,6 +1723,13 @@ async function main() {
     for (const t of Object.values(tokens)) {
         if (t.tier && tierCounts[t.tier] != null) tierCounts[t.tier]++;
     }
+    // Acquisition class breakdown (brief 2.21 follow-up — Camron's 4 buckets):
+    const acqClassCounts = { native_terra: 0, ibc_cosmos_native: 0, wrapped_disclosed: 0, wrapped_looks_native: 0, lp_token: 0, unclassified: 0 };
+    for (const t of Object.values(tokens)) {
+        const cls = t.acquisition_class || 'unclassified';
+        if (acqClassCounts[cls] != null) acqClassCounts[cls]++;
+        else acqClassCounts.unclassified++;
+    }
 
     const heartbeat = {
         schemaVersion: SCHEMA_VERSION, cron: CRON_NAME,
@@ -1705,6 +1761,8 @@ async function main() {
             external_source_errors: Object.keys(external.source_errors).length,
             // Scope phase (brief 2.21) — how the in-scope set was built
             scope: scopeStats,
+            // Acquisition class breakdown (brief 2.21 follow-up)
+            acquisition_classes: acqClassCounts,
         },
         dataFingerprint, previousFingerprint: freshness.previousFingerprint,
         dataFreshness: freshness.dataFreshness,
