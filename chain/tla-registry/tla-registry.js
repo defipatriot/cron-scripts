@@ -531,8 +531,172 @@ function indexAmplpMapping(assetConfigs) {
     return { mapping, lpToAmplp };
 }
 
-function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated }) {
+// -----------------------------------------------------------------------------
+// SCOPE FILTER (per CRON-FIXES-BRIEF item 2.21 + 2.21b)
+// -----------------------------------------------------------------------------
+// The catalog used to enumerate the entire chain's tokens (~622) and then try
+// to score down to relevance. That produced a mostly-noise output dominated
+// by dead meme LPs. The brief calls for the opposite: SCOPE IN from the TLA
+// gauge LPs and include ONLY the tokens those LPs contain.
+//
+// Two passes:
+//   1) expandToInactiveLPs  — extend the LP set beyond the 28 active to also
+//                              include below-threshold LPs (each bucket's
+//                              asset-staking contract has the full whitelist).
+//   2) buildLpUniverse       — for each LP, query `pair{}` on its Astroport
+//                              pair contract to get the two underlying token
+//                              addresses. Both LP token AND underlyings go in
+//                              the in-scope set.
+//
+// Either pass failing is recoverable: scope shrinks but the catalog still
+// builds. We log what worked and emit counters in the heartbeat so we can
+// see if the chain is degrading.
+
+// Best-effort: extend the LP list to include below-threshold LPs that each
+// bucket's asset-staking contract still tracks (the "inactive" set from
+// brief 2.21).
+//
+// We try `whitelisted_assets` on each bucket's asset-staking contract. If the
+// schema doesn't match what we expect, the contract returns null and we
+// silently fall back to active-only. The active 28 LPs are NEVER lost — this
+// only adds.
+//
+// Returns: array of pool-like records for any LP we discover beyond the active
+// set. Empty array on total failure (which is fine, catalog still works).
+async function expandToInactiveLPs(activePools, directory) {
+    const extraPools = [];
+    const stats = { contractsChecked: 0, contractsSucceeded: 0, extraLpsFound: 0 };
+
+    const stakingRoles = [
+        ['ASSET_STAKING__stable',   'stable'],
+        ['ASSET_STAKING__project',  'project'],
+        ['ASSET_STAKING__bluechip', 'bluechip'],
+        ['ASSET_STAKING__single',   'single'],
+    ];
+    // Build a set of active LP addresses for dedup
+    const activeKeys = new Set(activePools.map(p => p.gauge_pool_id));
+
+    for (const [role, bucketName] of stakingRoles) {
+        const stakingAddr = directory[role];
+        if (!stakingAddr) continue;
+        stats.contractsChecked++;
+
+        // Try the most likely query name first. Per the brief Part 6:
+        //   asset-staking → whitelisted_assets (returns the bucket's full LP set)
+        const result = await queryContract(stakingAddr, { whitelisted_assets: {} }, `asset-staking[${bucketName}].whitelisted_assets`);
+        if (!result) {
+            // Query failed — log but don't fail the whole cron. Active-only fallback.
+            continue;
+        }
+        stats.contractsSucceeded++;
+
+        // Response shape per the brief is unconfirmed in full detail, but the
+        // CW721/Astroport pattern is an array of asset_info entries. Be
+        // defensive about the wrapper.
+        let assetList = result;
+        if (result && typeof result === 'object' && !Array.isArray(result)) {
+            // Common wrappers: {assets: [...]} or {whitelisted_assets: [...]}
+            assetList = result.assets || result.whitelisted_assets || result.list || result.data || [];
+        }
+        if (!Array.isArray(assetList)) continue;
+
+        for (const entry of assetList) {
+            // Each entry could be a bare asset_info {cw20|native} or wrapped.
+            const asset = (entry && (entry.asset || entry.info)) || entry;
+            if (!asset || (typeof asset !== 'object')) continue;
+            const lpAddr = asset.cw20 || asset.native;
+            if (!lpAddr) continue;
+
+            const gaugePoolId = asset.cw20 ? `cw20:${asset.cw20}` : `native:${asset.native}`;
+            if (activeKeys.has(gaugePoolId)) continue;  // already in active set
+
+            extraPools.push({
+                gauge_pool_id: gaugePoolId,
+                bucket: bucketName,
+                asset_raw: asset,
+                distribution_pct: 0,     // inactive: not earning emissions this epoch
+                total_vp: null,          // VP info doesn't come from this query
+                gauge_status: 'inactive_below_threshold',
+            });
+            activeKeys.add(gaugePoolId);
+            stats.extraLpsFound++;
+        }
+    }
+    return { extraPools, stats };
+}
+
+// For each LP in the union (active + inactive), query the Astroport pair
+// to discover the two underlying token addresses. Both the LP itself and its
+// underlyings join the in-scope set.
+//
+// The LP's contract address is the LP TOKEN address (not the pair address).
+// To find the pair address we query the LP token's `minter` query — every
+// Astroport LP cw20 has the pair as its minter. For native/factory LPs the
+// path differs and we skip the pair lookup for now (still includes the LP).
+async function buildLpUniverse(pools) {
+    const lpAddrs = new Set();
+    const underlyings = new Set();
+    const lpToUnderlyings = {};  // lpAddr → [tokenAddr, tokenAddr]
+    const stats = { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsSkipped: 0 };
+
+    for (const pool of pools) {
+        stats.totalLps++;
+        const raw = pool.asset_raw || {};
+        const lpAddr = raw.cw20 || raw.native;
+        if (!lpAddr) continue;
+        lpAddrs.add(lpAddr);
+
+        if (raw.native) {
+            // Factory/native LPs — the path to underlyings is different and
+            // not pinned down yet (skip for this batch; LP itself stays in scope).
+            stats.nativeLpsSkipped++;
+            continue;
+        }
+
+        // cw20 LP: minter → pair address → pair{} → asset_infos
+        const minterResp = await queryContract(lpAddr, { minter: {} }, `lp[${lpAddr.slice(-8)}].minter`);
+        const pairAddr = minterResp?.minter || minterResp?.address;
+        if (!pairAddr) {
+            stats.pairLookupFailed++;
+            continue;
+        }
+        const pairResp = await queryContract(pairAddr, { pair: {} }, `pair[${pairAddr.slice(-8)}].pair`);
+        if (!pairResp || !Array.isArray(pairResp.asset_infos)) {
+            stats.pairLookupFailed++;
+            continue;
+        }
+        stats.pairLookupSucceeded++;
+
+        const u = [];
+        for (const info of pairResp.asset_infos) {
+            const t = info.token?.contract_addr || info.native_token?.denom;
+            if (t) {
+                underlyings.add(t);
+                u.push(t);
+            }
+        }
+        lpToUnderlyings[lpAddr] = u;
+    }
+
+    return { lpAddrs, underlyings, lpToUnderlyings, stats };
+}
+
+
+function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs }) {
     const tokens = {};
+    // scopeAddrs (Set<string>) is the in-scope set built from TLA gauge LPs +
+    // their underlyings per brief 2.21. Stages 1-4 (chain registry / Eris /
+    // Astroport / Skeleton) check against it and skip out-of-scope addresses
+    // at the source instead of enumerating everything then trying to score down.
+    //
+    // OPT-IN: pass `null` to keep the old "enumerate everything" behavior. The
+    // cron always passes a non-null set once the scope phase runs — at minimum
+    // it contains the 28 active LP addresses, so the catalog can't lose them.
+    const inScope = (addr) => {
+        if (!scopeAddrs) return true;  // legacy: no filter
+        return scopeAddrs.has(addr);
+    };
+
     const get = (addr) => {
         if (!tokens[addr]) tokens[addr] = emptyTokenRecord(addr);
         return tokens[addr];
@@ -540,6 +704,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
 
     // Stage 1: chain registry
     for (const [addr, info] of Object.entries(chainRegIdx)) {
+        if (!inScope(addr)) continue;
         const t = get(addr);
         t.type = info.type;
         t.symbol = info.symbol;
@@ -555,6 +720,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
 
     // Stage 2: Eris (canonical display name, but skip if Eris's key is just an address)
     for (const [addr, info] of Object.entries(erisIdx)) {
+        if (!inScope(addr)) continue;
         const t = get(addr);
         if (!t.type) {
             t.type = addr.startsWith('ibc/') ? 'ibc'
@@ -583,6 +749,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
 
     // Stage 3: Astroport
     for (const [addr, info] of Object.entries(astroIdx)) {
+        if (!inScope(addr)) continue;
         const t = get(addr);
         t.sources.astroport = info;
         if (!t.type) {
@@ -596,6 +763,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
 
     // Stage 4: SS
     for (const [addr, info] of Object.entries(ssIdx)) {
+        if (!inScope(addr)) continue;
         const t = get(addr);
         t.sources.skeletonswap = info;
         if (!t.type) {
@@ -1330,11 +1498,86 @@ async function main() {
     console.log(`   skeletonswap:   ${Object.keys(ssIdx).length} tokens`);
     console.log(`   amplp_mappings: ${Object.keys(amplpInfo.mapping).length}`);
 
-    console.log('\n🧬 Building catalog...');
-    const tokens = buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated });
+    // -------------------------------------------------------------------------
+    // SCOPE PHASE — build the in-scope address set BEFORE buildTokenCatalog,
+    // so stages 1-4 there can filter at the source.
+    // -------------------------------------------------------------------------
+    // Step A: extend pools beyond the 28 active to include below-threshold
+    //         LPs (each bucket's asset-staking contract has the full whitelist).
+    //         Defensive — if the chain query schema doesn't match, this
+    //         silently falls back to active-only.
+    // Step B: for each LP (cw20 only), discover its two underlying token
+    //         addresses by querying the LP's `minter` (Astroport pair address)
+    //         then the pair's `pair{}` query for asset_infos. Both LP and
+    //         underlyings go in the scope set.
+    // Step C: also include each LP's amplp denom (auto-compounded wrapper) so
+    //         those records aren't dropped from the catalog.
+    //
+    // No matter what fails, the active 28 LP addresses are always in scope.
+    console.log('\n🎯 SCOPE PHASE (brief 2.21): building in-scope address set');
+    console.log(`   start: ${pools.length} active pools`);
+
+    let extraPoolsResult = { extraPools: [], stats: { contractsChecked: 0, contractsSucceeded: 0, extraLpsFound: 0 } };
+    try {
+        extraPoolsResult = await expandToInactiveLPs(pools, directory);
+        console.log(`   step A: asset-staking[*].whitelisted_assets — ${extraPoolsResult.stats.contractsSucceeded}/${extraPoolsResult.stats.contractsChecked} buckets returned data, +${extraPoolsResult.stats.extraLpsFound} inactive LPs`);
+    } catch (e) {
+        console.warn(`   step A failed (continuing with active-only): ${e.message}`);
+    }
+    const allPools = [...pools, ...extraPoolsResult.extraPools];
+    console.log(`   total LPs after step A: ${allPools.length}`);
+
+    let universe = { lpAddrs: new Set(), underlyings: new Set(), lpToUnderlyings: {}, stats: { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsSkipped: 0 } };
+    try {
+        universe = await buildLpUniverse(allPools);
+        console.log(`   step B: pair{} lookups — ${universe.stats.pairLookupSucceeded} succeeded, ${universe.stats.pairLookupFailed} failed, ${universe.stats.nativeLpsSkipped} native LPs skipped`);
+        console.log(`           ${universe.lpAddrs.size} LP addresses, ${universe.underlyings.size} underlying token addresses`);
+    } catch (e) {
+        console.warn(`   step B failed (will scope to LPs only, no underlyings): ${e.message}`);
+        // Minimal safety net: always include the LP addresses themselves
+        for (const p of allPools) {
+            const a = p.asset_raw?.cw20 || p.asset_raw?.native;
+            if (a) universe.lpAddrs.add(a);
+        }
+    }
+
+    // Build the final scope set: LPs + their underlyings + amplp denoms
+    const scopeAddrs = new Set();
+    for (const a of universe.lpAddrs) scopeAddrs.add(a);
+    for (const a of universe.underlyings) scopeAddrs.add(a);
+    // Step C: amplp denoms (auto-compounded LP wrappers) — these wrap an LP
+    // that's already in scope, so the amplp's own factory denom should be too.
+    let amplpAdded = 0;
+    for (const info of Object.values(amplpInfo.mapping)) {
+        const amplpDenom = info.amplp_denom || info.amplp || info.denom;
+        if (amplpDenom && !scopeAddrs.has(amplpDenom)) {
+            scopeAddrs.add(amplpDenom);
+            amplpAdded++;
+        }
+    }
+    console.log(`   step C: +${amplpAdded} amplp denoms`);
+    console.log(`   FINAL SCOPE: ${scopeAddrs.size} addresses (was ${Object.keys(chainRegIdx).length + Object.keys(erisIdx).length + Object.keys(astroIdx).length + Object.keys(ssIdx).length} candidates from external sources)`);
+
+    // Save scope stats for the heartbeat
+    const scopeStats = {
+        active_lps:                 pools.length,
+        inactive_lps_discovered:    extraPoolsResult.stats.extraLpsFound,
+        total_lps:                  allPools.length,
+        pair_lookups_succeeded:     universe.stats.pairLookupSucceeded,
+        pair_lookups_failed:        universe.stats.pairLookupFailed,
+        native_lps_skipped:         universe.stats.nativeLpsSkipped,
+        underlyings_discovered:     universe.underlyings.size,
+        amplp_denoms_added:         amplpAdded,
+        total_in_scope_addresses:   scopeAddrs.size,
+        whitelist_buckets_checked:  extraPoolsResult.stats.contractsChecked,
+        whitelist_buckets_succeeded: extraPoolsResult.stats.contractsSucceeded,
+    };
+
+    console.log('\n🧬 Building catalog (scope-filtered)...');
+    const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs });
     const { contracts, wallets } = buildContractsCatalog({ directory, curated });
     const unmapped = findUnmapped({ tokens });
-    console.log(`   tokens:    ${Object.keys(tokens).length}`);
+    console.log(`   tokens:    ${Object.keys(tokens).length} (in-scope only; previously enumerated whole chain)`);
     console.log(`   contracts: ${Object.keys(contracts).length}`);
     console.log(`   wallets:   ${Object.keys(wallets).length} (curated only)`);
     console.log(`   unmapped:  ${unmapped.tokens.length}`);
@@ -1390,7 +1633,15 @@ async function main() {
         layer: 0, layerRole: 'discovery-bootstrap-catalog',
         capturedAt: startedAt.toISOString(), capturedAtUnix: startedAt.getTime(),
         canonicalEpoch,
-        directory, pools, buckets,
+        directory, pools: allPools, buckets,
+        // pools = active 28; allPools = active + inactive discovered via
+        // asset-staking.whitelisted_assets per brief 2.21. The consumer can
+        // distinguish via each pool's `gauge_status` field (active pools have
+        // no such field; inactive ones get 'inactive_below_threshold').
+        scope: {
+            ...scopeStats,
+            lp_to_underlyings: universe.lpToUnderlyings,
+        },
         contracts: {
             global_config: GLOBAL_CONFIG_ADDR,
             asset_gauge: chainData.assetGaugeAddr || null,
@@ -1452,6 +1703,8 @@ async function main() {
             unmapped_tokens: unmapped.tokens.length,
             chain_errors: errors.length,
             external_source_errors: Object.keys(external.source_errors).length,
+            // Scope phase (brief 2.21) — how the in-scope set was built
+            scope: scopeStats,
         },
         dataFingerprint, previousFingerprint: freshness.previousFingerprint,
         dataFreshness: freshness.dataFreshness,
