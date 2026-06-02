@@ -414,15 +414,31 @@ function indexChainRegistry(registry) {
 function indexErisPrices(prices) {
     const idx = {};
     if (!prices || typeof prices !== 'object') return idx;
-    for (const [eris_name, entry] of Object.entries(prices)) {
+    // The Eris /prices endpoint structure (verified from HAR):
+    //   { "<denom>": { denom, display, coingecko_id, decimals, price_usd } }
+    // The KEY is the address; `display` is the UI label Eris shows on its
+    // website (e.g. "wBTC.atom", "ampLUNA", "LUNA-USDC LP"); `coingecko_id`
+    // is the CoinGecko slug (e.g. "terra-luna-2"). These are three DIFFERENT
+    // values and the catalog preserves all three.
+    for (const [denom, entry] of Object.entries(prices)) {
         if (!entry || typeof entry !== 'object') continue;
-        const addr = entry.contract || entry.denom || entry.address;
+        const addr = entry.contract || entry.denom || denom;
         if (!addr) continue;
         const key = addr.startsWith('cw20:') ? addr.slice(5) : addr;
         idx[key] = {
-            eris_name, symbol: entry.symbol || eris_name,
-            decimals: entry.decimals, coingecko_id: entry.coingecko_id || null,
+            // Eris's user-facing UI label — this is the authoritative name to
+            // show in dashboards. Falls back to denom only if missing.
+            display: entry.display || null,
+            // CoinGecko ID slug. Separate field, NOT a fallback for display.
+            coingecko_id: entry.coingecko_id || null,
+            // Price + decimals
+            decimals: entry.decimals,
             price_usd: entry.price_usd ?? entry.final_price_usd ?? null,
+            // Legacy fields preserved for backwards compatibility — these
+            // were misnamed in earlier versions (eris_name was the address).
+            // New code should read `display` instead.
+            eris_name: entry.display || denom,
+            symbol: entry.display || denom,
         };
     }
     return idx;
@@ -731,7 +747,22 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         };
     }
 
-    // Stage 2: Eris (canonical display name, but skip if Eris's key is just an address)
+    // Stage 2: Eris — the AUTHORITATIVE source for the UI label
+    //
+    // The Eris price endpoint has been giving us the right label all along
+    // in the `display` field. Earlier versions of this cron read the wrong
+    // field (the address) and then added slug-detection heuristics to filter
+    // out the bad output. With `display` read correctly, those heuristics
+    // are unnecessary — Eris hands us "wBTC.atom", "ampLUNA", "LUNA-USDC LP"
+    // exactly as shown on the website.
+    //
+    // Three independent fields are preserved on each token:
+    //   sources.eris.display         → UI label (e.g. "wBTC.atom")
+    //   sources.eris.coingecko_id    → CG slug (e.g. "eureka-bridged-wbtc-terra")
+    //   sources.cosmos_chain_registry.name → registry full name (e.g. "Eureka Bridged WBTC")
+    //
+    // The dashboard can render all three side-by-side; the catalog never
+    // collapses them.
     for (const [addr, info] of Object.entries(erisIdx)) {
         if (!inScope(addr)) continue;
         const t = get(addr);
@@ -740,21 +771,20 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                    : addr.startsWith('factory/') ? 'factory'
                    : addr.startsWith('terra1') ? 'cw20' : 'native';
         }
-        // Only use Eris's name as display if it's NOT just an address or hash.
-        // (Eris sometimes uses the contract address as the price-endpoint key
-        // when it doesn't have a friendly name configured.)
-        const erisNameLooksLikeAddress = info.eris_name && (
-            info.eris_name.startsWith('terra1') ||
-            info.eris_name.startsWith('ibc/') ||
-            info.eris_name.startsWith('factory/')
-        );
         t.sources.eris = {
-            eris_name: info.eris_name, symbol: info.symbol,
-            decimals: info.decimals, price_usd: info.price_usd,
-            looks_like_address: erisNameLooksLikeAddress,
+            display: info.display,                  // authoritative UI label
+            coingecko_id: info.coingecko_id,        // separate — NOT a name
+            decimals: info.decimals,
+            price_usd: info.price_usd,
+            // Legacy fields — same values, kept for backwards compatibility
+            eris_name: info.display,
+            symbol: info.display,
         };
-        if (!erisNameLooksLikeAddress && info.eris_name) {
-            t.display_name = info.eris_name;
+        // Eris's display IS the user-facing name. Use it as the canonical
+        // display_name. Falling back to whatever an earlier stage set only
+        // when Eris has no entry for this token.
+        if (info.display) {
+            t.display_name = info.display;
         }
         if (info.decimals != null && t.decimals == null) t.decimals = info.decimals;
         if (info.coingecko_id && !t.coingecko_id) t.coingecko_id = info.coingecko_id;
@@ -790,8 +820,7 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     // Stage 5: TLA pool participation
     // Note: gauge_pool_id is an LP TOKEN address (not underlying asset).
     // The LP token represents a position in a pool. We mark it as such; the
-    // underlying-asset → "appears_in 16 pools" linkage gets backfilled by
-    // Layer 2 (entities) when it queries each Astroport pair for its assets.
+    // underlying-asset → "appears_in N pools" linkage is backfilled below.
     for (const pool of pools) {
         const addr = pool.gauge_pool_id?.replace(/^cw20:/, '').replace(/^native:/, '');
         if (!addr) continue;
@@ -805,10 +834,44 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         if (!t.type) t.type = pool.gauge_pool_id.startsWith('cw20:') ? 'cw20' : 'factory';
     }
 
-    // Stage 6: amplp underlyings
+    // Stage 5b: Backfill underlying-token participation in TLA pools
+    // Without this, LUNA — which underlies basically every TLA pool — shows
+    // "Appears in TLA pools: no" because the stage above only credits the
+    // LP token itself. The cron has lpToUnderlyings from the scope phase, so
+    // we credit each underlying for every LP it appears in.
+    if (lpToUnderlyings && typeof lpToUnderlyings === 'object') {
+        // Group pools by LP address so we can match each LP back to its bucket
+        const poolByLpAddr = {};
+        for (const pool of pools) {
+            const lpAddr = pool.asset_raw?.cw20 || pool.asset_raw?.native;
+            if (lpAddr) poolByLpAddr[lpAddr] = pool;
+        }
+        for (const [lpAddr, underlyings] of Object.entries(lpToUnderlyings)) {
+            const pool = poolByLpAddr[lpAddr];
+            if (!pool || !Array.isArray(underlyings)) continue;
+            for (const uAddr of underlyings) {
+                const ut = tokens[uAddr];
+                if (!ut) continue;
+                ut.appears_in.tla_pools_count += 1;
+                if (!ut.appears_in.tla_pools.includes(pool.bucket)) {
+                    ut.appears_in.tla_pools.push(pool.bucket);
+                }
+            }
+        }
+    }
+
+    // Stage 6: amplp wrapping
+    // For each amplp factory denom, mark the LP token it wraps. The field
+    // means: "this LP token gets wrapped by an amplp" — NOT "this token is an
+    // amplp underlying" (which would be 2 layers — the LP's underlying tokens).
+    // The original field name `is_amplp_underlying` was misleading.
     for (const info of Object.values(amplpInfo.mapping)) {
-        const underlying = info.underlying_lp_address;
-        if (tokens[underlying]) tokens[underlying].appears_in.is_amplp_underlying = true;
+        const wrappedLp = info.underlying_lp_address;
+        if (tokens[wrappedLp]) {
+            tokens[wrappedLp].appears_in.is_wrapped_by_amplp = true;
+            // Keep the legacy field for backwards compatibility — same value
+            tokens[wrappedLp].appears_in.is_amplp_underlying = true;
+        }
     }
 
     // Stage 7: curated overrides
@@ -1037,7 +1100,56 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         }
     }
 
-    // Post-pass: tier classification (signal-to-noise classification)
+    // Post-pass: display_name / headline_name sanitation
+    //
+    // After Eris's `display` field is read correctly (the bug fix in this
+    // batch), display_name is reliably the Eris UI label for tokens Eris
+    // knows about. For the few tokens Eris doesn't price (USDt, stLUNA,
+    // ampCAPA, ampROAR), fall back to other sources.
+    //
+    // Three named fields the dashboard can use:
+    //   headline_name  → primary user-facing label, matches Eris UI conventions
+    //   display_name   → same as headline for most tokens, may be longer for some
+    //   symbol         → short ticker
+    //
+    // Priority order for headline_name:
+    //   eris.display  >  astroport.symbol  >  chain-registry.symbol/name  >  truncated address
+    const looksLikeCoinGeckoSlug = (s) => s && /^[a-z0-9]+(-[a-z0-9]+)+$/.test(s);
+    const isAddressShape = (s) => !s || s.startsWith('terra1') || s.startsWith('ibc/')
+                                  || s.startsWith('factory/') || s.startsWith('neutron1')
+                                  || s.startsWith('osmo1') || s.startsWith('inj1');
+
+    for (const t of Object.values(tokens)) {
+        // Compute headline_name with Eris's `display` as the top priority
+        const erisDisplay = t.sources.eris?.display;
+        const astroSymbol = t.sources.astroport?.symbol;
+        const crSymbol = t.sources.cosmos_chain_registry?.symbol;
+        const crName = t.sources.cosmos_chain_registry?.name;
+
+        let h = null;
+        if (erisDisplay && !isAddressShape(erisDisplay) && !looksLikeCoinGeckoSlug(erisDisplay)) {
+            h = erisDisplay;
+        } else if (astroSymbol && !isAddressShape(astroSymbol) && !looksLikeCoinGeckoSlug(astroSymbol)) {
+            h = astroSymbol;
+        } else if (crSymbol && !isAddressShape(crSymbol) && !looksLikeCoinGeckoSlug(crSymbol)) {
+            h = crSymbol;
+        } else if (t.symbol && !isAddressShape(t.symbol) && !looksLikeCoinGeckoSlug(t.symbol)) {
+            h = t.symbol;
+        } else if (t.display_name && !isAddressShape(t.display_name) && !looksLikeCoinGeckoSlug(t.display_name)) {
+            h = t.display_name;
+        } else if (t.address) {
+            h = t.address.length > 18 ? (t.address.slice(0, 12) + '…' + t.address.slice(-6)) : t.address;
+            if (!t.scoring.flags.includes('no_display_name')) t.scoring.flags.push('no_display_name');
+        }
+        t.headline_name = h;
+
+        // Also ensure display_name isn't a CG slug — fall back to a clean source
+        if (looksLikeCoinGeckoSlug(t.display_name)) {
+            t.display_name = erisDisplay || crName || h;
+        }
+    }
+
+
     //   'core'    → must show: in TLA pool, has CG mapping, LP token, curated override, or
     //                acquisition guide. Things we actively care about.
     //   'tracked' → has a real name from a quality source (chain registry, Eris, Astroport) but
