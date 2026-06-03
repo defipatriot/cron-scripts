@@ -1407,32 +1407,39 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                                   || s.startsWith('osmo1') || s.startsWith('inj1');
 
     for (const t of Object.values(tokens)) {
-        // Compute headline_name with Eris's `display` as the top priority
-        const erisDisplay = t.sources.eris?.display;
-        const astroSymbol = t.sources.astroport?.symbol;
-        const crSymbol = t.sources.cosmos_chain_registry?.symbol;
-        const crName = t.sources.cosmos_chain_registry?.name;
+        // Compute headline_name with Eris's `display` as the top priority,
+        // BUT skip this entirely if we already hardcoded an override.
+        // Otherwise the bLUNA→boneLUNA hardcode (and any future overrides)
+        // get clobbered by Eris's stubborn naming.
+        if (t.hardcoded_override_reason) {
+            // already set in Stage 7b — leave it alone
+        } else {
+            const erisDisplay = t.sources.eris?.display;
+            const astroSymbol = t.sources.astroport?.symbol;
+            const crSymbol = t.sources.cosmos_chain_registry?.symbol;
+            const crName = t.sources.cosmos_chain_registry?.name;
 
-        let h = null;
-        if (erisDisplay && !isAddressShape(erisDisplay) && !looksLikeCoinGeckoSlug(erisDisplay)) {
-            h = erisDisplay;
-        } else if (astroSymbol && !isAddressShape(astroSymbol) && !looksLikeCoinGeckoSlug(astroSymbol)) {
-            h = astroSymbol;
-        } else if (crSymbol && !isAddressShape(crSymbol) && !looksLikeCoinGeckoSlug(crSymbol)) {
-            h = crSymbol;
-        } else if (t.symbol && !isAddressShape(t.symbol) && !looksLikeCoinGeckoSlug(t.symbol)) {
-            h = t.symbol;
-        } else if (t.display_name && !isAddressShape(t.display_name) && !looksLikeCoinGeckoSlug(t.display_name)) {
-            h = t.display_name;
-        } else if (t.address) {
-            h = t.address.length > 18 ? (t.address.slice(0, 12) + '…' + t.address.slice(-6)) : t.address;
-            if (!t.scoring.flags.includes('no_display_name')) t.scoring.flags.push('no_display_name');
-        }
-        t.headline_name = h;
+            let h = null;
+            if (erisDisplay && !isAddressShape(erisDisplay) && !looksLikeCoinGeckoSlug(erisDisplay)) {
+                h = erisDisplay;
+            } else if (astroSymbol && !isAddressShape(astroSymbol) && !looksLikeCoinGeckoSlug(astroSymbol)) {
+                h = astroSymbol;
+            } else if (crSymbol && !isAddressShape(crSymbol) && !looksLikeCoinGeckoSlug(crSymbol)) {
+                h = crSymbol;
+            } else if (t.symbol && !isAddressShape(t.symbol) && !looksLikeCoinGeckoSlug(t.symbol)) {
+                h = t.symbol;
+            } else if (t.display_name && !isAddressShape(t.display_name) && !looksLikeCoinGeckoSlug(t.display_name)) {
+                h = t.display_name;
+            } else if (t.address) {
+                h = t.address.length > 18 ? (t.address.slice(0, 12) + '…' + t.address.slice(-6)) : t.address;
+                if (!t.scoring.flags.includes('no_display_name')) t.scoring.flags.push('no_display_name');
+            }
+            t.headline_name = h;
 
-        // Also ensure display_name isn't a CG slug — fall back to a clean source
-        if (looksLikeCoinGeckoSlug(t.display_name)) {
-            t.display_name = erisDisplay || crName || h;
+            // Also ensure display_name isn't a CG slug — fall back to a clean source
+            if (looksLikeCoinGeckoSlug(t.display_name)) {
+                t.display_name = erisDisplay || crName || h;
+            }
         }
     }
 
