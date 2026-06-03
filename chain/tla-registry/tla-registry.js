@@ -581,7 +581,13 @@ function indexAmplpMapping(assetConfigs) {
 // set. Empty array on total failure (which is fine, catalog still works).
 async function expandToInactiveLPs(activePools, directory) {
     const extraPools = [];
-    const stats = { contractsChecked: 0, contractsSucceeded: 0, extraLpsFound: 0 };
+    const stats = {
+        contractsChecked: 0,
+        contractsSucceeded: 0,
+        extraLpsFound: 0,
+        whitelistedFound: 0,         // whitelisted:true entries discovered (excluding already-active)
+        dewhitelistedFound: 0,       // whitelisted:false entries (still subject to take rate)
+    };
 
     const stakingRoles = [
         ['ASSET_STAKING__stable',   'stable'],
@@ -597,42 +603,81 @@ async function expandToInactiveLPs(activePools, directory) {
         if (!stakingAddr) continue;
         stats.contractsChecked++;
 
-        // Try the most likely query name first. Per the brief Part 6:
-        //   asset-staking → whitelisted_assets (returns the bucket's full LP set)
-        const result = await queryContract(stakingAddr, { whitelisted_assets: {} }, `asset-staking[${bucketName}].whitelisted_assets`);
+        // Use `whitelisted_asset_details` (the query Eris's own UI uses).
+        // This returns BOTH currently-whitelisted LPs AND previously-whitelisted
+        // (`whitelisted: false`) LPs that still have stakes accruing take rate.
+        // The older `whitelisted_assets` query only returned the active subset,
+        // which is why we missed boneLUNA, plain wBNB, rSWTH, wETH-wstETH and
+        // others that users may still have stakes in.
+        //
+        // Each entry shape:
+        //   { info: { cw20|native: <addr> }, whitelisted: bool,
+        //     config: { last_taken_s, taken, harvested, yearly_take_rate,
+        //               stake_config: {...} | "default" } }
+        const result = await queryContract(stakingAddr, { whitelisted_asset_details: {} }, `asset-staking[${bucketName}].whitelisted_asset_details`);
         if (!result) {
             // Query failed — log but don't fail the whole cron. Active-only fallback.
             continue;
         }
         stats.contractsSucceeded++;
 
-        // Response shape per the brief is unconfirmed in full detail, but the
-        // CW721/Astroport pattern is an array of asset_info entries. Be
-        // defensive about the wrapper.
+        // Response is an array of detail entries (sometimes wrapped under {data}).
         let assetList = result;
         if (result && typeof result === 'object' && !Array.isArray(result)) {
-            // Common wrappers: {assets: [...]} or {whitelisted_assets: [...]}
-            assetList = result.assets || result.whitelisted_assets || result.list || result.data || [];
+            assetList = result.data || result.assets || result.whitelisted_assets || result.list || [];
         }
         if (!Array.isArray(assetList)) continue;
 
         for (const entry of assetList) {
-            // Each entry could be a bare asset_info {cw20|native} or wrapped.
-            const asset = (entry && (entry.asset || entry.info)) || entry;
-            if (!asset || (typeof asset !== 'object')) continue;
-            const lpAddr = asset.cw20 || asset.native;
+            // Each entry has .info (the asset_info) and .config (the take-rate config)
+            // plus a top-level .whitelisted boolean.
+            const info = entry?.info;
+            if (!info || typeof info !== 'object') continue;
+            const lpAddr = info.cw20 || info.native;
             if (!lpAddr) continue;
 
-            const gaugePoolId = asset.cw20 ? `cw20:${asset.cw20}` : `native:${asset.native}`;
-            if (activeKeys.has(gaugePoolId)) continue;  // already in active set
+            const gaugePoolId = info.cw20 ? `cw20:${info.cw20}` : `native:${info.native}`;
+            if (activeKeys.has(gaugePoolId)) continue;  // already in the active gauge set
+
+            const isWhitelisted = entry.whitelisted === true;
+            const cfg = entry.config || {};
+
+            // Three buckets of status for non-active pools:
+            //   - whitelisted:true  → in whitelist but no gauge votes ("below threshold")
+            //   - whitelisted:false → previously whitelisted, removed from active set,
+            //                          stakes still exposed to take rate ("dewhitelisted")
+            const gaugeStatus = isWhitelisted
+                ? 'inactive_below_threshold'
+                : 'dewhitelisted';
+
+            if (isWhitelisted) stats.whitelistedFound++;
+            else stats.dewhitelistedFound++;
+
+            // Determine pool type from stake_config shape: object with
+            // `astroport` key = cw20 LP staked on Astroport gauge; string "default"
+            // = native LP staked through Eris's own mechanism.
+            let stakeMechanism = null;
+            if (cfg.stake_config === 'default') {
+                stakeMechanism = 'default';
+            } else if (cfg.stake_config && typeof cfg.stake_config === 'object') {
+                stakeMechanism = Object.keys(cfg.stake_config)[0] || null;
+            }
 
             extraPools.push({
                 gauge_pool_id: gaugePoolId,
                 bucket: bucketName,
-                asset_raw: asset,
-                distribution_pct: 0,     // inactive: not earning emissions this epoch
-                total_vp: null,          // VP info doesn't come from this query
-                gauge_status: 'inactive_below_threshold',
+                asset_raw: info,
+                distribution_pct: 0,         // not earning emissions this epoch
+                total_vp: null,              // VP info doesn't come from this query
+                gauge_status: gaugeStatus,
+                // Take-rate metadata (preserved on the pool, applied to LP token in Stage 5)
+                take_rate: {
+                    yearly_rate: cfg.yearly_take_rate || null,    // e.g. "0.1" = 10%/yr
+                    taken_raw: cfg.taken || null,                  // cumulative units taken
+                    harvested_raw: cfg.harvested || null,          // cumulative units harvested
+                    last_taken_s: cfg.last_taken_s || null,        // unix seconds
+                    stake_mechanism: stakeMechanism,               // "astroport" or "default"
+                },
             });
             activeKeys.add(gaugePoolId);
             stats.extraLpsFound++;
@@ -866,6 +911,17 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         t.appears_in.tla_pools.push(pool.bucket);
         t.appears_in.tla_distribution_pct = pool.distribution_pct;
         t.appears_in.tla_total_vp = pool.total_vp;
+        // Gauge status: 'active' | 'inactive_below_threshold' | 'dewhitelisted'
+        // - active: in active gauge with positive emissions
+        // - inactive_below_threshold: whitelisted but below 1% vote share, no emissions
+        // - dewhitelisted: previously whitelisted, removed — stakes still subject to take rate
+        // (Pools coming directly from gauge distributions don't have gauge_status set;
+        // those are implicitly 'active'.)
+        t.appears_in.gauge_status = pool.gauge_status || 'active';
+        // Take-rate metadata (only present for inactive/dewhitelisted from whitelisted_asset_details)
+        if (pool.take_rate) {
+            t.appears_in.take_rate = pool.take_rate;
+        }
         if (!t.type) t.type = pool.gauge_pool_id.startsWith('cw20:') ? 'cw20' : 'factory';
     }
 
@@ -1824,7 +1880,7 @@ async function main() {
     let extraPoolsResult = { extraPools: [], stats: { contractsChecked: 0, contractsSucceeded: 0, extraLpsFound: 0 } };
     try {
         extraPoolsResult = await expandToInactiveLPs(pools, directory);
-        console.log(`   step A: asset-staking[*].whitelisted_assets — ${extraPoolsResult.stats.contractsSucceeded}/${extraPoolsResult.stats.contractsChecked} buckets returned data, +${extraPoolsResult.stats.extraLpsFound} inactive LPs`);
+        console.log(`   step A: asset-staking[*].whitelisted_asset_details — ${extraPoolsResult.stats.contractsSucceeded}/${extraPoolsResult.stats.contractsChecked} buckets returned data, +${extraPoolsResult.stats.extraLpsFound} extra LPs (${extraPoolsResult.stats.whitelistedFound} below-threshold + ${extraPoolsResult.stats.dewhitelistedFound} dewhitelisted)`);
     } catch (e) {
         console.warn(`   step A failed (continuing with active-only): ${e.message}`);
     }
@@ -1916,6 +1972,8 @@ async function main() {
     const scopeStats = {
         active_lps:                 pools.length,
         inactive_lps_discovered:    extraPoolsResult.stats.extraLpsFound,
+        below_threshold_lps:        extraPoolsResult.stats.whitelistedFound || 0,
+        dewhitelisted_lps:          extraPoolsResult.stats.dewhitelistedFound || 0,
         total_lps:                  allPools.length,
         pair_lookups_succeeded:     universe.stats.pairLookupSucceeded,
         pair_lookups_failed:        universe.stats.pairLookupFailed,
