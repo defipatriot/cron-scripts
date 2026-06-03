@@ -776,7 +776,32 @@ async function buildLpUniverse(pools) {
                 u.push(t);
             }
         }
-        lpToUnderlyings[lpAddr] = u;
+
+        // Detect self-referential "pair" responses. Eris's single-asset
+        // compounder vaults (e.g. ampCAPA at factory/terra186rpf.../ampCAPA)
+        // respond to pair{} as if they were 2-asset LPs, returning their
+        // input asset AND themselves as the "underlyings". They're NOT real
+        // LP pairs — they're staking vaults.
+        //
+        // Without this detection:
+        //   - is_amplp_underlying gets cascaded to the wrapper itself (self)
+        //   - the input asset (CAPA) gets falsely credited as participating
+        //     in the single-bucket pool (it doesn't — ampCAPA does)
+        //   - tla_pools_count double-counts via Stage 5b
+        //
+        // Detection signal: lpAddr appears in its own resolved underlyings.
+        // We strip the self-reference AND tag the entry so downstream stages
+        // can treat it as a single-asset stake/vault rather than an LP pair.
+        if (u.includes(lpAddr)) {
+            const cleaned = u.filter(x => x !== lpAddr);
+            lpToUnderlyings[lpAddr] = cleaned;
+            // Mark this LP entry as a vault (single-asset stake) so consumers
+            // can distinguish vault from real LP pair
+            lpToUnderlyings[lpAddr]._is_vault = true;
+            stats.selfReferentialVaultsDetected = (stats.selfReferentialVaultsDetected || 0) + 1;
+        } else {
+            lpToUnderlyings[lpAddr] = u;
+        }
     }
 
     return { lpAddrs, underlyings, lpToUnderlyings, stats };
@@ -957,6 +982,13 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     // "Appears in TLA pools: no" because the stage above only credits the
     // LP token itself. The cron has lpToUnderlyings from the scope phase, so
     // we credit each underlying for every LP it appears in.
+    //
+    // DEDUP: track which (token_addr, lp_addr) pairs we've already credited.
+    // Without this, single-asset stakes that ARE their own underlying (e.g.
+    // ampCAPA wrapped by ampCAPA AMPLP — the wrapper's underlying_lp_address
+    // points to ampCAPA itself) get incremented twice: once for Stage 5 (own
+    // pool) and once here (as "underlying" of its own amplp). Same address
+    // appearing in pools[] AND in lpToUnderlyings = double-credit.
     if (lpToUnderlyings && typeof lpToUnderlyings === 'object') {
         // Group pools by LP address so we can match each LP back to its bucket
         const poolByLpAddr = {};
@@ -964,18 +996,72 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
             const lpAddr = pool.asset_raw?.cw20 || pool.asset_raw?.native;
             if (lpAddr) poolByLpAddr[lpAddr] = pool;
         }
+        // Track which (uAddr, poolBucket) pairs are already credited from Stage 5
+        // — so we don't credit the same token-bucket pair twice.
+        const alreadyCredited = new Set();
+        for (const pool of pools) {
+            const lpAddr = pool.asset_raw?.cw20 || pool.asset_raw?.native;
+            if (lpAddr) alreadyCredited.add(`${lpAddr}|${pool.bucket}`);
+        }
         for (const [lpAddr, underlyings] of Object.entries(lpToUnderlyings)) {
             const pool = poolByLpAddr[lpAddr];
             if (!pool || !Array.isArray(underlyings)) continue;
             for (const uAddr of underlyings) {
+                if (uAddr === lpAddr) continue;  // skip self-reference (vault, not LP)
                 const ut = tokens[uAddr];
                 if (!ut) continue;
+                const dedupKey = `${uAddr}|${pool.bucket}`;
+                if (alreadyCredited.has(dedupKey)) continue;  // already counted in Stage 5
+                alreadyCredited.add(dedupKey);
                 ut.appears_in.tla_pools_count += 1;
                 if (!ut.appears_in.tla_pools.includes(pool.bucket)) {
                     ut.appears_in.tla_pools.push(pool.bucket);
                 }
             }
         }
+    }
+
+    // Stage 5c: ensure every amplp factory denom has a token record
+    //
+    // Some amplp denoms (typically ones wrapping legacy/inactive LPs like
+    // arbLUNA-LUNA, WHALE-bWHALE, USDC-USDt variants, LUNA-wSOL.wh) aren't
+    // published in Eris's /prices endpoint. Without this stage they exist
+    // in amplp_mappings but never get token records — they're missing from
+    // the catalog entirely. We synthesize a minimal record using what we
+    // know from amplp_mappings: bucket, wrapped LP address, reward asset.
+    // The headline name is derived from the wrapped LP (e.g. "arbLUNA-LUNA AMPLP").
+    let synthAmplps = 0;
+    for (const [amplpDenom, info] of Object.entries(amplpInfo.mapping)) {
+        if (!info) continue;
+        if (tokens[amplpDenom]) continue;  // already populated by Eris/another source
+        const t = get(amplpDenom);
+        t.type = 'factory';
+        t.subtype = 'amplp';
+        // Derive a name from the wrapped LP. The wrapped LP token should already
+        // be in our catalog (it came in via pools or amplp scope expansion).
+        const wrappedLp = info.underlying_lp_address;
+        const wrappedTok = wrappedLp ? tokens[wrappedLp] : null;
+        const wrappedName = (wrappedTok && (
+            wrappedTok.headline_name ||
+            wrappedTok.sources?.eris?.display ||
+            wrappedTok.display_name ||
+            wrappedTok.symbol
+        )) || null;
+        if (wrappedName) {
+            // Append " AMPLP" suffix unless the name already contains it
+            const nameHasAmplp = /AMPLP|ampLP/.test(wrappedName);
+            const synthName = nameHasAmplp
+                ? wrappedName
+                : wrappedName.replace(/ LP(?:\s*\(S\))?$/i, '').trim() + ' AMPLP';
+            t.display_name = synthName;
+            t.symbol = synthName;
+        }
+        // Decimals on amplp factory denoms are 6 (TLA convention for factory tokens)
+        t.decimals = 6;
+        synthAmplps++;
+    }
+    if (synthAmplps > 0) {
+        console.log(`   Stage 5c: synthesized ${synthAmplps} amplp records (not in external sources)`);
     }
 
     // Stage 6: amplp wrapping — fixed semantic split between two flags
@@ -1002,8 +1088,12 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         }
         // Cascade: mark the LP's underlying tokens as amplp underlyings.
         // The data comes from scope phase: lpToUnderlyings[lpAddr] = [token1, token2].
+        // Defense in depth: also skip self-references here. The scope phase now
+        // strips them but if any old data sneaks through, this prevents an LP
+        // from being marked as its own underlying.
         const underlyings = (lpToUnderlyings && lpToUnderlyings[wrappedLp]) || [];
         for (const uAddr of underlyings) {
+            if (uAddr === wrappedLp) continue;  // skip self-reference (vault, not LP)
             if (tokens[uAddr]) {
                 tokens[uAddr].appears_in.is_amplp_underlying = true;
             }
@@ -1065,13 +1155,33 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     };
     for (const [addr, fix] of Object.entries(HARDCODED_OVERRIDES)) {
         if (!tokens[addr]) continue;
-        if (fix.display_name) tokens[addr].display_name = fix.display_name;
-        if (fix.headline_name) tokens[addr].headline_name = fix.headline_name;
-        if (fix.coingecko_id && !tokens[addr].coingecko_id) {
-            tokens[addr].coingecko_id = fix.coingecko_id;
-            tokens[addr].coingecko_match = 'hardcoded_override';
+        const t = tokens[addr];
+        if (fix.display_name) t.display_name = fix.display_name;
+        if (fix.headline_name) t.headline_name = fix.headline_name;
+        if (fix.coingecko_id && !t.coingecko_id) {
+            t.coingecko_id = fix.coingecko_id;
+            t.coingecko_match = 'hardcoded_override';
         }
-        tokens[addr].hardcoded_override_reason = fix.override_reason;
+        t.hardcoded_override_reason = fix.override_reason;
+        // Propagate the corrected name through to source-level fields so the
+        // cross-source naming panel reflects the override too. Preserve the
+        // original Eris-API value as `_original` so anyone curious about the
+        // raw disagreement can still see it.
+        //
+        // Without this, the page shows "Eris UI: bLUNA" because that's what
+        // /prices literally returned — but Eris's UI shows "boneLUNA" and we
+        // hardcoded to match. The panel should reflect what UIs show, not
+        // what one underlying API quirkily returns.
+        if (fix.display_name) {
+            t.sources = t.sources || {};
+            if (t.sources.eris) {
+                if (t.sources.eris.display !== fix.display_name) {
+                    t.sources.eris._display_original = t.sources.eris.display;
+                    t.sources.eris.display = fix.display_name;
+                    t.sources.eris._display_overridden = true;
+                }
+            }
+        }
     }
 
     // Stage 7c: CoinGecko independent verification
@@ -1096,8 +1206,13 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
     // Why this matters: an unverified mapping shouldn't be treated as 100%
     // confidence. Scoring further down uses this status to calibrate.
     if (cgList && Array.isArray(cgList)) {
-        // Build address→cgEntry index for Terra-2 / Terra Classic addresses
+        // Build TWO indexes:
+        //   1. cgByAddr (terra-2 only): direct lookup at our Terra address
+        //   2. cgByChainAddr (all chains): { 'ethereum:0x4580...': cgEntry, ... }
+        //      Lets us verify provenance for bridged tokens whose source asset
+        //      CG indexes (PAXG via Ethereum, wBTC.atom via Ethereum, etc.)
         const cgByAddr = {};
+        const cgByChainAddr = {};
         for (const coin of cgList) {
             const plats = coin.platforms || {};
             for (const [platName, platAddr] of Object.entries(plats)) {
@@ -1105,9 +1220,40 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                 if (platName === 'terra-2' || platName === 'terra' || platName === 'terra2') {
                     cgByAddr[platAddr] = { cg_id: coin.id, symbol: coin.symbol, name: coin.name, platform: platName };
                 }
+                // Build cross-chain index: lowercase keys to handle EVM-address case variations
+                const lcAddr = platAddr.toLowerCase();
+                cgByChainAddr[`${platName}:${lcAddr}`] = { cg_id: coin.id, symbol: coin.symbol, name: coin.name, platform: platName, original_address: platAddr };
             }
         }
-        let nVerified = 0, nMismatch = 0, nDiscovered = 0, nUnverified = 0;
+
+        // Helper: walk a token's bridge.all_traces looking for a CG match on
+        // any source chain. Returns the first match, or null.
+        // Trace format (chain-registry standard):
+        //   [{ type: 'ibc'|'ibc-bridge', counterparty: { chain_name, base_denom, ... } }, ...]
+        // The deepest origin is usually the last entry. We check ALL of them.
+        function findCgMatchViaBridge(t) {
+            const traces = (t.bridge && t.bridge.all_traces) || [];
+            for (const trace of traces) {
+                const cp = trace.counterparty || {};
+                const chainName = cp.chain_name;
+                const baseDenom = cp.base_denom;
+                if (!chainName || !baseDenom) continue;
+                // CG uses 'ethereum' as platform name; chain-registry uses the same.
+                // For evm chains, the base_denom is the 0x... contract — match case-insensitively.
+                const lookupKey = `${chainName}:${baseDenom.toLowerCase()}`;
+                if (cgByChainAddr[lookupKey]) {
+                    return {
+                        ...cgByChainAddr[lookupKey],
+                        matched_via: 'bridge_trace',
+                        source_chain: chainName,
+                        source_address: baseDenom,
+                    };
+                }
+            }
+            return null;
+        }
+
+        let nVerified = 0, nMismatch = 0, nDiscovered = 0, nUnverified = 0, nViaBridge = 0;
         for (const [addr, t] of Object.entries(tokens)) {
             const claimedCgId = t.coingecko_id;
             const cgEntry = cgByAddr[addr];
@@ -1131,17 +1277,45 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                 t.coingecko_id = cgEntry.cg_id;
                 t.coingecko_match = 'discovered';
                 nDiscovered++;
-            } else if (!cgEntry && claimedCgId) {
-                // We have a CG ID (from Eris or hardcoded) but CG doesn't index
-                // this exact Terra address. Could be valid (IBC denoms aren't
-                // in CG's terra-2 platform — CG would index by origin chain) or
-                // could be a wrong mapping. Either way: not independently verified.
-                t.coingecko_match = 'unverified_no_terra_addr';
-                nUnverified++;
+            } else if (!cgEntry) {
+                // No terra-2 match. Try bridge trace as fallback — for tokens
+                // with chain-registry bridge data, the CG entry for the source
+                // asset on its origin chain (e.g. PAX Gold on Ethereum) is a
+                // valid mapping. The bridged Terra version IS that asset.
+                const bridgeMatch = findCgMatchViaBridge(t);
+                if (bridgeMatch) {
+                    // Verified via bridge provenance — different confidence level
+                    // than terra-2 direct match, but legitimate.
+                    t.sources = t.sources || {};
+                    t.sources.coingecko = bridgeMatch;
+                    if (!claimedCgId) {
+                        // Discover via bridge: adopt the source asset's CG ID
+                        t.coingecko_id = bridgeMatch.cg_id;
+                        t.coingecko_match = 'verified_via_bridge';
+                        t.coingecko_match_source = `${bridgeMatch.source_chain}:${bridgeMatch.source_address}`;
+                        nViaBridge++;
+                    } else if (claimedCgId === bridgeMatch.cg_id) {
+                        // Source claimed the same CG ID that bridge trace finds — confirmed
+                        t.coingecko_match = 'verified_via_bridge';
+                        t.coingecko_match_source = `${bridgeMatch.source_chain}:${bridgeMatch.source_address}`;
+                        nViaBridge++;
+                    } else {
+                        // Source claimed CG ID X, bridge trace finds Y. Mismatch.
+                        t.coingecko_match = 'mismatch';
+                        t.coingecko_id_claimed = claimedCgId;
+                        t.coingecko_id_actual = bridgeMatch.cg_id;
+                        t.coingecko_match_source = `bridge:${bridgeMatch.source_chain}`;
+                        nMismatch++;
+                    }
+                } else if (claimedCgId) {
+                    // Source claims a CG ID but neither terra-2 nor bridge match
+                    t.coingecko_match = 'unverified_no_terra_addr';
+                    nUnverified++;
+                }
+                // else: no claim, no CG entry, no bridge match — leave as no_mapping
             }
-            // else: no claim, no CG entry — leave coingecko_match as whatever the previous stage set
         }
-        console.log(`   CG verification: ${nVerified} verified, ${nMismatch} mismatched, ${nDiscovered} discovered (gap-fill), ${nUnverified} unverified (no terra-2 addr in CG)`);
+        console.log(`   CG verification: ${nVerified} verified (terra-2), ${nViaBridge} verified via bridge trace, ${nMismatch} mismatched, ${nDiscovered} discovered (gap-fill), ${nUnverified} unverified`);
     }
 
     // Stage 8: acquisition guides
@@ -1152,6 +1326,47 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                 if (tokens[addr]) tokens[addr].acquisition = guide;
             }
         }
+    }
+
+    // Stage 8b: synthesize acquisition hints from bridge data
+    //
+    // For tokens that have no curated acquisition guide but DO have bridge
+    // metadata from chain-registry (source_chain, channel, original_denom),
+    // we can derive a partial guide automatically. This catches USDt (Kava
+    // origin via channel-138), EURe, and others where bridge data is rich
+    // but no human has written the route.
+    //
+    // The synthesized guide is explicitly marked unverified — we know the
+    // bridge path from on-chain data, but not the consumer on-ramp to
+    // acquire the source asset in the first place. A real curated guide
+    // (with verified routes) would still override this when added.
+    for (const t of Object.values(tokens)) {
+        if (t.acquisition) continue;      // already has a curated guide
+        if (!t.bridge) continue;          // no bridge data to synthesize from
+        const b = t.bridge;
+        // Skip if the bridge data points back at Terra itself (terra2 origin
+        // = native Terra, no acquisition guide needed)
+        if (b.source_chain === 'terra2' || b.source_chain === 'terra') continue;
+        // Only generate for ibc tokens (factory tokens are minted natively)
+        if (t.type !== 'ibc') continue;
+        const sourceLabel = b.source_chain || 'unknown chain';
+        const channel = b.channel ? ` (channel: ${b.channel})` : '';
+        const originalDenom = b.original_denom ? `\nOn ${sourceLabel} this asset is: ${b.original_denom}` : '';
+        t.acquisition = {
+            native_chain: sourceLabel,
+            route_to_terra: [
+                `This token bridges from ${sourceLabel} to Terra via IBC${channel}.`,
+                `First acquire the source asset on ${sourceLabel} — route unverified.`,
+                `Then IBC transfer it to your Terra address (e.g. via Keplr cross-chain transfer).${originalDenom}`,
+            ],
+            warnings: [
+                'This guide was auto-derived from on-chain bridge metadata, not verified by a human.',
+                'The bridge path is correct, but the consumer route to acquire the source asset is unknown.',
+                'If you find a working on-ramp, please contribute to acquisition_guides.json.',
+            ],
+            verified: false,
+            source: 'auto_derived_from_bridge_data',
+        };
     }
 
     // Stage 9: subtype + wallet_import + scoring
@@ -1242,8 +1457,17 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
             flags.push('no_external_price_source');
             if (!t.coingecko_match) t.coingecko_match = 'no_mapping';
         } else if (t.coingecko_match === 'verified') {
-            // CG ID confirmed by CG's own platform index. Trustworthy.
+            // CG ID confirmed by CG's own terra-2 platform index. Trustworthy.
             // No penalty, no flag.
+        } else if (t.coingecko_match === 'verified_via_bridge') {
+            // CG ID confirmed via bridge provenance — CG indexes the source
+            // asset on its origin chain (e.g. PAX Gold on Ethereum), and our
+            // token's bridge.all_traces match that exact source contract.
+            // Slightly less specific than terra-2 direct (CG could theoretically
+            // list a separate "bridged" entry), but the provenance is solid.
+            // Small penalty so it's distinguishable from terra-2 verified.
+            score -= 5;
+            flags.push('cg_verified_via_bridge_provenance');
         } else if (t.coingecko_match === 'discovered') {
             // Gap-filled: Eris missed it but CG knew. Neutral — small bonus
             // is built in because we now have the mapping where we didn't before.
@@ -2252,6 +2476,40 @@ async function main() {
         wallets_catalog: wallets,
         protocols: curated.protocols || {},
         categories: curated.categories || {},
+        // Tell the page how much data each external source actually returned.
+        // Lets us distinguish "we queried this source and it doesn't have this
+        // token" (informative) from "we never queried" or "source failed"
+        // (different problem entirely). Without this the page can only say
+        // "— not listed" with no context.
+        source_coverage: {
+            cosmos_chain_registry: {
+                asset_count: (external.cosmos_chain_registry?.assets || []).length,
+                fetched_ok: !!external.cosmos_chain_registry,
+                note: 'IBC asset metadata; many common tokens (e.g. ATOM) absent from terra-2 list',
+            },
+            eris_prices: {
+                asset_count: external.eris_prices ? Object.keys(external.eris_prices).length : 0,
+                fetched_ok: !!external.eris_prices,
+                note: 'Eris /prices endpoint — Eris-recognized assets only',
+            },
+            astroport_pools: {
+                pool_count: external.astroport_pools
+                    ? (Array.isArray(external.astroport_pools) ? external.astroport_pools.length : (external.astroport_pools.pools || []).length)
+                    : 0,
+                fetched_ok: !!external.astroport_pools,
+                note: 'Astroport pool data — indexes assets via active trading pairs',
+            },
+            skeletonswap_pools: {
+                pool_count: external.skeletonswap_pools ? (external.skeletonswap_pools.pools || []).length : 0,
+                fetched_ok: !!external.skeletonswap_pools,
+                note: 'SkeletonSwap pool data — only assets in current SS pools',
+            },
+            coingecko_list: {
+                coin_count: Array.isArray(external.coingecko_list) ? external.coingecko_list.length : 0,
+                fetched_ok: !!external.coingecko_list,
+                note: 'CG /coins/list with platforms — used for independent CG-mapping verification',
+            },
+        },
         _unmapped: unmapped,
         raw, _errors: errors, source_errors: external.source_errors,
         sources: { primary_lcd: TERRA_LCD_PRIMARY, fallback_lcd: TERRA_LCD_FALLBACK },
