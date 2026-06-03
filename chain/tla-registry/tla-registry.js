@@ -40,6 +40,14 @@ const URL_COSMOS_CHAIN_REGISTRY_TERRA2 = 'https://raw.githubusercontent.com/cosm
 const URL_ERIS_PRICES   = 'https://backend.erisprotocol.com/prices';
 const URL_ASTROPORT     = 'https://app.astroport.fi/api/pools?chainId=phoenix-1';
 const URL_SKELETONSWAP  = 'https://dex.warlock.backbonelabs.io/api/pools/phoenix-1';
+// CoinGecko's full coin list with platform contract addresses. We use this
+// for INDEPENDENT verification of CG mappings — when Eris claims a token
+// maps to a particular CG ID, we cross-check by looking up the contract
+// address in CG's own platform index. This catches:
+//   - missing mappings (Eris doesn't have a CG ID but CG actually does)
+//   - wrong mappings (Eris claims X but CG has the same address as Y)
+//   - unverified mappings (CG doesn't index this address at all)
+const URL_COINGECKO_LIST = 'https://api.coingecko.com/api/v3/coins/list?include_platform=true';
 
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/tla-chain-registry';
@@ -301,6 +309,7 @@ async function fetchExternalSources() {
     const sources = {
         cosmos_chain_registry: null, eris_prices: null,
         astroport_pools: null, skeletonswap_pools: null,
+        coingecko_list: null,
         source_errors: {},
     };
 
@@ -328,6 +337,24 @@ async function fetchExternalSources() {
         const n = (sources.skeletonswap_pools.pools || []).length;
         console.log(`      ✓ ${n} pools`);
     } else sources.source_errors.skeletonswap_pools = 'fetch failed';
+
+    // E5: CoinGecko coin list with platform addresses. Used for independent
+    // verification of CG mappings — we look up our token addresses in CG's
+    // own Terra-2 platform index. Failure here is non-critical (catalog
+    // still works, just without the verification stage).
+    console.log('   E5: CoinGecko coin list (independent CG verification)');
+    sources.coingecko_list = await tryFetchJson(URL_COINGECKO_LIST, 'coingecko-list');
+    if (sources.coingecko_list && Array.isArray(sources.coingecko_list)) {
+        // Count Terra-2 addresses in the list to confirm we got real data
+        let t2count = 0;
+        for (const coin of sources.coingecko_list) {
+            const p = coin.platforms || {};
+            if (p['terra-2'] || p['terra2']) t2count++;
+        }
+        console.log(`      ✓ ${sources.coingecko_list.length} coins, ${t2count} with terra-2 contract addresses`);
+    } else {
+        sources.source_errors.coingecko_list = 'fetch failed';
+    }
 
     return sources;
 }
@@ -756,7 +783,7 @@ async function buildLpUniverse(pools) {
 }
 
 
-function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings }) {
+function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings, cgList }) {
     const tokens = {};
     // scopeAddrs (Set<string>) is the in-scope set built from TLA gauge LPs +
     // their underlyings per brief 2.21. Stages 1-4 (chain registry / Eris /
@@ -951,17 +978,35 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         }
     }
 
-    // Stage 6: amplp wrapping
-    // For each amplp factory denom, mark the LP token it wraps. The field
-    // means: "this LP token gets wrapped by an amplp" — NOT "this token is an
-    // amplp underlying" (which would be 2 layers — the LP's underlying tokens).
-    // The original field name `is_amplp_underlying` was misleading.
+    // Stage 6: amplp wrapping — fixed semantic split between two flags
+    //
+    // Two distinct concepts that were previously conflated:
+    //
+    //   is_wrapped_by_amplp = true → this LP token gets wrapped by an amplp.
+    //                                e.g. FUEL-LUNA LP is wrapped by FUEL-LUNA AMPLP.
+    //                                Set on the LP itself.
+    //
+    //   is_amplp_underlying  = true → this token is an UNDERLYING ASSET of an LP
+    //                                that gets wrapped by an amplp. e.g. FUEL itself
+    //                                is an underlying of FUEL-LUNA LP, which is amplp'd.
+    //                                Set on the actual asset tokens (LUNA, FUEL, ATOM).
+    //
+    // The page label "amplp underlying" should mean what users expect — the actual
+    // tokens (LUNA, FUEL, ATOM) underlying any amplp-wrapped LP, NOT the LPs themselves.
+    // Previously both flags were set on the LP token only, so FUEL showed "no" even
+    // though FUEL-LUNA LP is amplp'd.
     for (const info of Object.values(amplpInfo.mapping)) {
         const wrappedLp = info.underlying_lp_address;
         if (tokens[wrappedLp]) {
             tokens[wrappedLp].appears_in.is_wrapped_by_amplp = true;
-            // Keep the legacy field for backwards compatibility — same value
-            tokens[wrappedLp].appears_in.is_amplp_underlying = true;
+        }
+        // Cascade: mark the LP's underlying tokens as amplp underlyings.
+        // The data comes from scope phase: lpToUnderlyings[lpAddr] = [token1, token2].
+        const underlyings = (lpToUnderlyings && lpToUnderlyings[wrappedLp]) || [];
+        for (const uAddr of underlyings) {
+            if (tokens[uAddr]) {
+                tokens[uAddr].appears_in.is_amplp_underlying = true;
+            }
         }
     }
 
@@ -998,6 +1043,105 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
                 if (override.notes) t.notes = override.notes;
             }
         }
+    }
+
+    // Stage 7b: Hardcoded display + CG overrides (drama-not-data fixes)
+    //
+    // Some tokens have a name disagreement between Eris's API and Eris's UI
+    // (and the wider ecosystem). These are political/historical artifacts, not
+    // data bugs, so we hardcode rather than add to the curated overrides file.
+    // Currently just one case:
+    //   bLUNA at terra17aj4ty… — Eris's /prices returns display="bLUNA" with
+    //   no CG mapping. Eris's UI shows "boneLUNA". Backbone Labs uses
+    //   "boneLUNA" everywhere. CoinGecko lists it as "backbone-labs-staked-luna".
+    //   The label disagreement is a holdover from Eris/BBL drama.
+    const HARDCODED_OVERRIDES = {
+        'terra17aj4ty4sz4yhgm08na8drc0v03v2jwr3waxcqrwhajj729zhl7zqnpc0ml': {
+            display_name: 'boneLUNA',
+            headline_name: 'boneLUNA',
+            coingecko_id: 'backbone-labs-staked-luna',
+            override_reason: 'eris_bbl_naming_dispute',
+        },
+    };
+    for (const [addr, fix] of Object.entries(HARDCODED_OVERRIDES)) {
+        if (!tokens[addr]) continue;
+        if (fix.display_name) tokens[addr].display_name = fix.display_name;
+        if (fix.headline_name) tokens[addr].headline_name = fix.headline_name;
+        if (fix.coingecko_id && !tokens[addr].coingecko_id) {
+            tokens[addr].coingecko_id = fix.coingecko_id;
+            tokens[addr].coingecko_match = 'hardcoded_override';
+        }
+        tokens[addr].hardcoded_override_reason = fix.override_reason;
+    }
+
+    // Stage 7c: CoinGecko independent verification
+    //
+    // We've been blindly trusting Eris's claims about which CG ID corresponds
+    // to which token. That trust failed visibly on rSWTH (score 100 despite
+    // unverified mapping) and silently on others we haven't caught. This stage
+    // cross-checks every claimed mapping against CG's own coin list, which
+    // includes contract addresses per chain platform.
+    //
+    // Four outcomes per token:
+    //   - verified           — CG has this address AND matches the claimed CG ID
+    //   - mismatch           — CG has this address but a DIFFERENT CG ID than claimed
+    //                          (red flag — Eris's mapping is wrong)
+    //   - discovered         — CG has this address but Eris didn't claim a CG ID
+    //                          (gap-filler — we add the CG ID and link)
+    //   - unverified_no_addr — claimed CG ID exists, but CG doesn't index this
+    //                          address on terra-2 (could be legit if CG indexes
+    //                          by source chain only, but worth flagging)
+    //   - no_mapping_either  — no CG ID claimed, no CG address match (genuine no-CG)
+    //
+    // Why this matters: an unverified mapping shouldn't be treated as 100%
+    // confidence. Scoring further down uses this status to calibrate.
+    if (cgList && Array.isArray(cgList)) {
+        // Build address→cgEntry index for Terra-2 / Terra Classic addresses
+        const cgByAddr = {};
+        for (const coin of cgList) {
+            const plats = coin.platforms || {};
+            for (const [platName, platAddr] of Object.entries(plats)) {
+                if (!platAddr) continue;
+                if (platName === 'terra-2' || platName === 'terra' || platName === 'terra2') {
+                    cgByAddr[platAddr] = { cg_id: coin.id, symbol: coin.symbol, name: coin.name, platform: platName };
+                }
+            }
+        }
+        let nVerified = 0, nMismatch = 0, nDiscovered = 0, nUnverified = 0;
+        for (const [addr, t] of Object.entries(tokens)) {
+            const claimedCgId = t.coingecko_id;
+            const cgEntry = cgByAddr[addr];
+            // Preserve CG entry as a new source for the cross-source naming panel
+            if (cgEntry) {
+                t.sources = t.sources || {};
+                t.sources.coingecko = cgEntry;
+            }
+            if (cgEntry && claimedCgId) {
+                if (cgEntry.cg_id === claimedCgId) {
+                    t.coingecko_match = 'verified';
+                    nVerified++;
+                } else {
+                    t.coingecko_match = 'mismatch';
+                    t.coingecko_id_claimed = claimedCgId;
+                    t.coingecko_id_actual = cgEntry.cg_id;
+                    nMismatch++;
+                }
+            } else if (cgEntry && !claimedCgId) {
+                // Eris/sources missed this mapping — CG has it. Adopt it.
+                t.coingecko_id = cgEntry.cg_id;
+                t.coingecko_match = 'discovered';
+                nDiscovered++;
+            } else if (!cgEntry && claimedCgId) {
+                // We have a CG ID (from Eris or hardcoded) but CG doesn't index
+                // this exact Terra address. Could be valid (IBC denoms aren't
+                // in CG's terra-2 platform — CG would index by origin chain) or
+                // could be a wrong mapping. Either way: not independently verified.
+                t.coingecko_match = 'unverified_no_terra_addr';
+                nUnverified++;
+            }
+            // else: no claim, no CG entry — leave coingecko_match as whatever the previous stage set
+        }
+        console.log(`   CG verification: ${nVerified} verified, ${nMismatch} mismatched, ${nDiscovered} discovered (gap-fill), ${nUnverified} unverified (no terra-2 addr in CG)`);
     }
 
     // Stage 8: acquisition guides
@@ -1084,12 +1228,44 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
             flags.push('cross_source_name_mismatch:' + realNamesAcrossSources.join(','));
         }
 
+        // CoinGecko mapping scoring — uses verification status from Stage 7c.
+        // The CG verification stage runs BEFORE this and sets coingecko_match
+        // to one of: verified | mismatch | discovered | unverified_no_terra_addr
+        // | hardcoded_override | (unset). Anything that's not 'verified' or
+        // 'discovered' is treated as unreliable — penalize accordingly.
+        //
+        // Previously this stage blindly stamped 'matched' whenever a CG ID was
+        // present, masking unverified mappings (rSWTH's 100-score bug).
         if (!t.coingecko_id) {
+            // No CG mapping AT ALL — biggest penalty
             score -= 25;
             flags.push('no_external_price_source');
-            t.coingecko_match = 'no_mapping';
+            if (!t.coingecko_match) t.coingecko_match = 'no_mapping';
+        } else if (t.coingecko_match === 'verified') {
+            // CG ID confirmed by CG's own platform index. Trustworthy.
+            // No penalty, no flag.
+        } else if (t.coingecko_match === 'discovered') {
+            // Gap-filled: Eris missed it but CG knew. Neutral — small bonus
+            // is built in because we now have the mapping where we didn't before.
+        } else if (t.coingecko_match === 'mismatch') {
+            // Eris/source claimed one CG ID, CG actually has a different ID
+            // for this address. Strong red flag — the mapping is wrong.
+            score -= 30;
+            flags.push(`cg_mapping_mismatch:claimed=${t.coingecko_id_claimed},actual=${t.coingecko_id_actual}`);
+        } else if (t.coingecko_match === 'unverified_no_terra_addr') {
+            // CG ID claimed, but CG doesn't index this address on terra-2.
+            // Common for IBC denoms (CG indexes by origin chain). Not necessarily
+            // wrong but we can't confirm — moderate penalty so score isn't 100.
+            score -= 15;
+            flags.push('cg_mapping_unverified');
+        } else if (t.coingecko_match === 'hardcoded_override') {
+            // Manually corrected mapping — trust the hardcode, no penalty.
         } else {
-            t.coingecko_match = 'matched';
+            // Legacy / unknown match state — penalize lightly so unverified
+            // doesn't pass as perfect.
+            score -= 10;
+            flags.push('cg_mapping_status_unknown');
+            t.coingecko_match = 'unverified';
         }
 
         // no_acquisition_guide ONLY fires when a guide is genuinely needed:
@@ -1988,7 +2164,7 @@ async function main() {
     };
 
     console.log('\n🧬 Building catalog (scope-filtered)...');
-    const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings: universe.lpToUnderlyings });
+    const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings: universe.lpToUnderlyings, cgList: external.coingecko_list });
     const { contracts, wallets } = buildContractsCatalog({ directory, curated });
     const unmapped = findUnmapped({ tokens });
     console.log(`   tokens:    ${Object.keys(tokens).length} (in-scope only; previously enumerated whole chain)`);
