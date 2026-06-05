@@ -428,11 +428,18 @@ function indexChainRegistry(registry) {
             if (displayUnit) decimals = displayUnit.exponent;
         }
 
+        // Logo URI extraction. The chain-registry uses two shapes:
+        //   1. New: assets[].images[] array of {png, svg} pairs
+        //   2. Old: assets[].logo_URIs object with {png, svg}
+        // Prefer PNG for compatibility, fall back to SVG (newer entries are often
+        // SVG-only — e.g. ampLUNA, arbLUNA, xAstro). Both render fine in <img>.
+        const firstImage = (a.images && a.images[0]) || {};
+        const logoUris = a.logo_URIs || {};
         idx[key] = {
             symbol: a.symbol, name: a.name, display: a.display, decimals,
             coingecko_id: a.coingecko_id || null, type, bridge,
             description: a.description,
-            logo_uri: (a.images && a.images[0])?.png || (a.logo_URIs && a.logo_URIs.png) || null,
+            logo_uri: firstImage.png || firstImage.svg || logoUris.png || logoUris.svg || null,
         };
     }
     return idx;
