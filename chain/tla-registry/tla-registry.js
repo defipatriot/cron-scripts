@@ -2581,6 +2581,46 @@ async function main() {
         errors.push({ stage: 'pfpk_names', error: e.message });
     }
 
+    // Compute headline_name for each wallet. Priority order:
+    //   1. curated `label`          — manual curation always wins
+    //   2. `daodao_name`            — PFPK profile name (~24% of wallets)
+    //   3. membership-derived label — e.g. "TLA member" if no name available
+    //   4. (left null — page shows truncated address)
+    //
+    // headline_name is the single canonical field downstream pages read instead
+    // of duplicating the priority chain. Mirrors how tokens get a headline_name
+    // computed in the post-pass at the bottom of buildTokenCatalog.
+    let walletsWithHeadlineName = 0;
+    for (const w of Object.values(wallets)) {
+        if (!w || typeof w !== 'object') continue;
+        let h = null;
+        if (w.label) {
+            h = w.label;
+        } else if (w.daodao_name) {
+            h = w.daodao_name;
+        } else if (Array.isArray(w.dao_memberships) && w.dao_memberships.length > 0) {
+            // Synthesize a label from primary DAO membership. Useful for wallets
+            // we know are in a DAO but whose user hasn't registered a PFPK name.
+            // Pick TLA > highest VP > first.
+            const sorted = [...w.dao_memberships].sort((a, b) => {
+                if (a.dao === 'TLA' && b.dao !== 'TLA') return -1;
+                if (b.dao === 'TLA' && a.dao !== 'TLA') return 1;
+                const aVp = Number(a.total_vp || a.stake_balance || 0);
+                const bVp = Number(b.total_vp || b.stake_balance || 0);
+                return bVp - aVp;
+            });
+            const primary = sorted[0];
+            // "TLA member" / "Lion DAO ROAR staker" / "Pixel Lions holder" etc.
+            // Address remains the unique identifier — this is just a friendly label.
+            h = `${primary.dao} member`;
+        }
+        if (h) {
+            w.headline_name = h;
+            walletsWithHeadlineName++;
+        }
+    }
+    console.log(`   ${walletsWithHeadlineName} wallets given a headline_name (label > daodao_name > membership)`);
+
     console.log(`\n   wallets total: ${Object.keys(wallets).length} (curated + discovered from all sources)`);
 
     const snapshot = {
