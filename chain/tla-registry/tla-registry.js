@@ -1064,6 +1064,67 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         console.log(`   Stage 5c: synthesized ${synthAmplps} amplp records (not in external sources)`);
     }
 
+    // Stage 5d: Normalize ALL amplp tokens (whether synthesized in 5c or
+    // pre-existing from Eris). Two bug classes this fixes:
+    //
+    //   Bug A: subtype inheritance. Tokens that came in via Eris's /prices
+    //   are factory denoms and get subtype='native' from the generic catch-all
+    //   later. Worse, the LST regex at the same later stage matches symbols
+    //   like 'arbLUNA-LUNA AMPLP' (starts with arb + contains luna) and
+    //   reclassifies them as 'lst'. Result before fix: 10 of 65 amplps had
+    //   subtype='amplp'; the rest were 'native' or 'lst'.
+    //   Stage 5d forces subtype='amplp' for everything in amplp_mappings,
+    //   and the LST regex below has a guard to skip already-amplp tokens.
+    //
+    //   Bug B: tla_pools_count always 0 for amplps. Amplps don't appear in
+    //   pools[] directly (the gauge whitelists the LP, not the amplp) and
+    //   aren't in lpToUnderlyings. So Stage 5 and 5b never credit them.
+    //   But conceptually amplps DEFINITELY participate in TLA pools — you
+    //   stake the amplp to participate in the LP's bucket. Stage 5d mirrors
+    //   the underlying LP's appears_in.tla_pools onto the amplp (with
+    //   mapping.bucket fallback for cases where the underlying LP isn't
+    //   itself in pools[]). Also tracks wraps_lp_address so the page can
+    //   render a "Wraps: <LP name>" link.
+    let amplpsNormalized = 0;
+    for (const [amplpDenom, info] of Object.entries(amplpInfo.mapping)) {
+        if (!info) continue;
+        const t = tokens[amplpDenom];
+        if (!t) continue;  // synthesized in 5c if missing; defensive here
+
+        // (A) Force correct subtype regardless of how it was inferred earlier.
+        t.subtype = 'amplp';
+
+        // (B) Inherit TLA pool participation from the underlying LP. Falls back
+        //     to mapping.bucket if the underlying LP isn't a tracked TLA pool
+        //     (e.g. legacy amplps wrapping LPs not in the current gauge).
+        const wrappedLp = info.underlying_lp_address;
+        const wrappedTok = wrappedLp ? tokens[wrappedLp] : null;
+        const inheritBuckets = (wrappedTok && wrappedTok.appears_in && wrappedTok.appears_in.tla_pools && wrappedTok.appears_in.tla_pools.length > 0)
+            ? wrappedTok.appears_in.tla_pools
+            : (info.bucket ? [info.bucket] : []);
+
+        // Only set if not already populated. Defensive against future stages
+        // that might populate amplps differently.
+        if (t.appears_in.tla_pools_count === 0 && inheritBuckets.length > 0) {
+            t.appears_in.tla_pools_count = inheritBuckets.length;
+            t.appears_in.tla_pools = [...inheritBuckets];
+            // Inherit gauge_status from the underlying LP. If LP isn't tracked,
+            // leave undefined — the page renders "active" as default in that case.
+            if (wrappedTok && wrappedTok.appears_in && wrappedTok.appears_in.gauge_status) {
+                t.appears_in.gauge_status = wrappedTok.appears_in.gauge_status;
+            }
+        }
+
+        // (C) Record the LP this amplp wraps so the page can render the
+        //     relationship. Also useful for future DEX-badge derivation.
+        t.appears_in.wraps_lp_address = wrappedLp || null;
+
+        amplpsNormalized++;
+    }
+    if (amplpsNormalized > 0) {
+        console.log(`   Stage 5d: normalized ${amplpsNormalized} amplp records (subtype + tla_pools inheritance + wraps_lp link)`);
+    }
+
     // Stage 6: amplp wrapping — fixed semantic split between two flags
     //
     // Two distinct concepts that were previously conflated:
@@ -1412,7 +1473,11 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
             else t.subtype = 'native';
         }
         const sym = (t.display_name || t.symbol || '').toLowerCase();
-        if (/^(amp|arb|b|st)/.test(t.symbol || '') && /luna/i.test(sym)) {
+        // LST detection. Guard against overriding 'amplp' — amplps wrapping LST
+        // pairs (e.g. arbLUNA-LUNA AMPLP, ampWHALE-WHALE AMPLP) have symbols
+        // that match this regex but are amplps, not LSTs. Stage 5d already
+        // forced these to subtype='amplp'; respect that.
+        if (t.subtype !== 'amplp' && /^(amp|arb|b|st)/.test(t.symbol || '') && /luna/i.test(sym)) {
             t.subtype = 'lst';
         }
 
