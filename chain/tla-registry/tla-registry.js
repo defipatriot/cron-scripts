@@ -1196,6 +1196,37 @@ function buildTokenCatalog({ pools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplp
         }
     }
 
+    // Stage 7d: logo aggregation — pick best logo URL per token, with priority:
+    //   1. curated override (token_overrides.json logo_url field)
+    //   2. cosmos chain-registry logo_uri  (most canonical for IBC/cw20 with terra2 entry)
+    //   3. Skeleton Swap logo_url          (covers more wrapped tokens like wstETH)
+    //   4. (future) Eris CDN, Astroport API, CoinGecko per-coin endpoint
+    //
+    // Result is exposed as t.logo_url so downstream consumers (catalog page,
+    // tla-stats.html, future tools) read one canonical field instead of having
+    // to scan all the source records.
+    //
+    // For LPs and amplps, this stage does NOT compute a composite logo — that's
+    // a rendering concern. The page/UI composites two underlying token logos
+    // visually using the lp_to_underlyings + amplp_mappings data.
+    //
+    // 404s are gracefully handled on the page side via <img onerror> fallback
+    // to a letter-circle, so a wrong/dead URL here doesn't break anything.
+    let logosResolved = 0;
+    for (const t of Object.values(tokens)) {
+        const s = t.sources || {};
+        const best =
+            (t.override && t.override.logo_url) ||
+            (s.cosmos_chain_registry && s.cosmos_chain_registry.logo_uri) ||
+            (s.skeletonswap && s.skeletonswap.logo_url) ||
+            null;
+        if (best) {
+            t.logo_url = best;
+            logosResolved++;
+        }
+    }
+    console.log(`   Stage 7d: resolved ${logosResolved} token logos (of ${Object.keys(tokens).length} tokens)`);
+
     // Stage 7b: Hardcoded display + CG overrides (drama-not-data fixes)
     //
     // Some tokens have a name disagreement between Eris's API and Eris's UI
