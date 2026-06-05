@@ -367,8 +367,39 @@ async function fetchCurated() {
     console.log('\n📚 Curated files...');
     const files = ['categories', 'wallets', 'protocols', 'known_contracts', 'token_overrides', 'acquisition_guides'];
     const curated = {};
+
+    // Bypass Fastly cache by using commit-SHA-pinned raw URLs instead of
+    // branch-pinned ones. raw.githubusercontent.com uses Fastly with a
+    // 5-minute CDN cache keyed by full URL path. A SHA-pinned URL is a
+    // different path (different commit SHA → different URL → cache miss).
+    //
+    // Fixes a real bug from 2026-06-05: when a curator pushed corrected
+    // logo URLs to GitHub and manually triggered the cron within 5 minutes,
+    // Fastly served the OLD cached version. The cron wrote stale data
+    // into current.json even though the file on GitHub was correct.
+    // Query-string cache-busting (?_=ts) didn't help — Fastly ignores
+    // query strings for these URLs. Request headers (Cache-Control,
+    // Pragma) didn't help either. Only SHA-pinning bypasses the cache.
+    let sha = GITHUB_BRANCH;
+    try {
+        const commitInfo = await tryFetchJson(
+            `https://api.github.com/repos/${GITHUB_REPO}/commits/${GITHUB_BRANCH}`,
+            'github-api-latest-commit',
+            5000
+        );
+        if (commitInfo && commitInfo.sha) {
+            sha = commitInfo.sha;
+            console.log(`   pinned to commit ${sha.slice(0, 7)} (bypasses Fastly cache)`);
+        } else {
+            console.log(`   warn: SHA lookup returned no sha; using branch URL (may serve stale cache for ~5 min after recent push)`);
+        }
+    } catch (e) {
+        console.log(`   warn: SHA lookup failed (${e.message}); using branch URL`);
+    }
+
+    const baseUrl = `https://raw.githubusercontent.com/${GITHUB_REPO}/${sha}/curated`;
     for (const f of files) {
-        const url = `${CURATED_BASE_URL}/${f}.json`;
+        const url = `${baseUrl}/${f}.json`;
         const data = await tryFetchJson(url, `curated/${f}.json`);
         curated[f] = data;
         console.log(data ? `   ✓ ${f}.json` : `   - ${f}.json not present`);
