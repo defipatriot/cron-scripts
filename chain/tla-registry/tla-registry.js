@@ -763,7 +763,8 @@ async function buildLpUniverse(pools) {
     const lpAddrs = new Set();
     const underlyings = new Set();
     const lpToUnderlyings = {};  // lpAddr → [tokenAddr, tokenAddr]
-    const stats = { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsResolved: 0, nativeLpsSkipped: 0 };
+    const lpToArchitecture = {}; // lpAddr → { pair_address, pair_type, contract, version, dex }
+    const stats = { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsResolved: 0, nativeLpsSkipped: 0, archResolved: 0, archPartial: 0 };
 
     for (const pool of pools) {
         stats.totalLps++;
@@ -806,6 +807,45 @@ async function buildLpUniverse(pools) {
         if (raw.native) stats.nativeLpsResolved++;
         else stats.pairLookupSucceeded++;
 
+        // Architecture capture. Two queries' info combined:
+        //   1. pair{} (already done above) → pair_type: 'constant_product' | 'stable' | 'concentrated' | etc.
+        //   2. contract_version{} (new) → { contract: 'astroport-pair' | 'white_whale-pool' | ..., version: '1.5.0' }
+        //
+        // Why both: pair_type tells us AMM math (xyk/stable/CL); contract identity
+        // tells us the codebase (Astroport's official contracts vs White Whale's
+        // contracts that Backbone Labs took over as Skeleton Swap). Users want
+        // to see both — "Skeleton Swap (white_whale-pool v1.3.8) — concentrated"
+        // is much clearer than just "constant_product".
+        //
+        // contract_version{} fails silently on some pools — that's fine, we leave
+        // version null and the page falls back to inference from name suffix.
+        const versionResp = await queryContract(pairAddr, { contract_version: {} }, `pair[${pairAddr.slice(-8)}].contract_version`).catch(() => null);
+        const pairTypeRaw = pairResp.pair_type;
+        // pair_type comes in two shapes across Astroport versions:
+        //   string:  "constant_product" | "stable" | "concentrated"
+        //   object:  { xyk: {} } | { stable: {} } | { concentrated: {} }
+        const pairType = typeof pairTypeRaw === 'string'
+            ? pairTypeRaw
+            : (pairTypeRaw && typeof pairTypeRaw === 'object' ? Object.keys(pairTypeRaw)[0] : null);
+        // Determine DEX label from contract name. Falls back to "unknown" so
+        // the page can decide whether to surface or hide.
+        const contractName = versionResp?.contract || null;
+        let dexLabel = null;
+        if (contractName) {
+            if (contractName.startsWith('white_whale')) dexLabel = 'Skeleton Swap';
+            else if (contractName.startsWith('astroport')) dexLabel = 'Astroport';
+            else dexLabel = contractName;
+        }
+        lpToArchitecture[lpAddr] = {
+            pair_address: pairAddr,
+            pair_type: pairType,                      // 'xyk' | 'stable' | 'concentrated' etc.
+            contract: contractName,                   // 'astroport-pair' | 'white_whale-pool' etc.
+            version: versionResp?.version || null,    // '1.5.0' | '1.3.8' etc.
+            dex: dexLabel,                            // 'Astroport' | 'Skeleton Swap' | other
+        };
+        if (contractName && pairType) stats.archResolved++;
+        else if (pairType) stats.archPartial++;
+
         const u = [];
         for (const info of pairResp.asset_infos) {
             const t = info.token?.contract_addr || info.native_token?.denom;
@@ -842,7 +882,7 @@ async function buildLpUniverse(pools) {
         }
     }
 
-    return { lpAddrs, underlyings, lpToUnderlyings, stats };
+    return { lpAddrs, underlyings, lpToUnderlyings, lpToArchitecture, stats };
 }
 
 
@@ -2428,11 +2468,12 @@ async function main() {
     const allPools = [...pools, ...extraPoolsResult.extraPools];
     console.log(`   total LPs after step A: ${allPools.length}`);
 
-    let universe = { lpAddrs: new Set(), underlyings: new Set(), lpToUnderlyings: {}, stats: { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsSkipped: 0 } };
+    let universe = { lpAddrs: new Set(), underlyings: new Set(), lpToUnderlyings: {}, lpToArchitecture: {}, stats: { totalLps: 0, pairLookupSucceeded: 0, pairLookupFailed: 0, nativeLpsSkipped: 0, archResolved: 0, archPartial: 0 } };
     try {
         universe = await buildLpUniverse(allPools);
         console.log(`   step B: pair{} lookups — ${universe.stats.pairLookupSucceeded} succeeded, ${universe.stats.pairLookupFailed} failed, ${universe.stats.nativeLpsSkipped} native LPs skipped`);
         console.log(`           ${universe.lpAddrs.size} LP addresses, ${universe.underlyings.size} underlying token addresses`);
+        console.log(`           architecture resolved for ${universe.stats.archResolved} pools (full: contract+version+type), ${universe.stats.archPartial} partial (pair_type only)`);
     } catch (e) {
         console.warn(`   step B failed (will scope to LPs only, no underlyings): ${e.message}`);
         // Minimal safety net: always include the LP addresses themselves
@@ -2440,6 +2481,23 @@ async function main() {
             const a = p.asset_raw?.cw20 || p.asset_raw?.native;
             if (a) universe.lpAddrs.add(a);
         }
+    }
+
+    // Attach architecture metadata directly onto each pool object. Pool consumers
+    // (catalog page LP detail, future Member Stats LP cards, Portfolio Tracker)
+    // can then read `pool.architecture` without joining against scope.lp_to_architecture.
+    // The same data is also exported under scope for downstream tools that index by
+    // LP address.
+    let archAttached = 0;
+    for (const pool of allPools) {
+        const lpAddr = pool.asset_raw?.cw20 || pool.asset_raw?.native;
+        if (lpAddr && universe.lpToArchitecture && universe.lpToArchitecture[lpAddr]) {
+            pool.architecture = universe.lpToArchitecture[lpAddr];
+            archAttached++;
+        }
+    }
+    if (archAttached > 0) {
+        console.log(`           attached architecture to ${archAttached} pool objects`);
     }
 
     // Build the final scope set: LPs + their underlyings + amplp denoms
@@ -2636,6 +2694,7 @@ async function main() {
         scope: {
             ...scopeStats,
             lp_to_underlyings: universe.lpToUnderlyings,
+            lp_to_architecture: universe.lpToArchitecture,
         },
         contracts: {
             global_config: GLOBAL_CONFIG_ADDR,
