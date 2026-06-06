@@ -90,11 +90,17 @@ async function queryContract(contractAddr, query, label) {
     const qb = encodeQuery(query);
     const path = `/cosmwasm/wasm/v1/contract/${contractAddr}/smart/${qb}`;
     const qLabel = label || `${contractAddr.slice(0,12)} ${JSON.stringify(query).slice(0,40)}`;
+    // Some failures are definitional (contract doesn't implement this query) —
+    // retrying or trying the fallback LCD won't help, and the warnings spam
+    // the log. Detect these once and silently return null.
+    const isDefinitionalFailure = (errMsg) =>
+        errMsg && (errMsg.includes('unknown variant') || errMsg.includes('not supported query'));
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
             const r = await fetchJson(TERRA_LCD_PRIMARY + path, `${qLabel} (primary try ${attempt})`);
             return r.data;
         } catch (e) {
+            if (isDefinitionalFailure(e.message)) return null; // don't retry, don't warn
             if (attempt < 2) await new Promise(res => setTimeout(res, 200 + Math.random() * 300));
             else console.warn(`  ⚠ primary failed: ${e.message}`);
         }
@@ -103,6 +109,7 @@ async function queryContract(contractAddr, query, label) {
         const r = await fetchJson(TERRA_LCD_FALLBACK + path, `${qLabel} (fallback)`);
         return r.data;
     } catch (e) {
+        if (isDefinitionalFailure(e.message)) return null; // don't warn
         console.warn(`  ⚠ fallback failed: ${e.message}`);
         return null;
     }
@@ -692,6 +699,48 @@ function relocateSkeletonSourceData(ssIdx, ssData, lpToUnderlyings) {
     return { relocated, mismatches };
 }
 
+// Synthesize SS source entries for underlyings of SS-architecture pools.
+//
+// The relocateSkeletonSourceData function above handles the case where SS API
+// returns wrong denoms — but it can only relocate data that's IN ssIdx to
+// begin with. The empirical result after Rev 0.15: SS API simply doesn't
+// return metadata for some tokens (USDC, ATOM, dATOM specifically) that are
+// nonetheless in SS pools per on-chain pair{} queries. The token data we
+// DO need (symbol/decimals/logo) is available from other sources — cosmos
+// chain registry, Eris prices, Astroport. What's missing is the "SS knows
+// about this token too" signal.
+//
+// This function adds that signal. For each pool whose architecture identifies
+// it as a Skeleton Swap pool (contract starts with white_whale), mark each
+// on-chain underlying with a synthesized SS source entry IF it doesn't
+// already have one. The entry includes a `_synthesized` flag so consumers
+// can distinguish on-chain-inferred SS membership from API-fetched metadata.
+//
+// Requires `pools` to already have `architecture` attached (i.e. call this
+// after the pool.architecture attach loop). Uses scope.lpToArchitecture as
+// authoritative since it's keyed by LP address.
+function ensureSkeletonSourceForArchitecturePools(ssIdx, pools, lpToUnderlyings) {
+    let added = 0;
+    for (const p of pools) {
+        const arch = p.architecture;
+        if (!arch || arch.dex !== 'Skeleton Swap') continue;
+        const lpAddr = (p.asset_raw || {}).cw20 || (p.asset_raw || {}).native;
+        if (!lpAddr) continue;
+        const underlyings = lpToUnderlyings[lpAddr];
+        if (!Array.isArray(underlyings)) continue;
+        for (const u of underlyings) {
+            if (ssIdx[u]) continue; // already has real SS data, don't overwrite
+            ssIdx[u] = {
+                _synthesized: true,
+                _reason: 'underlying of SS pool per on-chain pair{} + cw2 contract name',
+                is_in_ss_pool: true,
+            };
+            added++;
+        }
+    }
+    return added;
+}
+
 function indexAmplpMapping(assetConfigs) {
     const mapping = {};
     const lpToAmplp = {};
@@ -934,31 +983,53 @@ async function buildLpUniverse(pools) {
         // pair_type comes in two shapes across Astroport versions:
         //   string:  "constant_product" | "stable" | "concentrated"
         //   object:  { xyk: {} } | { stable: {} } | { concentrated: {} }
+        // Normalize pair_type. Different Astroport contract versions return:
+        //   - "constant_product" / "stable" / "concentrated" — preferred names
+        //   - { xyk: {} } / { stable: {} } / { concentrated: {} } — object form
+        //   - "custom" — astroport-pair-concentrated v1.2.x uses this generic label
+        //   - "stable_swap" — older stable pair versions
+        //   - "xyk" — some older xyk variants
+        // Normalize to one of: constant_product | stable | concentrated.
         const pairType = typeof pairTypeRaw === 'string'
             ? pairTypeRaw
             : (pairTypeRaw && typeof pairTypeRaw === 'object' ? Object.keys(pairTypeRaw)[0] : null);
+        let normalizedPairType = pairType;
+        if (pairType === 'custom' && contractName && contractName.includes('concentrated')) {
+            normalizedPairType = 'concentrated';
+        } else if (pairType === 'stable_swap') {
+            normalizedPairType = 'stable';
+        } else if (pairType === 'xyk') {
+            normalizedPairType = 'constant_product';
+        }
         // Normalize the contract identity. cw2 typically returns names like
         // "crates.io:astroport-pair" or "crates.io:white_whale-pool" — strip the
         // crate prefix for cleaner display while keeping the identifying suffix.
         let contractName = cw2?.contract || null;
         if (contractName && contractName.startsWith('crates.io:')) contractName = contractName.slice(10);
-        // Determine DEX label from contract name. Falls back to "unknown" so
-        // the page can decide whether to surface or hide.
+        // Determine DEX label from contract name. Only recognized DEX contract
+        // families get a label; everything else stays null. Eris compounder
+        // vault contracts (eris-alliance-hub-lst, etc.) respond to pair{}
+        // queries with self-referential data but they're NOT actual DEX pairs
+        // — they're single-asset auto-compounders. Labeling them as a DEX
+        // would confuse downstream consumers (Member Stats would think the
+        // user has an LP position there, etc.). Leave dex null in those cases.
         let dexLabel = null;
         if (contractName) {
             if (contractName.startsWith('white_whale')) dexLabel = 'Skeleton Swap';
             else if (contractName.startsWith('astroport')) dexLabel = 'Astroport';
-            else dexLabel = contractName;
+            // No fallback to contractName — non-DEX contracts (Eris vaults, etc.)
+            // shouldn't masquerade as DEXes. They still get their `contract`
+            // and `version` populated for transparency.
         }
         lpToArchitecture[lpAddr] = {
             pair_address: pairAddr,
-            pair_type: pairType,                      // 'xyk' | 'stable' | 'concentrated' etc.
+            pair_type: normalizedPairType,            // 'constant_product' | 'stable' | 'concentrated'
             contract: contractName,                   // 'astroport-pair' | 'white_whale-pool' etc.
             version: cw2?.version || null,            // '1.5.0' | '1.3.8' etc.
-            dex: dexLabel,                            // 'Astroport' | 'Skeleton Swap' | other
+            dex: dexLabel,                            // 'Astroport' | 'Skeleton Swap' | null
         };
-        if (contractName && pairType) stats.archResolved++;
-        else if (pairType) stats.archPartial++;
+        if (contractName && normalizedPairType) stats.archResolved++;
+        else if (normalizedPairType) stats.archPartial++;
 
         const u = [];
         for (const info of pairResp.asset_infos) {
@@ -2496,14 +2567,29 @@ function findUnmapped({ tokens }) {
 // -----------------------------------------------------------------------------
 
 function computeDataFingerprint(snapshot) {
+    // Stable per-pool summary. Include architecture contract name + version
+    // since those should be deterministic once cw2 contract_info works. If
+    // they vanish or change unexpectedly, freshness check catches it.
     const items = (snapshot.pools || [])
-        .map(p => [p.gauge_pool_id, p.bucket, p.distribution_pct])
+        .map(p => [
+            p.gauge_pool_id,
+            p.bucket,
+            p.distribution_pct,
+            (p.architecture || {}).contract || null,
+            (p.architecture || {}).version || null,
+        ])
         .sort((a, b) => a[0].localeCompare(b[0]));
     const input = JSON.stringify({
         epoch: snapshot.canonicalEpoch,
         directory_size: Object.keys(snapshot.directory || {}).length,
         tokens_count: Object.keys(snapshot.tokens || {}).length,
         contracts_count: Object.keys(snapshot.contracts_catalog || {}).length,
+        // wallets count — when discovery picks up new stakers this changes
+        wallets_count: Object.keys(snapshot.wallets_catalog || {}).length,
+        // amplp coverage
+        amplp_count: Object.keys(snapshot.amplp_mappings || {}).length,
+        // architecture coverage stats (catches regressions to Rev 0.14 broken state)
+        arch_resolved_count: (snapshot.pools || []).filter(p => p.architecture && p.architecture.contract).length,
         pools: items,
     });
     return crypto.createHash('sha256').update(input).digest('hex').slice(0, 12);
@@ -2724,6 +2810,17 @@ async function main() {
         if (ssReloc.mismatches.length > 10) {
             console.log(`   ... and ${ssReloc.mismatches.length - 10} more`);
         }
+    }
+
+    // SS source synthesis: for SS-pool underlyings that don't have any SS
+    // metadata in ssIdx (because SS API doesn't return data for them), mark
+    // them as known-to-SS based on on-chain truth. This fills the
+    // "sources.skeletonswap" field with a synthesized stub so consumers see
+    // "yes, SS has a pool with this token" — even when SS's own API didn't
+    // expose token-level metadata.
+    const ssSynthAdded = ensureSkeletonSourceForArchitecturePools(ssIdx, allPools, universe.lpToUnderlyings);
+    if (ssSynthAdded > 0) {
+        console.log(`🔧 SS source synthesis: marked ${ssSynthAdded} on-chain SS-pool underlyings as known-to-SS (no API metadata available, but pair contract confirms membership)`);
     }
 
     console.log('\n🧬 Building catalog (scope-filtered)...');
