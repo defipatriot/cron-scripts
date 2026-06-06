@@ -164,3 +164,17 @@ cron-scripts/chain/
 ├── tla-participants/  ← Layer 3 — voter/locker/staker enumeration
 └── tla-rollups/       ← Layer 4 — pure functions of 0-3
 ```
+
+## Recent changes
+
+Authoritative Rev-by-Rev log is at `defipatriot/website-adao-core/catalog-log.md`. Brief summary of the last several:
+
+- **Rev 0.16 (2026-06-06)** — Phase 0 lock-in. 5 polish fixes: Eris vault no longer labeled as DEX; `pair_type` normalized to canonical names; `queryContract` recognizes definitional failures (no retry/warn for "unknown variant" / "not supported query"); SS source synthesis for tokens missing from SS API; freshness fingerprint expanded to include architecture data.
+- **Rev 0.15 (2026-06-06)** — Critical fix: contract architecture via cw2 **raw storage** query (`/raw/contract_info`) instead of broken `{contract_version: {}}` smart query. New helper `queryContractRaw()`. Result: 0 → 72 pools with full architecture; ~140 fewer error lines per run; runtime 120s → 77s. Also: SS indexer correction (relocate mislabeled denoms), avatar defensive ungating, curation candidates file.
+- **Rev 0.14 (2026-06-05)** — Pool architecture surfacing. Every pool gets `architecture: {pair_address, pair_type, contract, version, dex}` object. Closes the last major Phase 0 data gap.
+- **Rev 0.13 (2026-06-05)** — Wallet enrichment fully wired. 668/668 wallets get a meaningful `headline_name` (curated > PFPK > "{DAO} member" synthesized).
+- **Rev 0.12.x (2026-06-05)** — Token logo system (3-layer: curated > cron > page composite), URL audit hotfix, SHA-pinned curated file URLs (bypasses Fastly 5-min CDN cache).
+- **Rev 0.11 (2026-06-05)** — amplp classification fix. 65/65 amplps correctly typed with bucket inheritance.
+- **Rev 0.10 (2026-06-02)** — 10 systemic correctness fixes during audit night. Self-referential vault detection, dedup, missing amplp synthesis, source_coverage transparency block.
+
+Phase 0 (data foundation) is LOCKED IN as of Rev 0.16. Subsequent work (Member Stats, Portfolio Tracker, etc.) builds on this foundation without changes to catalog schema or contents.
