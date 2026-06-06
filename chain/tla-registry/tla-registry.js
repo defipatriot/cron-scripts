@@ -108,6 +108,51 @@ async function queryContract(contractAddr, query, label) {
     }
 }
 
+// Read raw contract state at a specific key. Used for cw2 contract_info which
+// every cw2-compliant contract stores at the standard `contract_info` storage
+// key — accessible even when the contract doesn't expose `{contract_info: {}}`
+// as a smart query (which is the case for Astroport / White Whale pair contracts,
+// as Rev 0.14 discovered the hard way).
+//
+// Response shape from the LCD: `{ data: "<base64-encoded raw bytes>" }`. For
+// cw2-stored values, those bytes decode to JSON like
+// `{ contract: "crates.io:astroport-pair", version: "1.5.0" }`.
+//
+// Returns the decoded value on success; null on any failure. Quiet-by-default
+// (suppresses retry warnings) since we expect some contracts to legitimately
+// not be cw2-compliant and we don't want noise like Rev 0.14 produced.
+async function queryContractRaw(contractAddr, storageKey, label) {
+    const keyB64 = Buffer.from(storageKey, 'utf-8').toString('base64');
+    const path = `/cosmwasm/wasm/v1/contract/${contractAddr}/raw/${keyB64}`;
+    const qLabel = label || `${contractAddr.slice(0,12)} raw[${storageKey}]`;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const r = await fetchJson(TERRA_LCD_PRIMARY + path, `${qLabel} (primary try ${attempt})`);
+            if (!r?.data) return null;  // key doesn't exist
+            // Decode the base64-wrapped bytes
+            try {
+                const bytes = Buffer.from(r.data, 'base64').toString('utf-8');
+                return JSON.parse(bytes);
+            } catch { return null; }
+        } catch (e) {
+            // Quiet by default — we expect some contracts to legitimately not be
+            // cw2-compliant. Don't spam the log like Rev 0.14's contract_version
+            // smart query did.
+            if (attempt < 2) await new Promise(res => setTimeout(res, 200 + Math.random() * 300));
+        }
+    }
+    try {
+        const r = await fetchJson(TERRA_LCD_FALLBACK + path, `${qLabel} (fallback)`);
+        if (!r?.data) return null;
+        try {
+            const bytes = Buffer.from(r.data, 'base64').toString('utf-8');
+            return JSON.parse(bytes);
+        } catch { return null; }
+    } catch (e) {
+        return null;
+    }
+}
+
 async function tryFetchJson(url, label) {
     try { return await fetchJson(url, label); }
     catch (e) {
@@ -589,6 +634,64 @@ function indexSkeletonSwap(ssData) {
     return idx;
 }
 
+// Relocate SS source data when SS API mislabels denoms.
+//
+// Background: SS's /api/pools sometimes returns wrong IBC denoms in
+// token_0/token_1 (most famously: "ATOM on Dungeon" at ibc/C3988DBA...
+// for pools whose pair{} contract actually holds standard ibc/27394FB0...
+// ATOM). When indexSkeletonSwap trusts those API claims, the SS source
+// data ends up indexed under denoms that don't exist in the chain. The
+// downstream scope check then drops those entries, so tokens like USDC,
+// ATOM, dATOM that ARE in SS pools end up with sources.skeletonswap = null
+// in the catalog — looking like SS doesn't know them when it does.
+//
+// This function fixes the attribution using the on-chain truth captured
+// in lpToUnderlyings (the output of pair{} queries in buildLpUniverse).
+// For each SS pool: compare SS's claimed underlyings against the chain's
+// underlyings. If a claim doesn't match anything on-chain, relocate the
+// SS metadata to the on-chain "orphan" (the address the chain has that
+// SS didn't claim). N-1-of-N matching is the common case (1 mislabel).
+//
+// Idempotent: runs again with same data, makes no changes. Adds a
+// `_relocated_from` marker on relocated entries for debuggability.
+function relocateSkeletonSourceData(ssIdx, ssData, lpToUnderlyings) {
+    if (!ssData?.pools || !lpToUnderlyings) return { relocated: 0, mismatches: [] };
+    const mismatches = [];
+    let relocated = 0;
+    for (const p of ssData.pools) {
+        const lpAddr = p.liquidity_token || p.lp_address || p.lp_token || p.lpAddress || p.share_token;
+        if (!lpAddr) continue;
+        const lpKey = lpAddr.startsWith('cw20:') ? lpAddr.slice(5) : lpAddr;
+        const onChainUnderlyings = lpToUnderlyings[lpKey];
+        if (!Array.isArray(onChainUnderlyings) || onChainUnderlyings.length !== 2) continue;
+
+        const stripCw20 = (d) => d && d.startsWith('cw20:') ? d.slice(5) : d;
+        const ssKeys = [p.token_0?.denom, p.token_1?.denom].filter(Boolean).map(stripCw20);
+        const chainSet = new Set(onChainUnderlyings);
+
+        for (const ssKey of ssKeys) {
+            if (chainSet.has(ssKey)) continue; // claim matches chain — nothing to do
+            // Mismatch: SS claims a key that's not in the on-chain underlyings.
+            // The orphan is whichever on-chain address SS DIDN'T claim.
+            const orphan = onChainUnderlyings.find(a => !ssKeys.includes(a));
+            if (!orphan) continue; // safety: no orphan to relocate to
+            if (!ssIdx[ssKey]) continue; // SS data wasn't actually indexed (already cleaned up)
+            // Move metadata to the on-chain address. Don't overwrite existing data —
+            // a previous SS pool might have correctly populated this same address.
+            if (!ssIdx[orphan]) {
+                ssIdx[orphan] = { ...ssIdx[ssKey], _relocated_from: ssKey };
+                delete ssIdx[ssKey];
+                relocated++;
+                mismatches.push({ pool_lp: lpKey, ss_claimed: ssKey, on_chain: orphan, symbol: ssIdx[orphan].symbol });
+            } else {
+                // Already have data at the orphan address — just drop the bad claim
+                delete ssIdx[ssKey];
+            }
+        }
+    }
+    return { relocated, mismatches };
+}
+
 function indexAmplpMapping(assetConfigs) {
     const mapping = {};
     const lpToAmplp = {};
@@ -809,17 +912,24 @@ async function buildLpUniverse(pools) {
 
         // Architecture capture. Two queries' info combined:
         //   1. pair{} (already done above) → pair_type: 'constant_product' | 'stable' | 'concentrated' | etc.
-        //   2. contract_version{} (new) → { contract: 'astroport-pair' | 'white_whale-pool' | ..., version: '1.5.0' }
+        //   2. cw2 contract_info via raw storage → { contract: 'crates.io:astroport-pair' | 'crates.io:white_whale-pool' | ..., version: '1.5.0' }
         //
-        // Why both: pair_type tells us AMM math (xyk/stable/CL); contract identity
+        // Why raw storage (not a smart query): Astroport pair, Astroport
+        // pair_concentrated, and White Whale pool contracts all reject
+        // `{contract_version: {}}` and `{contract_info: {}}` as smart queries
+        // — they don't include those in their QueryMsg enum. Rev 0.14 learned
+        // this the hard way (~140 error log lines per cron run, none of them
+        // actually gathering data). Every cw2-compliant contract DOES store
+        // `{contract, version}` at the standard raw storage key "contract_info"
+        // though, and we can read that directly via the /raw/ LCD endpoint
+        // — no QueryMsg routing involved. Rev 0.15 switches to this approach.
+        //
+        // pair_type tells us AMM math (xyk/stable/CL); contract identity
         // tells us the codebase (Astroport's official contracts vs White Whale's
         // contracts that Backbone Labs took over as Skeleton Swap). Users want
         // to see both — "Skeleton Swap (white_whale-pool v1.3.8) — concentrated"
         // is much clearer than just "constant_product".
-        //
-        // contract_version{} fails silently on some pools — that's fine, we leave
-        // version null and the page falls back to inference from name suffix.
-        const versionResp = await queryContract(pairAddr, { contract_version: {} }, `pair[${pairAddr.slice(-8)}].contract_version`).catch(() => null);
+        const cw2 = await queryContractRaw(pairAddr, 'contract_info', `pair[${pairAddr.slice(-8)}].cw2_info`);
         const pairTypeRaw = pairResp.pair_type;
         // pair_type comes in two shapes across Astroport versions:
         //   string:  "constant_product" | "stable" | "concentrated"
@@ -827,9 +937,13 @@ async function buildLpUniverse(pools) {
         const pairType = typeof pairTypeRaw === 'string'
             ? pairTypeRaw
             : (pairTypeRaw && typeof pairTypeRaw === 'object' ? Object.keys(pairTypeRaw)[0] : null);
+        // Normalize the contract identity. cw2 typically returns names like
+        // "crates.io:astroport-pair" or "crates.io:white_whale-pool" — strip the
+        // crate prefix for cleaner display while keeping the identifying suffix.
+        let contractName = cw2?.contract || null;
+        if (contractName && contractName.startsWith('crates.io:')) contractName = contractName.slice(10);
         // Determine DEX label from contract name. Falls back to "unknown" so
         // the page can decide whether to surface or hide.
-        const contractName = versionResp?.contract || null;
         let dexLabel = null;
         if (contractName) {
             if (contractName.startsWith('white_whale')) dexLabel = 'Skeleton Swap';
@@ -840,7 +954,7 @@ async function buildLpUniverse(pools) {
             pair_address: pairAddr,
             pair_type: pairType,                      // 'xyk' | 'stable' | 'concentrated' etc.
             contract: contractName,                   // 'astroport-pair' | 'white_whale-pool' etc.
-            version: versionResp?.version || null,    // '1.5.0' | '1.3.8' etc.
+            version: cw2?.version || null,            // '1.5.0' | '1.3.8' etc.
             dex: dexLabel,                            // 'Astroport' | 'Skeleton Swap' | other
         };
         if (contractName && pairType) stats.archResolved++;
@@ -2034,14 +2148,22 @@ async function enrichWalletsWithPfpkNames(wallets) {
             });
             if (!r.ok) return;
             const data = await r.json();
+            // Capture name and avatar independently. PFPK allows users to set
+            // either, both, or neither — registering just an avatar is allowed
+            // even without a name. The earlier gating logic (avatar inside
+            // `if (data?.name)`) would lose those cases. As of 2026-06-05
+            // the count is 0, but the defensive ungating prevents the bug
+            // class from coming back later as the user base expands.
             if (data?.name) {
                 w.daodao_name = data.name;
-                // Capture the avatar URL too if present (lets the UI render it later)
-                if (data.nft?.imageUrl) {
-                    w.daodao_avatar = data.nft.imageUrl;
-                }
                 namesFound++;
             }
+            if (data?.nft?.imageUrl) {
+                w.daodao_avatar = data.nft.imageUrl;
+            }
+            // (intentionally not counting avatar-only captures in namesFound —
+            // they're displayed via avatar, not via a name, so the metric stays
+            // accurate to "wallets we know a real name for")
         } catch (e) { /* silent — name lookups are best-effort */ }
     });
     return { totalLookups: candidates.length, namesFound };
@@ -2585,6 +2707,24 @@ async function main() {
         whitelist_buckets_checked:  extraPoolsResult.stats.contractsChecked,
         whitelist_buckets_succeeded: extraPoolsResult.stats.contractsSucceeded,
     };
+
+    // SS indexer correction: relocate source data from SS-mislabeled denoms
+    // to the on-chain truth captured by the pair{} queries earlier.
+    // Background: SS API returns wrong denoms for some IBC tokens (most
+    // notable: "ATOM on Dungeon" at ibc/C3988DBA... when the pair contract
+    // actually holds standard ibc/27394FB0... ATOM). Without this fix,
+    // tokens like USDC, ATOM, dATOM in SS pools end up with
+    // sources.skeletonswap = null even though SS does know them.
+    const ssReloc = relocateSkeletonSourceData(ssIdx, external.skeletonswap_pools, universe.lpToUnderlyings);
+    if (ssReloc.relocated > 0) {
+        console.log(`\n🔧 SS indexer correction: relocated ${ssReloc.relocated} source entries to on-chain addresses`);
+        for (const m of ssReloc.mismatches.slice(0, 10)) {
+            console.log(`   ${m.symbol || '?'}: SS claimed ${m.ss_claimed.slice(0, 25)}... → chain says ${m.on_chain.slice(0, 25)}...`);
+        }
+        if (ssReloc.mismatches.length > 10) {
+            console.log(`   ... and ${ssReloc.mismatches.length - 10} more`);
+        }
+    }
 
     console.log('\n🧬 Building catalog (scope-filtered)...');
     const tokens = buildTokenCatalog({ pools: allPools, chainRegIdx, erisIdx, astroIdx, ssIdx, amplpInfo, curated, scopeAddrs, lpToUnderlyings: universe.lpToUnderlyings, cgList: external.coingecko_list });
