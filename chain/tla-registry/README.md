@@ -1,180 +1,127 @@
-# tla-registry (cron source) — v2.0
+# cron-scripts
 
-**Layer 0 of the TLA chain-native data pipeline.**
-Now produces a full ecosystem catalog (tokens + contracts + wallets +
-acquisition guides) by merging chain queries + external registries + curated data.
+Source code for every production cron that powers `thealliancedao.com`.
 
-This is the script source. It writes its output to:
-`defipatriot/tla-chain-registry/2026/`.
+Each cron lives in its own folder with its own README. This top-level README is an index — start here to find what you need.
 
-> **Naming note:** the source folder is `chain/tla-registry/` (short) but the
-> data repo is `tla-chain-registry` (descriptive). Folder and repo names
-> deliberately differ.
+## How the system fits together
 
-## What it does
+```
+defipatriot/cron-scripts (this repo)
+   ├── one folder per cron (source code)
+   └── Render runs each on its own schedule
 
-Reads from THREE kinds of sources, merges by Terra address, publishes a unified catalog.
+       ↓ each cron writes to its own data repo
 
-### Chain queries (Q1-Q6)
+defipatriot/<cron-name>-data_2026  (one per cron)
+   ├── 2026/data/<cron-name>.json     ← current snapshot
+   ├── 2026/heartbeat.json            ← freshness signal
+   └── 2026/daily/YYYY-MM-DD.json     ← per-day archive
 
-| # | Contract | Query | Purpose |
+       ↓ pages on thealliancedao.com read directly from raw.githubusercontent.com
+
+defipatriot/aDAO-links-site  (the live website)
+   └── pages render from the data repos via fetch()
+```
+
+No backend server. No database. Each cron is independent — a failure in one doesn't break the rest. Pages cache last-good data and degrade gracefully.
+
+## Cron inventory
+
+### 🟢 Active production crons (10)
+
+| Folder | Writes to | Cadence | Purpose |
 |---|---|---|---|
-| 1 | global-config | `all_addresses` | Master contract directory (bootstrap) |
-| 2 | asset-gauge | `distributions` | Pool registry (gauge_pool_id, bucket, share %) |
-| 3 | asset-gauge | `last_distribution_period` | Canonical current epoch |
-| 4 | asset-gauge | `config` | Gauge list, global_config_addr, rebase asset |
-| 5 | voting-escrow | `num_tokens` | Sanity ping |
-| 6 | asset-compounder | `asset_configs` | amplp ↔ LP mapping (NEW in v2) |
+| `adao-positions/` | `adao-positions-data_2026` | Daily 01:00 UTC* | Member position snapshots (16 positions × all members) — foundation for Portfolio Tracker |
+| `astroport/` | `astroport-pool-data_2026` | Daily | Astroport pool stats (liquidity, APR, volume) |
+| `bribes-history/` | `bribes-data_2026` | Daily | Bribes per epoch — voting incentive history |
+| `marketplace-stats/` | `marketplace-data_2026` | Daily | NFT marketplace activity for Pixel Lions |
+| `network-and-prices/` | `network-and-prices-data_2026` | Daily | Token prices, chain stats, ASTRO etc. (the page-wide price source) |
+| `nft-inventory/` | `nft-inventory-data_2026` | Daily | Pixel Lions ownership distribution (replacing deving.zone) |
+| `skeletonswap-lp_data/` | `ss-pool-data_2026` | Daily | Skeleton Swap pool stats |
+| `tla-snapshot/` | `tla-snapshot-data_2026` | Daily 23:00 UTC Sun, 00:00 UTC other days | TLA gauge state at epoch boundaries — votes, distributions, APRs |
+| `tla-vp-holders/` | `tla-snapshot-data_2026` (subdirectory) | Daily | Per-wallet veLUNA holdings — voting power resolution |
+| `votion/` | `votion-data_2026` | Daily | Votion bribes market — current epoch incentive offers |
+| `chain/tla-registry/` | `tla-chain-registry` (no `_2026` — separate convention) | Daily 00:05 UTC | **The TLA ecosystem catalog** — 173 tokens, 75 pools, 65 amplps, 668 wallets with cross-source reconciliation. See `chain/tla-registry/README.md`. |
 
-Only the global-config address is hardcoded. Everything else discovered.
+\* `adao-positions` is currently scheduled `0 1 * * 1` (weekly Mondays). Needs to change to `0 1 * * *` (daily) — tracked in `CHANGES_PENDING.md` P1.
 
-### External sources (each optional)
+### 🟡 Legacy / retired folders (in this repo for history)
 
-If any single one fails, the catalog still publishes using the rest. Status becomes `partial`.
+| Folder | Status | Notes |
+|---|---|---|
+| `ampcapa/` | Last update 2026-04. No README. | Early experiment with ampCAPA-specific tracking — superseded by general `adao-positions` enumeration |
+| `backing/` | Last update 2026-04. No README. | Early experiment with treasury backing analysis — superseded |
+| `fuel/` | Last update 2026-05-30. No README. | Status unclear; not currently scheduled on Render |
 
-- **Cosmos Chain Registry** (`raw.githubusercontent.com/cosmos/chain-registry`) — 58 Terra2 assets with CoinGecko IDs, IBC traces, decimals
-- **Eris prices** (`backend.erisprotocol.com/prices`) — canonical display names
-- **Astroport REST** (`app.astroport.fi/api/pools`)
-- **Skeleton Swap** (`dex.warlock.backbonelabs.io/api/pools/phoenix-1`)
+These are kept for git history. They are NOT running as production crons. If you find yourself looking at one of these for active work, you're probably in the wrong folder.
 
-### Curated files (in the same data repo, edit via GitHub UI)
+### 📁 Root-level orphan files (safe to delete)
 
-The cron pulls these from `defipatriot/tla-chain-registry/curated/` each run:
+| File | Why it's there | Action |
+|---|---|---|
+| `tla-chain-registry.js` (root) | Old v1.0 catalog cron file from before the rename + folder move. | Delete — the current catalog cron is at `chain/tla-registry/tla-registry.js`. |
+| `tla-registry.js` (root) | Accidentally uploaded to root instead of `chain/tla-registry/` during a deploy. The chain/ path is what Render reads. | Delete — root copy is a stale duplicate. |
 
-- `categories.json` — taxonomy
-- `wallets.json` — known wallet labels
-- `protocols.json` — protocol metadata
-- `known_contracts.json` — contract labels (seeded from aDAO registry)
-- `token_overrides.json` — display name preferences
-- `acquisition_guides.json` — how to safely acquire each token
+## Conventions used across crons
 
-See `defipatriot/tla-chain-registry/curated/README.md` for the editing guide.
+### Data write pattern
 
-## Output schema (`current.json` v2)
+Every cron writes three files to its data repo per run:
 
-```jsonc
-{
-  "schemaVersion": 2,
-  "canonicalEpoch": 187,
+1. `2026/data/<cron-name>.json` — the latest snapshot (overwrites)
+2. `2026/heartbeat.json` — freshness signal (`{schemaVersion, capturedAt, runId, runMode, currentEpoch, status, next_expected_run_at, ...}`)
+3. `2026/daily/YYYY-MM-DD.json` — per-day archive (one file per UTC day, never overwritten)
 
-  // Chain-derived
-  "directory": { "ASSET_GAUGE": "terra1...", ... },
-  "pools": [ {gauge_pool_id, bucket, distribution_pct, ...} ],
-  "buckets": {...},
+The page-side `cron-health` widget reads heartbeat.json from each repo and shows green/yellow/red based on `next_expected_run_at` vs. current time.
 
-  // Catalog
-  "tokens": {
-    "<terra_address>": {
-      "address", "type", "category", "subtype",
-      "symbol", "display_name", "decimals",
-      "coingecko_id", "coingecko_match",
-      "sources": { cosmos_chain_registry, eris, astroport, skeletonswap },
-      "bridge": { source_chain, original_denom, channel_id, via },
-      "appears_in": { tla_pools_count, tla_pools, is_lockable, is_amplp_underlying },
-      "wallet_import": { symbol, name, decimals, address },
-      "scoring": { confusion_score, flags },
-      "override": null,                  // from token_overrides.json
-      "acquisition": null,               // from acquisition_guides.json
-      "related_variants": []             // other token addrs sharing base symbol
-    }
-  },
-  "amplp_mappings": { "<amplp_denom>": { underlying_lp_address, bucket, ... } },
-  "lp_to_amplp": { "<lp>": "<amplp_denom>" },
-  "contracts_catalog": { "<addr>": { label, protocol, category, subtype, source } },
-  "wallets_catalog":   { "<addr>": { label, subtype, ... } },
-  "protocols": {...},
-  "categories": {...},
+### Failure semantics
 
-  // Worklist
-  "_unmapped": { tokens: [...], contracts: [], wallets: [] },
+- **Both LCDs unreachable** → exit clean (1 or 2), no GitHub write. Last good snapshot stays in place.
+- **Watchdog** → most crons have a hard runtime ceiling (5-10 min) to prevent runaway costs.
+- **External source fails** → record in `source_errors` / `_errors[]`, snapshot publishes with what DID succeed, status becomes `partial`.
+- **Required source fails** → fatal, exit non-zero, no publish.
 
-  // Raw chain responses preserved
-  "raw": {...}
-}
-```
+Status values in heartbeat: `ok` | `partial` | `error` | (occasionally `skipped` if scheduling logic decided to no-op).
 
-## Deploy on Render
+### Environment variables
 
-| Field | Value |
+Every cron expects:
+- `GITHUB_TOKEN` — write access to its data repo
+- `GITHUB_REPO` — destination data repo (e.g. `defipatriot/adao-positions-data_2026`)
+- `GITHUB_BRANCH` — defaults to `main`
+
+Catalog cron (`chain/tla-registry/`) additionally uses:
+- `TERRA_LCD_PRIMARY` (default `https://terra-lcd.publicnode.com`)
+- `TERRA_LCD_FALLBACK` (default `https://terra-rest.publicnode.com`)
+- `GLOBAL_CONFIG_ADDR` (the bootstrap contract — should never change)
+
+## Where to find more detail
+
+| Question | Where to look |
 |---|---|
-| Service type | Cron Job |
-| Name | `tla-registry-v2` |
-| Region | Oregon (matches other crons) |
-| Schedule | `5 0 * * *` (daily 00:05 UTC) |
-| Source repo | `defipatriot/cron-scripts` |
-| Root directory | `chain/tla-registry` |
-| Build command | `npm install` |
-| Start command | `node tla-registry.js` |
+| What does cron X do specifically? | `<cron-folder>/README.md` |
+| Recent changes per cron? | "Recent changes" section in each cron's README |
+| The catalog system's Rev history? | `defipatriot/website-adao-core/catalog-log.md` |
+| Cross-cutting architecture, design principles? | `defipatriot/website-adao-core/PROJECT_KNOWLEDGE.md` |
+| What's pending to work on? | `defipatriot/website-adao-core/CHANGES_PENDING.md` |
+| Per-page dashboard changes? | `defipatriot/website-adao-core/{index,tla,dao,lore,explorer}-log.md` |
+| Top-level changelog for THIS repo? | `CHANGELOG.md` (same folder as this README) |
 
-### Env vars (required)
+## Deploy notes
 
-| Var | Value |
-|---|---|
-| `GITHUB_TOKEN` | Token with write access to `defipatriot/tla-chain-registry` |
-| `GITHUB_REPO` | `defipatriot/tla-chain-registry` |
+All crons run on **Render** as scheduled cron jobs in the **Oregon** region. Each Render service points at this repo with a specific `Root directory` (the cron folder). Build command is `npm install`, start command is `node <script>.js`.
 
-### Env vars (optional, defaults baked in)
+Adding a new cron:
+1. Create the folder + README + script + `package.json` here
+2. Create a new GitHub data repo with the `_2026` suffix (use the `2026/` year-folder convention)
+3. Create a Render cron service pointing at the folder
+4. Set env vars (GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRANCH)
+5. Verify first run writes heartbeat.json + data file
+6. Add to the cron-health widget on the dashboard
 
-| Var | Default |
-|---|---|
-| `GITHUB_BRANCH` | `main` |
-| `TERRA_LCD_PRIMARY` | `https://terra-lcd.publicnode.com` |
-| `TERRA_LCD_FALLBACK` | `https://terra-rest.publicnode.com` |
-| `GLOBAL_CONFIG_ADDR` | `terra1hwxg6s732eparz3ys7sa4t5f64ngpd2w8syrca6z7ckv3fs9uqnsvrpcqa` |
+## Operational status
 
-## Local test
+10 production crons running on schedule as of 2026-06-06. Catalog cron (`chain/tla-registry/`) at Rev 0.15 deployed; Rev 0.16 packaged but not yet deployed (Phase 0 lock-in). All other crons stable.
 
-```bash
-# Without GITHUB_TOKEN, prints summary instead of pushing
-node tla-registry.js
-```
-
-## Failure modes
-
-- **Both LCDs unreachable** → exit 1, no GitHub write, old snapshot stays.
-- **Watchdog (5 min ceiling)** → exit 2.
-- **External source fails** (chain-registry / Eris / Astroport / SS) → recorded in `source_errors`, snapshot still publishes with remaining sources, status=`partial`.
-- **Missing curated file** → cron continues without it.
-- **`global-config.all_addresses` returns null** → fatal; can't proceed.
-
-## Why this design
-
-Per `CRON-FIXES-BRIEF` Parts 5.1 + 5.0:
-- Layer 0 = discovery / bootstrap / catalog (this).
-- Layer 1 = pricing (next session).
-- Layer 2 = entities (pools reserves, locks, staking).
-- Layer 3 = participants.
-- Layer 4 = rollups.
-
-**Address-first** identity is non-negotiable: the wBTC.atom vs wBTC.axl
-case proves that names lie but addresses don't. Names from sources
-become metadata; the catalog primary key is always the Terra address.
-
-**Catalog merging is layered**: chain registry → Eris → Astroport → SS →
-pool participation → amplp → curated overrides → acquisition guides →
-scoring. Each stage non-destructively augments. Eris wins on display name.
-
-## Future siblings
-
-```
-cron-scripts/chain/
-├── tla-registry/      ← Layer 0 (this) — discovery + catalog
-├── tla-pricing/       ← Layer 1 — multi-source token prices
-├── tla-pools/         ← Layer 2 — pool entities (reserves, APR)
-├── tla-participants/  ← Layer 3 — voter/locker/staker enumeration
-└── tla-rollups/       ← Layer 4 — pure functions of 0-3
-```
-
-## Recent changes
-
-Authoritative Rev-by-Rev log is at `defipatriot/website-adao-core/catalog-log.md`. Brief summary of the last several:
-
-- **Rev 0.16 (2026-06-06)** — Phase 0 lock-in. 5 polish fixes: Eris vault no longer labeled as DEX; `pair_type` normalized to canonical names; `queryContract` recognizes definitional failures (no retry/warn for "unknown variant" / "not supported query"); SS source synthesis for tokens missing from SS API; freshness fingerprint expanded to include architecture data.
-- **Rev 0.15 (2026-06-06)** — Critical fix: contract architecture via cw2 **raw storage** query (`/raw/contract_info`) instead of broken `{contract_version: {}}` smart query. New helper `queryContractRaw()`. Result: 0 → 72 pools with full architecture; ~140 fewer error lines per run; runtime 120s → 77s. Also: SS indexer correction (relocate mislabeled denoms), avatar defensive ungating, curation candidates file.
-- **Rev 0.14 (2026-06-05)** — Pool architecture surfacing. Every pool gets `architecture: {pair_address, pair_type, contract, version, dex}` object. Closes the last major Phase 0 data gap.
-- **Rev 0.13 (2026-06-05)** — Wallet enrichment fully wired. 668/668 wallets get a meaningful `headline_name` (curated > PFPK > "{DAO} member" synthesized).
-- **Rev 0.12.x (2026-06-05)** — Token logo system (3-layer: curated > cron > page composite), URL audit hotfix, SHA-pinned curated file URLs (bypasses Fastly 5-min CDN cache).
-- **Rev 0.11 (2026-06-05)** — amplp classification fix. 65/65 amplps correctly typed with bucket inheritance.
-- **Rev 0.10 (2026-06-02)** — 10 systemic correctness fixes during audit night. Self-referential vault detection, dedup, missing amplp synthesis, source_coverage transparency block.
-
-Phase 0 (data foundation) is LOCKED IN as of Rev 0.16. Subsequent work (Member Stats, Portfolio Tracker, etc.) builds on this foundation without changes to catalog schema or contents.
+See `CHANGELOG.md` for revision history.
