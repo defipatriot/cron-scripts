@@ -3,6 +3,7 @@
 Captures full per-NFT state for the aDAO collection from on-chain truth. Replaces the dashboard's dependency on the third-party `deving.zone/nfts/alliance_daos.json` feed, which has known bugs (16 missing stakers, 54 stakers undercounted, DAODAO staking contract incorrectly listed as a 384-NFT user, no Atrium awareness).
 
 **Data repo:** `defipatriot/nft-inventory-data_2026`
+**Output path:** `data/v2/` (Rev B.2+) — the old `data/` folder is abandoned, see "Pre-Rev-B data" below
 **Render schedule:** `30 * * * *` (hourly at :30)
 **Runtime:** ~70 seconds per run
 
@@ -20,7 +21,7 @@ Phase by phase:
 
 Phases 3-7 run in parallel. Each is independently fallible — a failure in one (e.g., Atrium contract briefly unreachable) doesn't abort the others. The cron always ships SOMETHING, even if a sub-system is degraded.
 
-## Per-NFT record schema (data/nfts.json → records[i])
+## Per-NFT record schema (data/v2/nfts.json → records[i])
 
 ```jsonc
 {
@@ -76,10 +77,20 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 
 | File | Purpose | Update cadence |
 |---|---|---|
-| `data/nfts.json` | Per-NFT records (canonical full state) | Every run (~2.5 MB) |
-| `data/summary.json` | Aggregates + stakers + marketplaces + backing | Every run |
-| `data/heartbeat.json` | Freshness contract + stats | Every run |
-| `data/daily/<date>.json` | End-of-day snapshot (for movement/yield timeline) | Overwritten each run; last write of day wins |
+| `data/v2/nfts.json` | Per-NFT records (canonical full state) | Every run (~2.5 MB) |
+| `data/v2/summary.json` | Aggregates + stakers + marketplaces + backing | Every run |
+| `data/v2/heartbeat.json` | Freshness contract + stats | Every run |
+| `data/v2/daily/<date>.json` | End-of-day snapshot (for movement/yield timeline) | Overwritten each run; last write of day wins |
+
+## Pre-Rev-B data (abandoned)
+
+The `data/` folder (no `/v2/` subdir) contains pre-Rev-B output from when the cron had classification bugs (treasury mislabeled as enterprise, no Atrium awareness, no marketplace seller resolution, no backing data, etc.). **It's frozen as of 2026-06-07 and no longer updated.** Why we abandoned it instead of overwriting:
+
+1. **Historical archaeology** — at some point in the original cron's lifetime a bug was introduced. Going back through the daily snapshots, we may be able to identify when (e.g., when did `enterprise_count` first start being treasury-conflated?). Pre-bug data may still be valid.
+2. **Auditability** — the old data documents what the dashboard WAS showing. Useful to compare against the corrected data for any communications about why numbers changed.
+3. **Forward-only history reset accepted** — Rev B.2 starts fresh. We've lost continuous history. That's the cost of correctness; trying to retroactively fix wrong data is a worse trade.
+
+If you want to migrate or salvage pre-Rev-B data later, document the analysis in `cron-scripts/nft-inventory/README.md` under "Archaeology". Don't write to `data/` from the cron going forward.
 
 ## Critical contract addresses
 
@@ -96,21 +107,28 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 | Boost marketplace | `terra1kj7pasyahtugajx9qud02r5jqaf60mtm7g5v9utr94rmdfftx0vqspf4at` |
 | ampLUNA (cw20) | `terra1ecgazyd0waaj3g7l9cmy5gulhxkps2gmxu9ghducvuypjq68mq2s5lvsct` |
 
-## NFT count breakdown (verified live 2026-06-06)
+## NFT count breakdown (verified live 2026-06-07)
 
 ```
 10,000 total
-├─ 5,828 unminted    (DAO main wallet, all unbroken)
+├─ 5,828 unminted    (DAO main wallet, all unbroken — verified 0 broken)
 ├─   898 treasury    (DAO treasury contract, all broken — governance control)
 ├─     2 dao_8ywv    (small DAO wallet, broken)
 ├─   100 enterprise_dao_broken  (Enterprise contract, broken — DAO gov)
 ├─   403 enterprise_staked      (Enterprise contract, unbroken — real user stakes)
-├─ 1,661 daodao_staked         (DAODAO contract — has indexer for per-user attribution)
+├─ 1,661 daodao_staked         (DAODAO contract — of which ~65 are broken but
+│                               kept staked for VP; breaking only forfeits
+│                               FUTURE ampLUNA rewards, NFT + VP retained)
 ├─    43 bbl_listed
 ├─     1 atrium_listed
 ├─     4 boost_listed
-└─ ~1,060 user_held              (individual wallets, liquid)
+└─ ~1,060 user_liquid           (individual wallets — of which ~28 are broken
+                                 but kept by users for collection/VP)
 ```
+
+**DAO-controlled NFTs:** unminted (5,828) + treasury (898) + 8ywv (2) + enterprise DAO broken (100) = **6,828 total** (5,828 unbroken + 1,000 broken).
+
+**Important nuance on broken NFTs:** breaking an NFT (via `break_nft` execute) only forfeits future ampLUNA rewards from the daily Alliance reward stream. The owner keeps the NFT itself plus any voting power it confers. Some users break to claim their share and then re-stake the now-empty NFT on DAODAO for governance VP (65 NFTs in this state today). Some just hold them (28 in user wallets).
 
 ## Failure modes
 
@@ -132,5 +150,7 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 
 ## Rev history
 
+- **Rev B.2 (2026-06-07)** — Clean-break path migration. Output moved from `data/` → `data/v2/`. Pre-Rev-B data abandoned (had classification bugs). History reset accepted as the cost of accurate data going forward. Old folder retained for archaeology — see "Pre-Rev-B data" section above.
+- **Rev B.1 (2026-06-07)** — Polish micro-rev. Surfaced 3 metrics that were already classified internally but missing from heartbeat: `dao_wallet_8ywv_held` (the 2 broken NFTs at the small DAO wallet), `daodao_staked_broken` (NFTs broken-then-staked-on-DAODAO for VP), `user_held_broken` (broken NFTs kept in user wallets). Added `user_liquid_count` alias for `user_held_count` (clearer naming). No schema break — all new fields are additive. Console output now shows full breakdown during runs.
 - **Rev B (2026-06-06)** — Major expansion: corrected treasury vs Enterprise classification, added all 3 marketplaces with seller resolution, added backing/yield, added Enterprise stakers, daily snapshots. Schema bumped to v2.
 - **Rev A (2026-05-13)** — Initial deploy: per-NFT enumeration via `all_nft_info`, DAODAO stakers via indexer. Schema v1.

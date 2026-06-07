@@ -1,9 +1,24 @@
 // =============================================================================
-// NFT Inventory Cron — Rev B
+// NFT Inventory Cron — Rev B.2
 // =============================================================================
 //
 // Captures full per-NFT state for the aDAO collection from on-chain truth.
 // Replaces the dashboard's dependency on the third-party deving.zone feed.
+//
+// Rev B.2 (2026-06-07) — Clean-break path migration:
+//   • Output path moved from `data/` → `data/v2/` in the data repo. Old `data/`
+//     folder is abandoned (it contained pre-Rev-B data with classification bugs).
+//     Consumer pages must swap `/data/foo.json` → `/data/v2/foo.json`.
+//   • History reset accepted as the cost of accurate data going forward.
+//   • Old data files preserved in `data/` for archaeological review (find when
+//     bugs were introduced, salvage anything truthful before that point).
+//
+// Rev B.1 (2026-06-07) — Polish micro-rev:
+//   • Added `dao_wallet_8ywv_held` to heartbeat (was missing, only affected display).
+//   • Added `daodao_staked_broken` — broken NFTs staked on DAODAO. Insight: breaking
+//     an NFT only forfeits FUTURE ampLUNA rewards; owner keeps the NFT + voting power.
+//   • Added `user_held_broken` — broken NFTs held in individual wallets.
+//   • Added `user_liquid_count` alias for `user_held_count` (clearer naming).
 //
 // Rev B (2026-06-06) — Major expansion:
 //   • Fixed classification: Treasury (898 broken) was previously mislabeled as
@@ -15,15 +30,18 @@
 //   • Backing & yield: ampLUNA treasury balance + per-NFT share + boost-mechanic
 //     metrics. Daily snapshot enables future timeline tracking (Rev C).
 //
-// What it produces (uploaded to `nft-inventory-data_2026`):
+// What it produces (uploaded to `nft-inventory-data_2026` under `data/v2/`):
 //
-//   data/nfts.json       ← per-NFT records: { id, owner, real_owner, broken,
-//                          listing{...}, classification flags, ... }
-//                         (large file, ~10k entries, ~2.5 MB)
-//   data/summary.json    ← aggregate counts + per-holder breakdowns + backing
-//                          + marketplace stats + daodao_stakers + enterprise_stakers
-//   data/heartbeat.json  ← uniform freshness contract
-//   data/daily/<date>.json ← daily snapshot of summary (for movement/yield timeline)
+//   data/v2/nfts.json       ← per-NFT records: { id, owner, real_owner, broken,
+//                             listing{...}, classification flags, ... }
+//                             (large file, ~10k entries, ~2.5 MB)
+//   data/v2/summary.json    ← aggregate counts + per-holder breakdowns + backing
+//                             + marketplace stats + daodao_stakers + enterprise_stakers
+//   data/v2/heartbeat.json  ← uniform freshness contract
+//   data/v2/daily/<date>.json ← daily snapshot of summary (for movement/yield timeline)
+//
+// The OLD `data/` folder (pre-Rev-B) is ABANDONED. It contains pre-cleanup data with
+// classification bugs (treasury mislabeled, no Atrium, etc.). Retained for archaeology.
 //
 // Schedule: hourly at :30 (Render cron: `30 * * * *`)
 // Runtime:  ~70 seconds (10k chain queries + 3 marketplaces + enterprise + backing)
@@ -81,6 +99,14 @@ const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/nft-inventory-data_2026';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
+// Output path within the data repo. Rev B.2 (2026-06-07): moved from `data/` → `data/v2/`
+// to make a clean break from the pre-Rev-B data which had classification bugs (treasury
+// mislabeled as enterprise, no Atrium awareness, etc.). The old `data/` folder is
+// abandoned but retained for archaeological purposes — see "Pre-Rev-B data" in README.
+//
+// To migrate: any consumer page should swap `/data/foo.json` → `/data/v2/foo.json`.
+const OUTPUT_PATH = 'data/v2';
+
 // Sister cron data repos (read-only fetches for prices & catalog token metadata)
 // These are PUBLIC — no auth needed.
 const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/current.json';
@@ -107,7 +133,7 @@ async function fetchJson(url, label = url, timeoutMs = HTTP_TIMEOUT_MS) {
     try {
         const res = await fetch(url, {
             signal: controller.signal,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-nft-inventory/2.0' },
+            headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-nft-inventory/2.2' },
         });
         if (!res.ok) {
             const body = await res.text().catch(() => '');
@@ -801,6 +827,14 @@ function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, back
         boost_listed: 0,
         user_held: 0,
     };
+    // Broken sub-classifications (Rev B.1) — informational, NOT mutually exclusive with `counts`.
+    // These count broken-NFTs-within-a-bucket. Useful insight: people who broke their NFT to
+    // claim ampLUNA but kept it for VP / collection still appear in their staking bucket;
+    // they retain the NFT and voting power, only future rewards are forfeited.
+    const brokenSubCounts = {
+        daodao_staked_broken: 0,    // Staked on DAODAO AND broken (user broke then re-staked for VP)
+        user_held_broken: 0,        // Held in individual wallet AND broken (user broke and kept)
+    };
     const perOwnerCounts = {};       // raw owner → count
     const perRealOwnerCounts = {};   // resolved owner → count
     const perOwnerBroken = {};
@@ -811,6 +845,9 @@ function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, back
         for (const k of Object.keys(counts)) {
             if (r[k]) counts[k]++;
         }
+        // Broken sub-classifications (Rev B.1)
+        if (r.broken && r.daodao_staked) brokenSubCounts.daodao_staked_broken++;
+        if (r.broken && r.user_held)     brokenSubCounts.user_held_broken++;
         if (r.owner) {
             perOwnerCounts[r.owner] = (perOwnerCounts[r.owner] || 0) + 1;
             if (r.broken) perOwnerBroken[r.owner] = (perOwnerBroken[r.owner] || 0) + 1;
@@ -880,10 +917,18 @@ function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, back
         unbroken_count: unbroken,
         // New canonical classification counts
         ...Object.fromEntries(Object.entries(counts).map(([k, v]) => [k + '_count', v])),
+        // Broken sub-classifications (Rev B.1) — within-bucket broken counts
+        // These are subsets of their parent bucket, not new buckets:
+        //   daodao_staked_broken ⊂ daodao_staked   (broken-then-staked-for-VP)
+        //   user_held_broken     ⊂ user_held       (broken-and-kept)
+        // Insight: breaking an NFT only forfeits FUTURE rewards. Owner keeps the NFT
+        // and any VP from it. Some users claim then re-stake or just hold.
+        ...Object.fromEntries(Object.entries(brokenSubCounts).map(([k, v]) => [k + '_count', v])),
         // Backward-compat aliases for current dashboard JS
         unminted_count: counts.unminted,
         minted_count: total - counts.unminted,
         dao_held_count: counts.unminted, // alias kept for old code
+        user_liquid_count: counts.user_held, // Rev B.1 — clearer name (same value as user_held_count)
         // (note: old "enterprise_staked_count" semantics changed — was treasury_held, now real Enterprise stakes)
         // The Rev 2 page migration will use the new names directly.
 
@@ -913,7 +958,7 @@ function githubApiRequest(method, apiPath, body = null) {
             hostname: 'api.github.com', path: apiPath, method,
             headers: {
                 'Authorization': `token ${GITHUB_TOKEN}`,
-                'User-Agent':    'aDAO-nft-inventory/2.0',
+                'User-Agent':    'aDAO-nft-inventory/2.2',
                 'Accept':        'application/vnd.github.v3+json',
                 'Content-Type':  'application/json',
             },
@@ -1004,15 +1049,16 @@ async function captureSnapshot() {
     const summary = aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, backing, priceData);
     console.log(`  Unminted (DAO):      ${summary.unminted_count.toLocaleString()}`);
     console.log(`  Treasury (broken):   ${summary.treasury_held_count.toLocaleString()}`);
+    console.log(`  DAO wallet 8ywv:     ${summary.dao_wallet_8ywv_held_count.toLocaleString()} (broken, small DAO custody)`);
     console.log(`  Enterprise staked:   ${summary.enterprise_staked_count.toLocaleString()} (real user stakes)`);
     console.log(`  Enterprise DAO:      ${summary.enterprise_dao_broken_count.toLocaleString()} (DAO-controlled broken)`);
-    console.log(`  DAODAO staked:       ${summary.daodao_staked_count.toLocaleString()}`);
+    console.log(`  DAODAO staked:       ${summary.daodao_staked_count.toLocaleString()} (of which ${summary.daodao_staked_broken_count} broken, kept for VP)`);
     console.log(`  BBL listed:          ${summary.bbl_listed_count.toLocaleString()}`);
     console.log(`  Atrium listed:       ${summary.atrium_listed_count.toLocaleString()}`);
     console.log(`  Boost listed:        ${summary.boost_listed_count.toLocaleString()}`);
-    console.log(`  User-held:           ${summary.user_held_count.toLocaleString()}`);
-    console.log(`  Broken:              ${summary.broken_count.toLocaleString()}`);
-    console.log(`  Unbroken:            ${summary.unbroken_count.toLocaleString()}`);
+    console.log(`  User-liquid:         ${summary.user_liquid_count.toLocaleString()} (of which ${summary.user_held_broken_count} broken, kept individually)`);
+    console.log(`  Broken (total):      ${summary.broken_count.toLocaleString()}`);
+    console.log(`  Unbroken (total):    ${summary.unbroken_count.toLocaleString()}`);
     console.log(`  Unique real owners:  ${summary.unique_holders.toLocaleString()}`);
     console.log(`  DAO members:         ${summary.dao_members_count.toLocaleString()}`);
     if (summary.backing) {
@@ -1085,13 +1131,17 @@ async function captureSnapshot() {
             broken: summary.broken_count,
             unbroken: summary.unbroken_count,
             treasury_held: summary.treasury_held_count,
+            dao_wallet_8ywv_held: summary.dao_wallet_8ywv_held_count, // Rev B.1 — was missing from heartbeat
             enterprise_staked: summary.enterprise_staked_count,
             enterprise_dao_broken: summary.enterprise_dao_broken_count,
             daodao_staked: summary.daodao_staked_count,
+            daodao_staked_broken: summary.daodao_staked_broken_count, // Rev B.1 — broken-but-staked-on-DAODAO (kept for VP)
             bbl_listed: summary.bbl_listed_count,
             atrium_listed: summary.atrium_listed_count,
             boost_listed: summary.boost_listed_count,
             user_held: summary.user_held_count,
+            user_liquid: summary.user_liquid_count,           // Rev B.1 — clearer alias for user_held
+            user_held_broken: summary.user_held_broken_count, // Rev B.1 — broken-and-held-by-user (kept for collection/VP)
             unique_holders: summary.unique_holders,
             ampluna_balance: summary.backing?.ampluna_balance ?? null,
             per_nft_ampluna: summary.backing?.per_nft_ampluna ?? null,
@@ -1113,13 +1163,16 @@ async function captureSnapshot() {
         unbroken_count: summary.unbroken_count,
         unminted_count: summary.unminted_count,
         treasury_held_count: summary.treasury_held_count,
+        dao_wallet_8ywv_held_count: summary.dao_wallet_8ywv_held_count, // Rev B.1
         enterprise_staked_count: summary.enterprise_staked_count,
         enterprise_dao_broken_count: summary.enterprise_dao_broken_count,
         daodao_staked_count: summary.daodao_staked_count,
+        daodao_staked_broken_count: summary.daodao_staked_broken_count, // Rev B.1
         bbl_listed_count: summary.bbl_listed_count,
         atrium_listed_count: summary.atrium_listed_count,
         boost_listed_count: summary.boost_listed_count,
         user_held_count: summary.user_held_count,
+        user_held_broken_count: summary.user_held_broken_count, // Rev B.1
         backing: summary.backing,
         marketplaces: summary.marketplaces,
     };
@@ -1127,10 +1180,10 @@ async function captureSnapshot() {
     // ── Publish / save ──────────────────────────────────────────────────────
     if (GITHUB_TOKEN) {
         console.log('📤 Publishing to GitHub...');
-        await pushToGithub('data/nfts.json',      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs (rev B schema v2)`);
-        await pushToGithub('data/summary.json',   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.broken_count} broken / ${summary.bbl_listed_count + summary.atrium_listed_count + summary.boost_listed_count} listed`);
-        await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${status}`);
-        await pushToGithub(`data/daily/${dateKey}.json`, JSON.stringify(dailyDoc, null, 2), `daily snapshot — ${dateKey}`);
+        await pushToGithub(`${OUTPUT_PATH}/nfts.json`,      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs (rev B.2 schema v2)`);
+        await pushToGithub(`${OUTPUT_PATH}/summary.json`,   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.broken_count} broken / ${summary.bbl_listed_count + summary.atrium_listed_count + summary.boost_listed_count} listed`);
+        await pushToGithub(`${OUTPUT_PATH}/heartbeat.json`, JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${status}`);
+        await pushToGithub(`${OUTPUT_PATH}/daily/${dateKey}.json`, JSON.stringify(dailyDoc, null, 2), `daily snapshot — ${dateKey}`);
     } else {
         console.log('⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('nfts.json', JSON.stringify(nftsDoc));
