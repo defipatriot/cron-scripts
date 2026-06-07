@@ -81,6 +81,7 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 | `data/v2/summary.json` | Aggregates + stakers + marketplaces + backing | Every run |
 | `data/v2/heartbeat.json` | Freshness contract + stats | Every run |
 | `data/v2/daily/<date>.json` | End-of-day snapshot (for movement/yield timeline) | Overwritten each run; last write of day wins |
+| `data/v2/pending-claims.json` | DAODAO unstaked-but-unclaimed tracking (self-maintaining state) | Every run — cron adds/removes entries automatically |
 
 ## Pre-Rev-B data (abandoned)
 
@@ -140,6 +141,8 @@ If you want to migrate or salvage pre-Rev-B data later, document the analysis in
 | DAODAO indexer down | `daodao_stakers[]` empty | Warning logged |
 | ampLUNA balance query fails | `summary.backing = null` | Warning logged |
 | Sister cron data unavailable | USD prices null; token amounts still shown | Warning logged |
+| `total_power_at_height` query fails | Pending-claim count falls back to tracked (best-effort), `reconciled: null` | Warning logged |
+| Pending-claim tx-search fails | Per-wallet attribution stale; count still chain-truth (`custody − total_power`) | Warning logged; scan height not advanced |
 
 ## Known gotchas
 
@@ -147,8 +150,11 @@ If you want to migrate or salvage pre-Rev-B data later, document the analysis in
 - **Boost schema variance**: Boost's `to_info` can be `{native: '...'}` (with optional `cw20:` prefix in the string) or `{cw20: '...'}`. `runtime` can be `nft` (direct sale) or `la` (launch agreement). Defensive parsing handles both.
 - **DAODAO indexer freshness**: known to lag ~5-15 min behind chain. Per-NFT chain truth (Phase 2) catches movements that the indexer hasn't reflected yet.
 - **Rewards query is misleading for broken NFTs**: the contract's `rewards{token_id}` returns non-zero values for already-broken NFTs that can't actually claim again. We do NOT use this query directly — we compute per-NFT backing from `treasury_balance / unbroken_count` which matches the contract's actual distribution math.
+- **Pending-claims is seed-once, forward-only**: `data/v2/pending-claims.json` must be committed once (the seed) because public LCDs prune history — the cron can't reconstruct old unstakes. After that it self-maintains. Never delete it (you'd lose per-wallet attribution on whatever is unclaimed at that moment); but if it IS lost, nothing breaks — the count still computes live from `custody − total_power` and the cron rebuilds state by replaying tx-search from genesis on the next run. Claim parsing reads `transfer_nft` token_ids from the event log (not the empty `claim_nfts {}` message), and events are applied in block order, so a token unstaked → claimed → unstaked-again resolves correctly (this is the token-1319 case).
 
 ## Rev history
+
+- **Rev B.3 (2026-06-07)** — DAODAO pending-claim tracking. Adds a post-aggregate reconciliation step that surfaces NFTs unstaked from DAODAO but not yet claimed back (they sit in the 7-day claim queue, or indefinitely if the owner forgets). The count is always chain-truth (`daodao_staked_count` custody − `total_power_at_height` active stake); per-wallet attribution is tracked forward by watching `unstake`/`claim_nfts` events via LCD tx-search, persisted in `data/v2/pending-claims.json`. Reconciliation flags drift (heartbeat `daodao_pending_reconciled`) but always renders the chain count — graceful degradation. Seeded once with 4 verified legacy forgotten-claims (tokens 1319, 3605, 6847, 7123); self-maintaining thereafter (claims/unstakes add and remove themselves, no manual edits). New: `summary.daodao_pending_claim` block, heartbeat `daodao_pending_claim` + `daodao_pending_reconciled`. Additive — no schema break.
 
 - **Rev B.2 (2026-06-07)** — Clean-break path migration. Output moved from `data/` → `data/v2/`. Pre-Rev-B data abandoned (had classification bugs). History reset accepted as the cost of accurate data going forward. Old folder retained for archaeology — see "Pre-Rev-B data" section above.
 - **Rev B.1 (2026-06-07)** — Polish micro-rev. Surfaced 3 metrics that were already classified internally but missing from heartbeat: `dao_wallet_8ywv_held` (the 2 broken NFTs at the small DAO wallet), `daodao_staked_broken` (NFTs broken-then-staked-on-DAODAO for VP), `user_held_broken` (broken NFTs kept in user wallets). Added `user_liquid_count` alias for `user_held_count` (clearer naming). No schema break — all new fields are additive. Console output now shows full breakdown during runs.
