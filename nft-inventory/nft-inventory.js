@@ -474,14 +474,57 @@ async function fetchBblListings() {
 // Response per listing:
 //   { id, seller, nft_contract, token_id, price, payment: {Cw20: {contract_addr}},
 //     expires_at, created_at, whitelisted_buyer, time_locked_until, locked_for, whitelist }
+// Atrium's `listings_by_collection` *variant* is stable, but the collection field
+// NAME has drifted across contract upgrades — it now rejects `collection` with a 500
+// ("unknown field `collection`"). We probe the common CosmWasm field-name conventions
+// once per process, memoize the winner, and reuse it for pagination. If none match, we
+// surface the contract's full valid-field list (untruncated) so it can be pinned in one
+// follow-up. Either way there's no regression: Atrium-held NFTs are already classified
+// by cw721 ownership; this only adds price/seller detail on top.
+let ATRIUM_COLLECTION_FIELD = null;
+const ATRIUM_COLLECTION_FIELD_CANDIDATES = [
+    'collection_addr', 'nft_contract', 'collection_address',
+    'address', 'contract', 'contract_addr', 'cw721', 'collection',
+];
+
+async function resolveAtriumCollectionField() {
+    if (ATRIUM_COLLECTION_FIELD) return ATRIUM_COLLECTION_FIELD;
+    for (const field of ATRIUM_COLLECTION_FIELD_CANDIDATES) {
+        try {
+            const data = await queryContract(
+                ATRIUM_MARKETPLACE,
+                { listings_by_collection: { [field]: ADAO_NFT_CONTRACT, limit: 1 } },
+                `atrium probe ${field}`
+            );
+            if (data && (Array.isArray(data.listings) || Array.isArray(data))) {
+                ATRIUM_COLLECTION_FIELD = field;
+                console.log(`  ℹ Atrium collection field resolved to '${field}'`);
+                return field;
+            }
+        } catch (_) { /* wrong field name → try the next candidate */ }
+    }
+    // Nothing matched — log the contract's full error body (fetchJson truncates to 100
+    // chars, so do a direct fetch here to capture the "expected one of …" field list).
+    try {
+        const b64 = Buffer.from(JSON.stringify({ listings_by_collection: { collection: ADAO_NFT_CONTRACT, limit: 1 } })).toString('base64');
+        const res = await fetch(`${TERRA_LCD_PRIMARY}/cosmwasm/wasm/v1/contract/${ATRIUM_MARKETPLACE}/smart/${b64}`,
+            { headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-nft-inventory/2.2' } });
+        const body = await res.text().catch(() => '');
+        console.warn(`  ⚠ Atrium collection field unresolved — contract reports: ${body.slice(0, 400)}`);
+    } catch (_) { /* diagnostic only */ }
+    return null;
+}
+
 async function fetchAtriumListings() {
+    const field = await resolveAtriumCollectionField();
+    if (!field) return [];   // ownership classification already covers Atrium-held NFTs
     const out = [];
     const seenIds = new Set();
     let startAfter = null;
     let page = 0;
     while (true) {
         const params = {
-            collection: ADAO_NFT_CONTRACT,
+            [field]: ADAO_NFT_CONTRACT,
             limit: MARKETPLACE_PAGE,
             ...(startAfter ? { start_after: startAfter } : {}),
         };
