@@ -1,40 +1,42 @@
 // =============================================================================
-// NFT Inventory Cron
+// NFT Inventory Cron — Rev B
 // =============================================================================
 //
 // Captures full per-NFT state for the aDAO collection from on-chain truth.
 // Replaces the dashboard's dependency on the third-party deving.zone feed.
 //
+// Rev B (2026-06-06) — Major expansion:
+//   • Fixed classification: Treasury (898 broken) was previously mislabeled as
+//     "enterprise" — now correctly distinguished from the real Enterprise NFT
+//     staking contract (which holds 100 broken + 403 real user stakes).
+//   • Enterprise staker resolution via members{} query (per-user counts).
+//   • All 3 marketplaces (BBL, Atrium, Boost) — sellers resolved from
+//     marketplace contracts (not raw cw721 owner).
+//   • Backing & yield: ampLUNA treasury balance + per-NFT share + boost-mechanic
+//     metrics. Daily snapshot enables future timeline tracking (Rev C).
+//
 // What it produces (uploaded to `nft-inventory-data_2026`):
 //
-//   data/nfts.json       ← per-NFT records: { id, owner, broken, rank, ... }
-//                         (large file, ~10k entries, ~1.5 MB)
-//   data/summary.json    ← aggregate counts + per-holder breakdowns
-//                         (small file for the dashboard's quick reads)
+//   data/nfts.json       ← per-NFT records: { id, owner, real_owner, broken,
+//                          listing{...}, classification flags, ... }
+//                         (large file, ~10k entries, ~2.5 MB)
+//   data/summary.json    ← aggregate counts + per-holder breakdowns + backing
+//                          + marketplace stats + daodao_stakers + enterprise_stakers
 //   data/heartbeat.json  ← uniform freshness contract
+//   data/daily/<date>.json ← daily snapshot of summary (for movement/yield timeline)
 //
 // Schedule: hourly at :30 (Render cron: `30 * * * *`)
-// Runtime:  ~50 seconds (10k chain queries at concurrency 30)
+// Runtime:  ~70 seconds (10k chain queries + 3 marketplaces + enterprise + backing)
 //
-// Data model — per NFT record:
-//   {
-//     id:        "1",                  // token_id (string, as on chain)
-//     owner:     "terra1...",          // current chain owner
-//     broken:    true|false,           // from extension.attributes trait 'broken'
-//     rank:      Number|null,          // if present in attributes
-//     image:     "ipfs://..." | null,  // image URI from extension
-//     // Classification booleans (derived from owner) — match deving.zone shape
-//     // for easy site integration:
-//     dao:        true|false,          // held by DAO main wallet
-//     minted:     true|false,          // !dao
-//     daodao:     true|false,          // staked in DAODAO contract
-//     enterprise: true|false,          // held by Enterprise treasury
-//   }
+// Backward compatibility: existing record-level fields (dao, daodao, enterprise)
+// are preserved as aliases so the current dashboard JS continues to work during
+// the Rev B → Rev 2 (page migration) window. New code should prefer the clean
+// names (unminted, daodao_staked, treasury_held).
 //
-// NOTE: bbl / boost (currently-listed flags) are populated by the SEPARATE
-// `marketplace-stats` cron — kept independent so a BBL API outage doesn't
-// stall the per-NFT chain walk, and vice versa. Consumers (dashboard JS)
-// merge the two outputs.
+// Architecture rule preserved: marketplaces and Enterprise queries are
+// independent — failures are non-fatal. Aggregate counts still ship even if
+// any single sub-system fails. See cron-scripts/README.md for the broader
+// "independent systems" principle.
 // =============================================================================
 
 const https = require('https');
@@ -47,31 +49,52 @@ const fs    = require('fs');
 const TERRA_LCD_PRIMARY  = 'https://terra-lcd.publicnode.com';
 const TERRA_LCD_FALLBACK = 'https://terra-rest.publicnode.com';
 
-// aDAO NFT collection contract
+// aDAO NFT collection
 const ADAO_NFT_CONTRACT = 'terra1phr9fngjv7a8an4dhmhd0u0f98wazxfnzccqtyheq4zqrrp4fpuqw3apw9';
 
-// Known custody locations — used to classify owners.
-// Verified live 2026-05-14 via contract_info / config queries.
-const DAO_MAIN_WALLET         = 'terra1sffd4efk2jpdt894r04qwmtjqrrjfc52tmj6vkzjxqhd8qqu2drs3m5vzm';
-const DAODAO_STAKING_CONTRACT = 'terra1c57ur376szdv8rtes6sa9nst4k536dynunksu8tx5zu4z5u3am6qmvqx47';
-const ENTERPRISE_TREASURY     = 'terra1h8psjgcsg9fef7w2yv0j6262sfcaszj8vs4tsy3uwla6zwtaspvqrp4l7v';
+// Known custody locations
+// Verified live 2026-06-06 via chain queries; see Rev B session log.
+const DAO_MAIN_WALLET           = 'terra1sffd4efk2jpdt894r04qwmtjqrrjfc52tmj6vkzjxqhd8qqu2drs3m5vzm';
+const DAODAO_STAKING_CONTRACT   = 'terra1c57ur376szdv8rtes6sa9nst4k536dynunksu8tx5zu4z5u3am6qmvqx47';
+const DAO_TREASURY_CONTRACT     = 'terra1h8psjgcsg9fef7w2yv0j6262sfcaszj8vs4tsy3uwla6zwtaspvqrp4l7v'; // previously mislabeled "enterprise" — holds 898 broken NFTs for DAO governance
+const ENTERPRISE_NFT_STAKING    = 'terra1e54tcdyulrtslvf79htx4zntqntd4r550cg22sj24r6gfm0anrvq0y8tdv'; // REAL Enterprise NFT staking; holds 503 NFTs (100 broken/DAO + 403 user stakes)
+const DAO_WALLET_8YWV           = 'terra1yqv0af22675wlcmgflxk4ve07vt8qlm999gk0cuw5l64r5xxgadsyg8ywv'; // small DAO-controlled wallet with 2 broken NFTs
+
+// Marketplaces
+const BBL_MARKETPLACE    = 'terra1ej4cv98e9g2zjefr5auf2nwtq4xl3dm7x0qml58yna2ml2hk595s7gccs9'; // bbl-necropolis-marketplace v2.2.2
+const ATRIUM_MARKETPLACE = 'terra15du229lqcxkn939pmjgklqunftf604q4wz87kt5awj6reghec5jqs0w0kj'; // atrium-marketplace v1.6.0-rc1
+const BOOST_MARKETPLACE  = 'terra1kj7pasyahtugajx9qud02r5jqaf60mtm7g5v9utr94rmdfftx0vqspf4at'; // launch-nft v1.4.0 (launch-nft-permissionless)
+
+// Backing token — aDAO NFT collection accrues ampLUNA from Alliance staking
+const AMPLUNA_CW20 = 'terra1ecgazyd0waaj3g7l9cmy5gulhxkps2gmxu9ghducvuypjq68mq2s5lvsct';
 
 // Query/pagination tuning
-const ALL_TOKENS_PAGE = 30;     // CW721 default cap
-const NFT_INFO_CONCURRENCY = 30; // benchmarked: 100 queries in ~470ms; 10k → ~47s
-const HTTP_TIMEOUT_MS = 15000;
-const RETRIES = 3;
+const ALL_TOKENS_PAGE      = 30;     // CW721 default cap
+const MARKETPLACE_PAGE     = 30;     // BBL/Atrium/Boost default
+const ENTERPRISE_MEMBERS_PAGE = 30;
+const NFT_INFO_CONCURRENCY = 30;     // benchmarked: 100 queries in ~470ms; 10k → ~47s
+const HTTP_TIMEOUT_MS      = 15000;
+const RETRIES              = 3;
 
 // GitHub publish (matches other crons' env contract)
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/nft-inventory-data_2026';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
+// Sister cron data repos (read-only fetches for prices & catalog token metadata)
+// These are PUBLIC — no auth needed.
+const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/current.json';
+const CATALOG_DATA_URL = 'https://raw.githubusercontent.com/defipatriot/tla-chain-registry/main/data/current.json';
+
 // TLA epoch math (for heartbeat consistency with other crons)
 const TLA_EPOCH_START_MS = Date.parse('2022-10-31T00:00:00Z');
 const TLA_EPOCH_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 function currentEpoch() {
     return Math.floor((Date.now() - TLA_EPOCH_START_MS) / TLA_EPOCH_DURATION_MS) + 1;
+}
+
+function todayUtcDate() {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
 // -----------------------------------------------------------------------------
@@ -84,7 +107,7 @@ async function fetchJson(url, label = url, timeoutMs = HTTP_TIMEOUT_MS) {
     try {
         const res = await fetch(url, {
             signal: controller.signal,
-            headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-nft-inventory/1.0' },
+            headers: { 'Accept': 'application/json', 'User-Agent': 'aDAO-nft-inventory/2.0' },
         });
         if (!res.ok) {
             const body = await res.text().catch(() => '');
@@ -115,6 +138,16 @@ async function fetchJsonWithRetry(url, label, maxTries = RETRIES) {
     throw lastErr;
 }
 
+async function tryFetchJson(url, label, timeoutMs = HTTP_TIMEOUT_MS) {
+    // Returns null on failure instead of throwing — for optional dependencies.
+    try {
+        return await fetchJson(url, label, timeoutMs);
+    } catch (e) {
+        console.warn(`  ⚠ ${label} fetch failed (non-fatal): ${e.message}`);
+        return null;
+    }
+}
+
 async function queryContract(contract, queryObj, label = '') {
     const b64 = Buffer.from(JSON.stringify(queryObj)).toString('base64');
     const tryLcd = async (base) => {
@@ -125,6 +158,16 @@ async function queryContract(contract, queryObj, label = '') {
         return await tryLcd(TERRA_LCD_PRIMARY);
     } catch (e1) {
         return await tryLcd(TERRA_LCD_FALLBACK);
+    }
+}
+
+async function queryContractSafe(contract, queryObj, label = '') {
+    // Returns null on failure — for non-critical queries.
+    try {
+        return await queryContract(contract, queryObj, label);
+    } catch (e) {
+        console.warn(`  ⚠ ${label} query failed (non-fatal): ${e.message}`);
+        return null;
     }
 }
 
@@ -184,12 +227,35 @@ function extractAttr(attributes, traitType) {
     return found ? found.value : null;
 }
 
-function classifyOwner(owner) {
-    return {
+function classifyOwner(owner, broken) {
+    // Returns the classification flags for one NFT given its raw cw721 owner.
+    // The seller resolution (for marketplace listings) happens in a later phase
+    // and overwrites `real_owner` — this function uses raw chain ownership.
+    const f = {
+        // Backward-compat aliases (preserve current dashboard JS during Rev 2 migration)
         dao:        owner === DAO_MAIN_WALLET,
         daodao:     owner === DAODAO_STAKING_CONTRACT,
-        enterprise: owner === ENTERPRISE_TREASURY,
+        enterprise: owner === DAO_TREASURY_CONTRACT, // PRESERVED for backward compat — but now means "treasury_held"
+
+        // Canonical clean names (use these going forward)
+        unminted:                owner === DAO_MAIN_WALLET,
+        daodao_staked:           owner === DAODAO_STAKING_CONTRACT,
+        treasury_held:           owner === DAO_TREASURY_CONTRACT,
+        dao_wallet_8ywv_held:    owner === DAO_WALLET_8YWV,
+        enterprise_staked:       owner === ENTERPRISE_NFT_STAKING && !broken,
+        enterprise_dao_broken:   owner === ENTERPRISE_NFT_STAKING && broken,
+        bbl_listed:              owner === BBL_MARKETPLACE,
+        atrium_listed:           owner === ATRIUM_MARKETPLACE,
+        boost_listed:            owner === BOOST_MARKETPLACE,
     };
+    // user_held = everything else (individual wallet, not in any known custody)
+    const knownCustody = (
+        f.unminted || f.daodao_staked || f.treasury_held || f.dao_wallet_8ywv_held ||
+        f.enterprise_staked || f.enterprise_dao_broken ||
+        f.bbl_listed || f.atrium_listed || f.boost_listed
+    );
+    f.user_held = !knownCustody;
+    return f;
 }
 
 async function fetchOneNft(tokenId) {
@@ -208,19 +274,25 @@ async function fetchOneNft(tokenId) {
         const n = parseInt(rankStr, 10);
         return Number.isFinite(n) ? n : null;
     })();
-    const cls = classifyOwner(owner);
+    const cls = classifyOwner(owner, broken);
     return {
         id: tokenId,
-        owner,
+        owner,                          // raw cw721 owner (might be a marketplace/staking contract)
+        real_owner: owner,              // overwritten by Phase 4 for marketplace-listed NFTs
         broken,
         rank: rankNum,
         image: extension.image || null,
         name:  extension.name  || null,
-        // Classification booleans for easy site consumption
-        dao:    cls.dao,
-        minted: !cls.dao,                   // minted = held by anyone EXCEPT DAO main
-        daodao: cls.daodao,
-        enterprise: cls.enterprise,
+
+        // Marketplace listing detail — populated by Phase 4
+        listing: null,                  // { marketplace, seller, price_raw, denom, price_token_symbol, price_token_decimals, price_display, price_usd, internal_id, listing_type, created_at?, raw }
+
+        // Minted = anything that has been claimed by a user OR moved into DAO control mechanisms.
+        // Backward-compat semantic preserved: minted = !held by DAO main wallet (unminted set).
+        minted: !cls.unminted,
+
+        // Spread all the classification flags onto the record
+        ...cls,
     };
 }
 
@@ -245,98 +317,248 @@ async function fetchAllNftInfo(tokenIds) {
     if (failed.length > 0) {
         console.log(`  ⚠ ${failed.length} failures (sample): ${failed.slice(0, 3).map(f => f._error).join(' | ')}`);
     }
-    // Keep only successful records; drop the _error entries
     return records.filter(r => r && !r._error);
 }
 
 // -----------------------------------------------------------------------------
-// PHASE 3 — Aggregate
+// PHASE 3 — Enterprise NFT staking members
 // -----------------------------------------------------------------------------
+//
+// Enterprise NFT staking contract holds 503 NFTs total: 100 broken (DAO control)
+// + 403 real user stakes. We query `members{}` paginated to get per-user weight
+// (= NFT count staked). Failures are non-fatal — aggregate counts still ship.
+//
+// The "DAO control" 100 are detected via Phase 2 (broken && owner == ENTERPRISE_NFT_STAKING).
+// The 403 real stakers come from members{} response.
 
-function aggregate(records) {
-    const total = records.length;
-    let dao_held = 0, minted = 0, broken = 0, unbroken = 0;
-    let daodao = 0, enterprise = 0;
-    const perOwnerCounts = {};     // owner → count
-    const perOwnerBroken = {};     // owner → broken count
-    const uniqueHolders = new Set();
-
-    for (const r of records) {
-        if (r.dao) dao_held++;
-        else minted++;
-        if (r.broken) broken++;
-        else unbroken++;
-        if (r.daodao) daodao++;
-        if (r.enterprise) enterprise++;
-        if (r.owner) {
-            uniqueHolders.add(r.owner);
-            perOwnerCounts[r.owner] = (perOwnerCounts[r.owner] || 0) + 1;
-            if (r.broken) {
-                perOwnerBroken[r.owner] = (perOwnerBroken[r.owner] || 0) + 1;
-            }
+async function fetchEnterpriseStakers() {
+    console.log('👥 Phase 3: fetching Enterprise NFT stakers (via members{})...');
+    const t0 = Date.now();
+    const all = [];
+    let startAfter = null;
+    let page = 0;
+    try {
+        while (true) {
+            const query = startAfter
+                ? { members: { limit: ENTERPRISE_MEMBERS_PAGE, start_after: startAfter } }
+                : { members: { limit: ENTERPRISE_MEMBERS_PAGE } };
+            const data = await queryContract(ENTERPRISE_NFT_STAKING, query, `enterprise members page ${page}`);
+            const members = data?.members || [];
+            if (members.length === 0) break;
+            all.push(...members);
+            startAfter = members[members.length - 1]?.user || members[members.length - 1]?.address;
+            page++;
+            if (members.length < ENTERPRISE_MEMBERS_PAGE) break;
         }
+    } catch (e) {
+        console.warn(`  ⚠ Enterprise members fetch failed (non-fatal): ${e.message}`);
+        return [];
     }
-
-    // DAO members count: unique holders MINUS DAO-controlled / staking-contract addresses.
-    // Matches the dashboard's intent (real individual members, not contracts).
-    const excludedFromMembers = new Set([
-        DAO_MAIN_WALLET,
-        DAODAO_STAKING_CONTRACT,
-        ENTERPRISE_TREASURY,
-    ]);
-    const memberHolders = [...uniqueHolders].filter(o => !excludedFromMembers.has(o));
-
-    // Top per-owner tables (DAODAO + Enterprise stakers — used by the dashboard modals).
-    // We rebuild these by walking records once more to get per-NFT detail per owner.
-    function buildStakerTable(filterFn) {
-        const byOwner = {};
-        for (const r of records) {
-            if (!filterFn(r)) continue;
-            if (!byOwner[r.owner]) byOwner[r.owner] = { owner: r.owner, count: 0, broken: 0 };
-            byOwner[r.owner].count++;
-            if (r.broken) byOwner[r.owner].broken++;
-        }
-        return Object.values(byOwner).sort((a, b) => b.count - a.count);
-    }
-    // Note: stakers tables based on owner-equal-to-staking-contract will collapse to a single
-    // row (the contract holds them all). That's not the UX the dashboard wants — it wants the
-    // ORIGINAL stakers (the users who delegated). For DAODAO that requires querying the staking
-    // contract's own staker list. We capture that in Phase 4 below.
-
-    return {
-        // Aggregate counts (drive the top tiles)
-        total_tokens: total,
-        minted_count: minted,
-        unminted_count: dao_held,
-        broken_count: broken,
-        unbroken_count: unbroken,
-        daodao_staked_count: daodao,
-        enterprise_staked_count: enterprise,
-        dao_held_count: dao_held,
-        unique_holders: uniqueHolders.size,
-        dao_members_count: memberHolders.length,
-
-        // Useful for analytics / supply breakdown modal
-        circulating_supply: Math.max(0, minted - dao_held),   // matches dashboard math
-        per_owner_counts: perOwnerCounts,
-        per_owner_broken: perOwnerBroken,
-    };
+    // Normalize entries — Enterprise's exact field name may be `user` or `address`,
+    // and weight may be `weight` or `nfts` depending on the contract version.
+    const stakers = all
+        .map(m => ({
+            address: m.user || m.address,
+            count: Number(m.weight || m.nfts || m.count || 0),
+        }))
+        .filter(s => s.address && s.count > 0)
+        .sort((a, b) => b.count - a.count);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    const total = stakers.reduce((sum, s) => sum + s.count, 0);
+    console.log(`  ✓ ${stakers.length} Enterprise stakers (total ${total} NFTs staked) in ${elapsed}s`);
+    return stakers;
 }
 
 // -----------------------------------------------------------------------------
-// PHASE 4 — Real stakers for DAODAO (via daodao.zone indexer, which adao-positions
-// also uses). The on-chain DAODAO contract (dao-voting-cw721-staked v2.5.0) has
-// NO enumerable staker list — only per-address `staked_nfts(address)` queries.
-// The indexer is the canonical source for "who staked what." Failures here are
-// non-fatal — summary aggregate counts are still produced from chain data.
+// PHASE 4 — Marketplace queries (BBL + Atrium + Boost)
 // -----------------------------------------------------------------------------
+//
+// Each marketplace stores its listings differently. We normalize to a common
+// shape and merge back into the per-NFT records, overwriting `real_owner` with
+// the original seller (so the explorer page shows the rightful owner, not the
+// marketplace contract address).
+//
+// Each marketplace is queried independently in parallel — one failure doesn't
+// stall the others. Per-marketplace failure logs warning and returns [].
 
-// Same indexer URL pattern used by adao-positions cron — proven to work on Render.
-const DAODAO_VOTING_CONTRACT = 'terra1c57ur376szdv8rtes6sa9nst4k536dynunksu8tx5zu4z5u3am6qmvqx47';
-const DAODAO_INDEXER_URL = `https://indexer.daodao.zone/phoenix-1/contract/${DAODAO_VOTING_CONTRACT}/daoVotingCw721Staked/topStakers`;
+// BBL: query `auction_by_contract` with nft_contract filter
+//
+// Response per auction:
+//   { auction_id, auction_type, nft_contract, token_id, seller, denom,
+//     reserve_price, amount, bidder, end_time, creator_address, royalty_fee,
+//     is_settled, offers }
+async function fetchBblListings() {
+    const out = [];
+    let startAfter = null;
+    let page = 0;
+    while (true) {
+        const params = {
+            nft_contract: ADAO_NFT_CONTRACT,
+            limit: MARKETPLACE_PAGE,
+            ...(startAfter ? { start_after: startAfter } : {}),
+        };
+        const data = await queryContract(BBL_MARKETPLACE, { auction_by_contract: params }, `bbl page ${page}`);
+        const auctions = data?.auctions || [];
+        if (auctions.length === 0) break;
+        out.push(...auctions);
+        // BBL pagination key: most likely auction_id (numeric, string-typed). We pass the last one.
+        const lastId = auctions[auctions.length - 1]?.auction_id;
+        if (!lastId) break;
+        startAfter = lastId;
+        page++;
+        if (auctions.length < MARKETPLACE_PAGE) break;
+        if (page > 100) { console.warn('  ⚠ BBL pagination cap hit (100 pages) — stopping'); break; }
+    }
+    return out.map(a => ({
+        marketplace: 'BBL',
+        internal_id: a.auction_id,
+        token_id: a.token_id,
+        seller: a.seller,
+        price_raw: a.reserve_price,
+        denom: a.denom,
+        listing_type: a.auction_type, // 'buy_now' or auction-style
+        royalty_fee: a.royalty_fee,
+        creator_address: a.creator_address,
+        bidder: a.bidder,
+        end_time: a.end_time,
+        raw: a,
+    }));
+}
+
+// Atrium: query `listings_by_collection` with collection filter
+//
+// Response per listing:
+//   { id, seller, nft_contract, token_id, price, payment: {Cw20: {contract_addr}},
+//     expires_at, created_at, whitelisted_buyer, time_locked_until, locked_for, whitelist }
+async function fetchAtriumListings() {
+    const out = [];
+    let startAfter = null;
+    let page = 0;
+    while (true) {
+        const params = {
+            collection: ADAO_NFT_CONTRACT,
+            limit: MARKETPLACE_PAGE,
+            ...(startAfter ? { start_after: startAfter } : {}),
+        };
+        const data = await queryContract(ATRIUM_MARKETPLACE, { listings_by_collection: params }, `atrium page ${page}`);
+        const listings = data?.listings || [];
+        if (listings.length === 0) break;
+        out.push(...listings);
+        const lastId = listings[listings.length - 1]?.id;
+        if (lastId == null) break;
+        startAfter = lastId;
+        page++;
+        if (listings.length < MARKETPLACE_PAGE) break;
+        if (page > 100) { console.warn('  ⚠ Atrium pagination cap hit (100 pages) — stopping'); break; }
+    }
+    return out.map(l => {
+        // Atrium payment is wrapped: { Cw20: { contract_addr: 'terra1...' } } or { Native: 'uluna' }
+        const pay = l.payment || {};
+        let denom = null;
+        if (pay.Cw20) denom = 'cw20:' + (pay.Cw20.contract_addr || pay.Cw20);
+        else if (pay.Native) denom = pay.Native;
+        return {
+            marketplace: 'Atrium',
+            internal_id: l.id,
+            token_id: l.token_id,
+            seller: l.seller,
+            price_raw: l.price,
+            denom,
+            listing_type: 'fixed',
+            created_at: l.created_at,  // block height
+            expires_at: l.expires_at,
+            whitelisted_buyer: l.whitelisted_buyer,
+            raw: l,
+        };
+    });
+}
+
+// Boost: query `launches` — returns ALL launches across ALL collections + ALL history
+// (active + cancelled + done). We must client-side filter.
+//
+// Per-launch shape (varies a lot):
+//   { id, name, cancelled, done, owner (=seller), from: {contract, token_id},
+//     to_info: { native?: 'uluna'|'ibc/...'|'cw20:terra1...', cw20?: 'terra1...' },
+//     runtime: {
+//       nft?: { setup: { to_amount: '...' }, runtime: {} },
+//       la?:  { setup: { to_amount: '...' }, runtime: {...} },
+//     }
+//   }
+async function fetchBoostListings() {
+    const out = [];
+    let startAfter = null;
+    let page = 0;
+    // Boost may use `start_after` keyed by id. We try empty first, then paginate.
+    while (true) {
+        const params = { ...(startAfter != null ? { start_after: startAfter } : {}) };
+        const data = await queryContract(BOOST_MARKETPLACE, { launches: params }, `boost page ${page}`);
+        // Boost's response format: data is an array directly (not wrapped in {launches: [...]}).
+        // Defensive: accept either shape.
+        const arr = Array.isArray(data) ? data : (data?.launches || data?.data || []);
+        if (!Array.isArray(arr) || arr.length === 0) break;
+        out.push(...arr);
+        const lastId = arr[arr.length - 1]?.id;
+        if (lastId == null) break;
+        startAfter = lastId;
+        page++;
+        if (arr.length < MARKETPLACE_PAGE) break;
+        if (page > 200) { console.warn('  ⚠ Boost pagination cap hit (200 pages) — stopping'); break; }
+    }
+    // Filter to active aDAO launches only
+    const active = out.filter(l =>
+        l && !l.cancelled && !l.done &&
+        l.from?.contract === ADAO_NFT_CONTRACT
+    );
+    return active.map(l => {
+        // Boost to_info shape: defensive — may be either {native: 'X'} or {cw20: 'X'}
+        // And `native` field sometimes contains a 'cw20:' prefix string. Normalize.
+        const info = l.to_info || {};
+        let denom = null;
+        if (info.cw20) denom = 'cw20:' + info.cw20;
+        else if (info.native) denom = info.native; // already includes cw20: prefix if applicable
+        // Amount: from runtime.nft.setup.to_amount OR runtime.la.setup.to_amount
+        const rt = l.runtime || {};
+        const amount = rt.nft?.setup?.to_amount || rt.la?.setup?.to_amount || null;
+        return {
+            marketplace: 'Boost',
+            internal_id: l.id,
+            token_id: l.from?.token_id,
+            seller: l.owner,
+            price_raw: amount,
+            denom,
+            listing_type: rt.la ? 'launch_agreement' : 'setup',
+            name: l.name || null,
+            raw: l,
+        };
+    });
+}
+
+// Orchestrator — runs all 3 in parallel, returns combined list
+async function fetchMarketplaces() {
+    console.log('🏪 Phase 4: fetching marketplace listings (BBL + Atrium + Boost)...');
+    const t0 = Date.now();
+    const [bbl, atrium, boost] = await Promise.all([
+        fetchBblListings().catch(e => { console.warn(`  ⚠ BBL failed: ${e.message}`); return []; }),
+        fetchAtriumListings().catch(e => { console.warn(`  ⚠ Atrium failed: ${e.message}`); return []; }),
+        fetchBoostListings().catch(e => { console.warn(`  ⚠ Boost failed: ${e.message}`); return []; }),
+    ]);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`  ✓ BBL ${bbl.length}, Atrium ${atrium.length}, Boost ${boost.length} listings in ${elapsed}s`);
+    return { bbl, atrium, boost };
+}
+
+// -----------------------------------------------------------------------------
+// PHASE 5 — DAODAO stakers via daodao.zone indexer
+// -----------------------------------------------------------------------------
+//
+// The on-chain DAODAO contract (dao-voting-cw721-staked v2.5.0) has NO
+// enumerable staker list — only per-address `staked_nfts(address)` queries.
+// The indexer is the canonical source for "who staked what." Non-fatal.
+
+const DAODAO_INDEXER_URL = `https://indexer.daodao.zone/phoenix-1/contract/${DAODAO_STAKING_CONTRACT}/daoVotingCw721Staked/topStakers`;
 
 async function fetchDaodaoStakers() {
-    console.log('👥 Phase 4: fetching DAODAO stakers list (via daodao.zone indexer)...');
+    console.log('👥 Phase 5: fetching DAODAO stakers (via daodao.zone indexer)...');
     try {
         const data = await fetchJson(DAODAO_INDEXER_URL, 'daodao-indexer-topStakers');
         if (!Array.isArray(data)) {
@@ -358,6 +580,330 @@ async function fetchDaodaoStakers() {
 }
 
 // -----------------------------------------------------------------------------
+// PHASE 6 — Backing & yield: ampLUNA balance + per-NFT share
+// -----------------------------------------------------------------------------
+//
+// The NFT contract continuously stakes LUNA in the Alliance module. Daily,
+// Eris's bot triggers `alliance_claim_rewards` which:
+//   - Claims LUNA from all validators
+//   - Bonds it to Eris (Staking Hub) → produces ampLUNA
+//   - Splits 90% to NFT contract (rewards for unbroken NFTs)
+//   - Splits 10% to DAO main wallet (treasury share)
+//
+// We capture the NFT contract's current ampLUNA balance. Per-NFT share is
+// computed as: balance / unbroken_count. Daily yield emerges from day-over-day
+// balance deltas (tracked via daily snapshots).
+
+async function fetchBackingData(unbrokenCount) {
+    console.log('💰 Phase 6: fetching backing data (ampLUNA balance)...');
+    try {
+        const balData = await queryContract(
+            AMPLUNA_CW20,
+            { balance: { address: ADAO_NFT_CONTRACT } },
+            'ampluna balance'
+        );
+        const balanceRaw = balData?.balance || '0';
+        const balanceAmpLuna = Number(balanceRaw) / 1e6;
+        const perNftAmpLuna = unbrokenCount > 0 ? balanceAmpLuna / unbrokenCount : 0;
+        console.log(`  ✓ Treasury holds ${balanceAmpLuna.toFixed(2)} ampLUNA`);
+        console.log(`  ✓ Per-unbroken share: ${perNftAmpLuna.toFixed(4)} ampLUNA`);
+        return {
+            ampluna_balance_raw: balanceRaw,
+            ampluna_balance: balanceAmpLuna,
+            per_nft_ampluna_share: perNftAmpLuna,
+            unbroken_count: unbrokenCount,
+            captured_at: new Date().toISOString(),
+        };
+    } catch (e) {
+        console.warn(`  ⚠ Backing data fetch failed (non-fatal): ${e.message}`);
+        return null;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PHASE 7 — Price data from sister crons
+// -----------------------------------------------------------------------------
+//
+// We fetch already-published price data instead of querying price sources
+// directly. This avoids duplication, keeps load off CoinGecko/Eris, and
+// inherits the sister crons' price-validation logic.
+//
+//   network-and-prices-data_2026 → LUNA price + Astroport snapshot prices
+//   tla-chain-registry           → Eris exchange rates + token catalog
+//
+// Used to:
+//   1. Compute ampLUNA → USD for the backing display
+//   2. Compute marketplace listing prices in USD (any payment token)
+
+async function fetchPriceData() {
+    console.log('💱 Phase 7: fetching price data from sister crons...');
+    const t0 = Date.now();
+    const [pricesDoc, catalogDoc] = await Promise.all([
+        tryFetchJson(PRICES_DATA_URL, 'network-and-prices'),
+        tryFetchJson(CATALOG_DATA_URL, 'tla-chain-registry'),
+    ]);
+    if (!pricesDoc && !catalogDoc) {
+        console.warn('  ⚠ Both price sources unavailable — USD computation will be skipped');
+        return { prices: {}, tokens: {}, ampluna_usd: null, luna_usd: null };
+    }
+    // LUNA → USD (preferred from network-and-prices)
+    const luna_usd = pricesDoc?.prices?.LUNA?.usd
+                  ?? pricesDoc?.luna_usd
+                  ?? null;
+    // Token map for symbol/decimals/USD lookups
+    // The catalog publishes tokens keyed by address. We index for fast lookup.
+    const tokenByAddr = {};
+    const tokenBySymbol = {};
+    if (catalogDoc?.tokens) {
+        for (const [addr, t] of Object.entries(catalogDoc.tokens)) {
+            const rec = { ...t, address: addr };
+            tokenByAddr[addr] = rec;
+            if (t.symbol) tokenBySymbol[t.symbol] = rec;
+        }
+    }
+    // ampLUNA price
+    let ampluna_usd = null;
+    const amplunaToken = tokenByAddr[AMPLUNA_CW20] || tokenBySymbol['ampLUNA'];
+    if (amplunaToken?.final_price_usd != null) {
+        ampluna_usd = Number(amplunaToken.final_price_usd);
+    } else if (amplunaToken?.eris_exchange_rate != null && luna_usd != null) {
+        // Compute: ampLUNA → LUNA → USD
+        ampluna_usd = Number(amplunaToken.eris_exchange_rate) * Number(luna_usd);
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`  ✓ LUNA $${luna_usd?.toFixed?.(4) ?? 'n/a'}, ampLUNA $${ampluna_usd?.toFixed?.(4) ?? 'n/a'}, ${Object.keys(tokenByAddr).length} catalog tokens in ${elapsed}s`);
+    return {
+        luna_usd,
+        ampluna_usd,
+        tokens_by_addr: tokenByAddr,
+        tokens_by_symbol: tokenBySymbol,
+    };
+}
+
+// Helper — given a denom (cw20:terra1... or uluna or ibc/...) and price data,
+// return { symbol, decimals, price_usd, price_display_for_amount(raw) }
+function decodeTokenDenom(denom, priceData) {
+    if (!denom) return null;
+    const tokens = priceData.tokens_by_addr || {};
+    let symbol = denom, decimals = 6, price_usd = null;
+    if (denom === 'uluna') {
+        symbol = 'LUNA';
+        decimals = 6;
+        price_usd = priceData.luna_usd;
+    } else if (denom.startsWith('cw20:')) {
+        const addr = denom.slice(5);
+        const tok = tokens[addr];
+        if (tok) {
+            symbol = tok.symbol || denom;
+            decimals = tok.decimals ?? 6;
+            price_usd = tok.final_price_usd != null ? Number(tok.final_price_usd) : null;
+        }
+    } else if (denom.startsWith('ibc/')) {
+        const tok = tokens[denom];
+        if (tok) {
+            symbol = tok.symbol || denom;
+            decimals = tok.decimals ?? 6;
+            price_usd = tok.final_price_usd != null ? Number(tok.final_price_usd) : null;
+        }
+    } else {
+        // Unknown denom shape — return raw
+    }
+    return { symbol, decimals, price_usd };
+}
+
+// Decorate one listing with price_display and price_usd
+function decorateListing(listing, priceData) {
+    if (!listing || !listing.denom || !listing.price_raw) return listing;
+    const tok = decodeTokenDenom(listing.denom, priceData);
+    if (!tok) return listing;
+    const amount_human = Number(listing.price_raw) / Math.pow(10, tok.decimals);
+    return {
+        ...listing,
+        price_token_symbol: tok.symbol,
+        price_token_decimals: tok.decimals,
+        price_display: `${amount_human.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${tok.symbol}`,
+        price_amount: amount_human,
+        price_usd: tok.price_usd != null ? +(amount_human * tok.price_usd).toFixed(6) : null,
+        price_usd_source: tok.price_usd != null ? 'sister-cron' : null,
+    };
+}
+
+// -----------------------------------------------------------------------------
+// MERGE: apply marketplace listings + decorate records
+// -----------------------------------------------------------------------------
+//
+// For each NFT whose raw owner is a marketplace contract, look up its listing
+// in the marketplace data and:
+//   1. Set real_owner = listing.seller (the rightful pre-listing owner)
+//   2. Attach the decorated listing object to record.listing
+//
+// If no listing is found (shouldn't normally happen — the NFT is sitting at a
+// marketplace contract but no active listing references it), we flag it.
+
+function mergeMarketplaceListings(records, marketplaces, priceData) {
+    const t0 = Date.now();
+    const all = [
+        ...marketplaces.bbl,
+        ...marketplaces.atrium,
+        ...marketplaces.boost,
+    ];
+    // Index by token_id (string)
+    const listingByTokenId = {};
+    for (const l of all) {
+        if (l.token_id != null) {
+            const key = String(l.token_id);
+            // If same token has multiple active listings across marketplaces (rare),
+            // we keep the first one we encounter and log a warning.
+            if (listingByTokenId[key]) {
+                console.warn(`  ⚠ NFT #${key} listed on BOTH ${listingByTokenId[key].marketplace} and ${l.marketplace} — keeping ${listingByTokenId[key].marketplace}`);
+                continue;
+            }
+            listingByTokenId[key] = l;
+        }
+    }
+    let matched = 0, unmatched = 0;
+    for (const r of records) {
+        const isMarketplaceOwned = r.bbl_listed || r.atrium_listed || r.boost_listed;
+        if (!isMarketplaceOwned) continue;
+        const listing = listingByTokenId[String(r.id)];
+        if (listing) {
+            r.listing = decorateListing(listing, priceData);
+            r.real_owner = listing.seller;
+            matched++;
+        } else {
+            // NFT sits at a marketplace contract but no active listing references it.
+            // Could be a stale state, just-settled auction, or contract upgrade in progress.
+            r.listing = { marketplace_owner_no_listing: true, marketplace_addr: r.owner };
+            unmatched++;
+        }
+    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    console.log(`  ✓ Merged ${matched} listings to records (${unmatched} marketplace-owned NFTs without active listing) in ${elapsed}s`);
+    return records;
+}
+
+// -----------------------------------------------------------------------------
+// AGGREGATE
+// -----------------------------------------------------------------------------
+
+function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, backing, priceData) {
+    const total = records.length;
+    let broken = 0, unbroken = 0;
+    const counts = {
+        unminted: 0,
+        treasury_held: 0,
+        dao_wallet_8ywv_held: 0,
+        enterprise_staked: 0,
+        enterprise_dao_broken: 0,
+        daodao_staked: 0,
+        bbl_listed: 0,
+        atrium_listed: 0,
+        boost_listed: 0,
+        user_held: 0,
+    };
+    const perOwnerCounts = {};       // raw owner → count
+    const perRealOwnerCounts = {};   // resolved owner → count
+    const perOwnerBroken = {};
+    const uniqueRealOwners = new Set();
+
+    for (const r of records) {
+        if (r.broken) broken++; else unbroken++;
+        for (const k of Object.keys(counts)) {
+            if (r[k]) counts[k]++;
+        }
+        if (r.owner) {
+            perOwnerCounts[r.owner] = (perOwnerCounts[r.owner] || 0) + 1;
+            if (r.broken) perOwnerBroken[r.owner] = (perOwnerBroken[r.owner] || 0) + 1;
+        }
+        if (r.real_owner) {
+            perRealOwnerCounts[r.real_owner] = (perRealOwnerCounts[r.real_owner] || 0) + 1;
+            uniqueRealOwners.add(r.real_owner);
+        }
+    }
+
+    // DAO members count: unique REAL owners (post-seller-resolution),
+    // minus the DAO-controlled custody addresses.
+    const excludedFromMembers = new Set([
+        DAO_MAIN_WALLET,
+        DAODAO_STAKING_CONTRACT,
+        DAO_TREASURY_CONTRACT,
+        ENTERPRISE_NFT_STAKING,
+        DAO_WALLET_8YWV,
+        BBL_MARKETPLACE,
+        ATRIUM_MARKETPLACE,
+        BOOST_MARKETPLACE,
+    ]);
+    const memberHolders = [...uniqueRealOwners].filter(o => !excludedFromMembers.has(o));
+
+    // Marketplace stats: floor value / count per marketplace
+    const marketplaceStats = {};
+    for (const mkName of ['bbl', 'atrium', 'boost']) {
+        const listings = marketplaces[mkName] || [];
+        const decoratedListings = records.filter(r => r.listing && r.listing.marketplace?.toLowerCase() === mkName).map(r => r.listing);
+        // Floor by token symbol (since different listings may use different payment tokens)
+        const byToken = {};
+        for (const l of decoratedListings) {
+            const sym = l.price_token_symbol || l.denom || 'unknown';
+            if (!byToken[sym]) byToken[sym] = { count: 0, total: 0, min: Infinity, total_usd: 0 };
+            byToken[sym].count++;
+            if (l.price_amount != null) {
+                byToken[sym].total += l.price_amount;
+                byToken[sym].min = Math.min(byToken[sym].min, l.price_amount);
+            }
+            if (l.price_usd != null) byToken[sym].total_usd += l.price_usd;
+        }
+        // Clean up infinities for empty buckets
+        for (const sym of Object.keys(byToken)) {
+            if (byToken[sym].min === Infinity) byToken[sym].min = null;
+        }
+        marketplaceStats[mkName] = {
+            count: listings.length,
+            count_resolved: decoratedListings.length,
+            by_token: byToken,
+        };
+    }
+
+    // Backing summary (collection-wide)
+    const backingSummary = backing ? {
+        ampluna_balance:    backing.ampluna_balance,
+        per_nft_ampluna:    backing.per_nft_ampluna_share,
+        unbroken_count:     unbroken,
+        ampluna_usd:        priceData.ampluna_usd,
+        treasury_value_usd: priceData.ampluna_usd != null ? +(backing.ampluna_balance * priceData.ampluna_usd).toFixed(2) : null,
+        per_nft_value_usd:  priceData.ampluna_usd != null ? +(backing.per_nft_ampluna_share * priceData.ampluna_usd).toFixed(4) : null,
+    } : null;
+
+    return {
+        // Aggregate counts (drive the top tiles)
+        total_tokens: total,
+        broken_count: broken,
+        unbroken_count: unbroken,
+        // New canonical classification counts
+        ...Object.fromEntries(Object.entries(counts).map(([k, v]) => [k + '_count', v])),
+        // Backward-compat aliases for current dashboard JS
+        unminted_count: counts.unminted,
+        minted_count: total - counts.unminted,
+        dao_held_count: counts.unminted, // alias kept for old code
+        // (note: old "enterprise_staked_count" semantics changed — was treasury_held, now real Enterprise stakes)
+        // The Rev 2 page migration will use the new names directly.
+
+        unique_holders: uniqueRealOwners.size,
+        dao_members_count: memberHolders.length,
+
+        // Useful breakdowns
+        per_owner_counts: perOwnerCounts,
+        per_real_owner_counts: perRealOwnerCounts,
+        per_owner_broken: perOwnerBroken,
+
+        // Backing & yield (collection-wide)
+        backing: backingSummary,
+
+        // Marketplace stats
+        marketplaces: marketplaceStats,
+    };
+}
+
+// -----------------------------------------------------------------------------
 // GITHUB PUBLISH
 // -----------------------------------------------------------------------------
 
@@ -367,7 +913,7 @@ function githubApiRequest(method, apiPath, body = null) {
             hostname: 'api.github.com', path: apiPath, method,
             headers: {
                 'Authorization': `token ${GITHUB_TOKEN}`,
-                'User-Agent':    'aDAO-nft-inventory/1.0',
+                'User-Agent':    'aDAO-nft-inventory/2.0',
                 'Accept':        'application/vnd.github.v3+json',
                 'Content-Type':  'application/json',
             },
@@ -412,73 +958,119 @@ async function pushToGithub(filepath, content, message) {
 async function captureSnapshot() {
     const startedAt = new Date();
     const epoch = currentEpoch();
-    console.log(`🚀 NFT Inventory Cron — ${startedAt.toISOString()} (epoch ${epoch})`);
+    const dateKey = todayUtcDate();
+    console.log(`🚀 NFT Inventory Cron Rev B — ${startedAt.toISOString()} (epoch ${epoch})`);
     console.log();
 
-    // Phase 1: enumerate IDs
+    // ── Phase 1: enumerate token IDs ────────────────────────────────────────
     const tokenIds = await enumerateAllTokens();
-
     // Sanity check against num_tokens
-    const numTokensData = await queryContract(ADAO_NFT_CONTRACT, { num_tokens: {} }, 'num_tokens');
+    const numTokensData = await queryContractSafe(ADAO_NFT_CONTRACT, { num_tokens: {} }, 'num_tokens');
     const declaredCount = numTokensData?.count ?? null;
     if (declaredCount != null && tokenIds.length !== declaredCount) {
         console.warn(`  ⚠ Enumerated ${tokenIds.length} but contract reports ${declaredCount}`);
     }
     console.log();
 
-    // Phase 2: per-NFT info
+    // ── Phase 2: per-NFT info ────────────────────────────────────────────────
     const records = await fetchAllNftInfo(tokenIds);
     const captureRate = tokenIds.length > 0 ? records.length / tokenIds.length : 0;
     console.log();
 
-    // Phase 3: aggregate
-    console.log('📊 Phase 3: aggregating...');
-    const summary = aggregate(records);
-    console.log(`  Minted:           ${summary.minted_count.toLocaleString()}`);
-    console.log(`  Unminted (DAO):   ${summary.unminted_count.toLocaleString()}`);
-    console.log(`  Broken:           ${summary.broken_count.toLocaleString()}`);
-    console.log(`  Unbroken:         ${summary.unbroken_count.toLocaleString()}`);
-    console.log(`  DAODAO staked:    ${summary.daodao_staked_count.toLocaleString()}`);
-    console.log(`  Enterprise:       ${summary.enterprise_staked_count.toLocaleString()}`);
-    console.log(`  Unique holders:   ${summary.unique_holders.toLocaleString()}`);
-    console.log(`  DAO members:      ${summary.dao_members_count.toLocaleString()}`);
+    // ── Phases 3-5: parallel data fetches (independent systems) ─────────────
+    console.log('🔀 Phases 3-7: parallel data fetches...');
+    const [enterpriseStakers, marketplaces, daodaoStakers, priceData] = await Promise.all([
+        fetchEnterpriseStakers(),
+        fetchMarketplaces(),
+        fetchDaodaoStakers(),
+        fetchPriceData(),
+    ]);
     console.log();
 
-    // Phase 4: drill into staker tables
-    const daodaoStakers = await fetchDaodaoStakers();
+    // ── Compute unbroken count (needed for Phase 6) ─────────────────────────
+    const unbrokenCount = records.filter(r => !r.broken).length;
+
+    // ── Phase 6: backing data (needs unbroken count) ────────────────────────
+    const backing = await fetchBackingData(unbrokenCount);
     console.log();
 
-    // Assemble output documents
+    // ── Merge marketplace listings into records ─────────────────────────────
+    console.log('🔗 Merging marketplace listings into records...');
+    mergeMarketplaceListings(records, marketplaces, priceData);
+    console.log();
+
+    // ── Aggregate ───────────────────────────────────────────────────────────
+    console.log('📊 Aggregating...');
+    const summary = aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, backing, priceData);
+    console.log(`  Unminted (DAO):      ${summary.unminted_count.toLocaleString()}`);
+    console.log(`  Treasury (broken):   ${summary.treasury_held_count.toLocaleString()}`);
+    console.log(`  Enterprise staked:   ${summary.enterprise_staked_count.toLocaleString()} (real user stakes)`);
+    console.log(`  Enterprise DAO:      ${summary.enterprise_dao_broken_count.toLocaleString()} (DAO-controlled broken)`);
+    console.log(`  DAODAO staked:       ${summary.daodao_staked_count.toLocaleString()}`);
+    console.log(`  BBL listed:          ${summary.bbl_listed_count.toLocaleString()}`);
+    console.log(`  Atrium listed:       ${summary.atrium_listed_count.toLocaleString()}`);
+    console.log(`  Boost listed:        ${summary.boost_listed_count.toLocaleString()}`);
+    console.log(`  User-held:           ${summary.user_held_count.toLocaleString()}`);
+    console.log(`  Broken:              ${summary.broken_count.toLocaleString()}`);
+    console.log(`  Unbroken:            ${summary.unbroken_count.toLocaleString()}`);
+    console.log(`  Unique real owners:  ${summary.unique_holders.toLocaleString()}`);
+    console.log(`  DAO members:         ${summary.dao_members_count.toLocaleString()}`);
+    if (summary.backing) {
+        console.log(`  Treasury ampLUNA:    ${summary.backing.ampluna_balance.toFixed(2)}`);
+        console.log(`  Per-NFT share:       ${summary.backing.per_nft_ampluna.toFixed(4)} ampLUNA`);
+        if (summary.backing.treasury_value_usd != null) {
+            console.log(`  Treasury value:      $${summary.backing.treasury_value_usd.toLocaleString(undefined, { maximumFractionDigits: 0 })}`);
+        }
+    }
+    // Sanity: sum of all classification counts should equal total tokens
+    const classifiedSum = (
+        summary.unminted_count + summary.treasury_held_count + summary.dao_wallet_8ywv_held_count +
+        summary.enterprise_staked_count + summary.enterprise_dao_broken_count +
+        summary.daodao_staked_count + summary.bbl_listed_count + summary.atrium_listed_count +
+        summary.boost_listed_count + summary.user_held_count
+    );
+    if (classifiedSum !== summary.total_tokens) {
+        console.warn(`  ⚠ Classification sum (${classifiedSum}) ≠ total tokens (${summary.total_tokens}) — overlap or gap`);
+    } else {
+        console.log(`  ✓ Classification sums correctly to ${summary.total_tokens}`);
+    }
+    console.log();
+
+    // ── Assemble output documents ───────────────────────────────────────────
     const status = captureRate >= 0.99 ? 'ok' : 'partial';
+    const contracts = {
+        nft:                       ADAO_NFT_CONTRACT,
+        dao_main_wallet:           DAO_MAIN_WALLET,
+        daodao_staking:            DAODAO_STAKING_CONTRACT,
+        dao_treasury:              DAO_TREASURY_CONTRACT,
+        dao_wallet_8ywv:           DAO_WALLET_8YWV,
+        enterprise_nft_staking:    ENTERPRISE_NFT_STAKING,
+        bbl_marketplace:           BBL_MARKETPLACE,
+        atrium_marketplace:        ATRIUM_MARKETPLACE,
+        boost_marketplace:         BOOST_MARKETPLACE,
+        ampluna_cw20:              AMPLUNA_CW20,
+    };
     const nftsDoc = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
-        nft_contract: ADAO_NFT_CONTRACT,
+        contracts,
         total_tokens: records.length,
         capture_rate: captureRate,
         records,
     };
     const summaryDoc = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
         epoch,
-        nft_contract: ADAO_NFT_CONTRACT,
-        contracts: {
-            dao_main_wallet:        DAO_MAIN_WALLET,
-            daodao_staking:         DAODAO_STAKING_CONTRACT,
-            enterprise_treasury:    ENTERPRISE_TREASURY,
-        },
+        contracts,
         ...summary,
         daodao_stakers: daodaoStakers,
-        // Enterprise stakers: the treasury contract holds them all on-chain.
-        // No per-staker list available via standard query — would need event log walk.
-        // The dashboard modal can display the count + treasury holder count.
-        enterprise_stakers_note: 'Enterprise treasury holds all migrated NFTs as a single owner. Individual staker attribution requires event log walk (not currently captured).',
+        enterprise_stakers: enterpriseStakers,
     };
     const heartbeatDoc = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         cron: 'nft-inventory',
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
@@ -489,28 +1081,63 @@ async function captureSnapshot() {
         stats: {
             total_tokens: records.length,
             capture_rate: captureRate,
-            minted: summary.minted_count,
             unminted: summary.unminted_count,
             broken: summary.broken_count,
-            daodao: summary.daodao_staked_count,
-            enterprise: summary.enterprise_staked_count,
+            unbroken: summary.unbroken_count,
+            treasury_held: summary.treasury_held_count,
+            enterprise_staked: summary.enterprise_staked_count,
+            enterprise_dao_broken: summary.enterprise_dao_broken_count,
+            daodao_staked: summary.daodao_staked_count,
+            bbl_listed: summary.bbl_listed_count,
+            atrium_listed: summary.atrium_listed_count,
+            boost_listed: summary.boost_listed_count,
+            user_held: summary.user_held_count,
             unique_holders: summary.unique_holders,
+            ampluna_balance: summary.backing?.ampluna_balance ?? null,
+            per_nft_ampluna: summary.backing?.per_nft_ampluna ?? null,
         },
         next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
     };
+    // Daily snapshot — overwrites today's file each run; final write of the day "wins"
+    // and represents the day-end state. Subsequent runs see the previous day's snapshot
+    // as reference for movement / yield-delta tracking.
+    const dailyDoc = {
+        schemaVersion: 1,
+        date: dateKey,
+        capturedAt: startedAt.toISOString(),
+        // Subset of summary suitable for daily timeline (full summary is also at
+        // data/summary.json, but daily snapshot is the time-anchored archive).
+        epoch,
+        total_tokens: records.length,
+        broken_count: summary.broken_count,
+        unbroken_count: summary.unbroken_count,
+        unminted_count: summary.unminted_count,
+        treasury_held_count: summary.treasury_held_count,
+        enterprise_staked_count: summary.enterprise_staked_count,
+        enterprise_dao_broken_count: summary.enterprise_dao_broken_count,
+        daodao_staked_count: summary.daodao_staked_count,
+        bbl_listed_count: summary.bbl_listed_count,
+        atrium_listed_count: summary.atrium_listed_count,
+        boost_listed_count: summary.boost_listed_count,
+        user_held_count: summary.user_held_count,
+        backing: summary.backing,
+        marketplaces: summary.marketplaces,
+    };
 
-    // Publish / save
+    // ── Publish / save ──────────────────────────────────────────────────────
     if (GITHUB_TOKEN) {
         console.log('📤 Publishing to GitHub...');
-        await pushToGithub('data/nfts.json',      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs`);
-        await pushToGithub('data/summary.json',   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.minted_count} minted / ${summary.broken_count} broken`);
+        await pushToGithub('data/nfts.json',      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs (rev B schema v2)`);
+        await pushToGithub('data/summary.json',   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.broken_count} broken / ${summary.bbl_listed_count + summary.atrium_listed_count + summary.boost_listed_count} listed`);
         await pushToGithub('data/heartbeat.json', JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${status}`);
+        await pushToGithub(`data/daily/${dateKey}.json`, JSON.stringify(dailyDoc, null, 2), `daily snapshot — ${dateKey}`);
     } else {
         console.log('⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('nfts.json', JSON.stringify(nftsDoc));
         fs.writeFileSync('summary.json', JSON.stringify(summaryDoc, null, 2));
         fs.writeFileSync('heartbeat.json', JSON.stringify(heartbeatDoc, null, 2));
-        console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json`);
+        fs.writeFileSync(`daily-${dateKey}.json`, JSON.stringify(dailyDoc, null, 2));
+        console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json, daily-${dateKey}.json`);
     }
 
     const elapsed = (Date.now() - startedAt.getTime()) / 1000;
@@ -531,8 +1158,23 @@ if (require.main === module) {
 
 module.exports = {
     captureSnapshot,
+    // Phase exports for testing
     enumerateAllTokens,
     fetchAllNftInfo,
-    aggregate,
+    fetchEnterpriseStakers,
+    fetchMarketplaces,
     fetchDaodaoStakers,
+    fetchBackingData,
+    fetchPriceData,
+    aggregate,
+    // Constants (might be useful for tests / sanity checks)
+    ADAO_NFT_CONTRACT,
+    DAO_MAIN_WALLET,
+    DAO_TREASURY_CONTRACT,
+    DAODAO_STAKING_CONTRACT,
+    ENTERPRISE_NFT_STAKING,
+    BBL_MARKETPLACE,
+    ATRIUM_MARKETPLACE,
+    BOOST_MARKETPLACE,
+    AMPLUNA_CW20,
 };
