@@ -421,6 +421,7 @@ async function fetchEnterpriseStakers() {
 //     is_settled, offers }
 async function fetchBblListings() {
     const out = [];
+    const seenIds = new Set();
     let startAfter = null;
     let page = 0;
     while (true) {
@@ -432,7 +433,18 @@ async function fetchBblListings() {
         const data = await queryContract(BBL_MARKETPLACE, { auction_by_contract: params }, `bbl page ${page}`);
         const auctions = data?.auctions || [];
         if (auctions.length === 0) break;
-        out.push(...auctions);
+        // Defensive de-dupe: only keep auctions we haven't already collected. If a
+        // page contributes zero NEW auction_ids, pagination isn't advancing (BBL is
+        // returning the same window) — stop instead of looping to the page cap.
+        let added = 0;
+        for (const a of auctions) {
+            const id = a?.auction_id;
+            if (id == null || seenIds.has(String(id))) continue;
+            seenIds.add(String(id));
+            out.push(a);
+            added++;
+        }
+        if (added === 0) break;
         // BBL pagination key: most likely auction_id (numeric, string-typed). We pass the last one.
         const lastId = auctions[auctions.length - 1]?.auction_id;
         if (!lastId) break;
@@ -464,6 +476,7 @@ async function fetchBblListings() {
 //     expires_at, created_at, whitelisted_buyer, time_locked_until, locked_for, whitelist }
 async function fetchAtriumListings() {
     const out = [];
+    const seenIds = new Set();
     let startAfter = null;
     let page = 0;
     while (true) {
@@ -475,7 +488,15 @@ async function fetchAtriumListings() {
         const data = await queryContract(ATRIUM_MARKETPLACE, { listings_by_collection: params }, `atrium page ${page}`);
         const listings = data?.listings || [];
         if (listings.length === 0) break;
-        out.push(...listings);
+        let added = 0;
+        for (const l of listings) {
+            const id = l?.id;
+            if (id == null || seenIds.has(String(id))) continue;
+            seenIds.add(String(id));
+            out.push(l);
+            added++;
+        }
+        if (added === 0) break;
         const lastId = listings[listings.length - 1]?.id;
         if (lastId == null) break;
         startAfter = lastId;
@@ -518,6 +539,7 @@ async function fetchAtriumListings() {
 //   }
 async function fetchBoostListings() {
     const out = [];
+    const seenIds = new Set();
     let startAfter = null;
     let page = 0;
     // Boost may use `start_after` keyed by id. We try empty first, then paginate.
@@ -528,7 +550,15 @@ async function fetchBoostListings() {
         // Defensive: accept either shape.
         const arr = Array.isArray(data) ? data : (data?.launches || data?.data || []);
         if (!Array.isArray(arr) || arr.length === 0) break;
-        out.push(...arr);
+        let added = 0;
+        for (const l of arr) {
+            const id = l?.id;
+            if (id == null || seenIds.has(String(id))) continue;
+            seenIds.add(String(id));
+            out.push(l);
+            added++;
+        }
+        if (added === 0) break;
         const lastId = arr[arr.length - 1]?.id;
         if (lastId == null) break;
         startAfter = lastId;
@@ -784,10 +814,15 @@ function mergeMarketplaceListings(records, marketplaces, priceData) {
     for (const l of all) {
         if (l.token_id != null) {
             const key = String(l.token_id);
-            // If same token has multiple active listings across marketplaces (rare),
-            // we keep the first one we encounter and log a warning.
+            // If same token already has a listing, keep the first one we encountered.
+            // Only warn when it's a genuine CROSS-marketplace conflict (e.g. BBL vs
+            // Atrium) — a duplicate within the same marketplace is just noise and is
+            // de-duped silently.
             if (listingByTokenId[key]) {
-                console.warn(`  ⚠ NFT #${key} listed on BOTH ${listingByTokenId[key].marketplace} and ${l.marketplace} — keeping ${listingByTokenId[key].marketplace}`);
+                const existing = listingByTokenId[key];
+                if (existing.marketplace !== l.marketplace) {
+                    console.warn(`  ⚠ NFT #${key} listed on BOTH ${existing.marketplace} and ${l.marketplace} — keeping ${existing.marketplace}`);
+                }
                 continue;
             }
             listingByTokenId[key] = l;
