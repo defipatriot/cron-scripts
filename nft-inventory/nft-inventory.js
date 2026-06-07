@@ -112,6 +112,12 @@ const OUTPUT_PATH = 'data/v2';
 const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/current.json';
 const CATALOG_DATA_URL = 'https://raw.githubusercontent.com/defipatriot/tla-chain-registry/main/data/current.json';
 
+// DAODAO pending-claim tracking (Rev B.3). Forward-only state persisted in the data repo.
+const PENDING_CLAIMS_PATH    = `${OUTPUT_PATH}/pending-claims.json`;
+const PENDING_CLAIMS_RAW_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/pending-claims.json`;
+const UNSTAKE_WINDOW_SECONDS = 604800;                      // 7-day DAODAO claim queue (claim_duration in unstake events)
+const UNSTAKE_WINDOW_MS      = UNSTAKE_WINDOW_SECONDS * 1000;
+
 // TLA epoch math (for heartbeat consistency with other crons)
 const TLA_EPOCH_START_MS = Date.parse('2022-10-31T00:00:00Z');
 const TLA_EPOCH_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -997,6 +1003,175 @@ async function pushToGithub(filepath, content, message) {
 }
 
 // -----------------------------------------------------------------------------
+// DAODAO PENDING-CLAIM TRACKING (Rev B.3)
+// -----------------------------------------------------------------------------
+// The DAODAO staking contract physically holds `daodao_staked_count` NFTs (cw721
+// custody), but only `total_power_at_height` of them are ACTIVELY staked (= the
+// number DAODAO's own UI shows). The difference is NFTs that were unstaked but
+// not yet claimed — they sit in the 7-day claim queue, or sit there indefinitely
+// if the owner forgets to claim ("forgotten claims").
+//
+//   custody (daodao_staked_count)  −  total_power  =  pending claims   [CHAIN TRUTH]
+//
+// We track those forward by watching unstake / claim_nfts events (LCD tx-search),
+// persisting state in data/v2/pending-claims.json. Every run we reconcile the
+// tracked list against the chain-truth count above. The COUNT is always derived
+// live from chain (never wrong); per-wallet attribution is best-effort from the
+// event log. If they disagree we still render the chain count and flag the drift
+// — graceful degradation, honest data over false positives. No historical
+// backfill (public LCDs prune): seeded once, then tracks itself forward.
+
+function buildTxSearchUrl(base, contract, action, minHeight, limit, offset) {
+    const q = `wasm._contract_address='${contract}' AND wasm.action='${action}' AND tx.height>${minHeight}`;
+    return `${base}/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(q)}` +
+           `&order_by=ORDER_BY_ASC&pagination.limit=${limit}&pagination.offset=${offset}`;
+}
+
+// unstake: token_ids come straight from the execute message.
+function parseUnstakeTxs(txResponses) {
+    const out = [];
+    for (const r of txResponses || []) {
+        for (const m of r?.tx?.body?.messages || []) {
+            const ids = m?.msg?.unstake?.token_ids;
+            if (!Array.isArray(ids)) continue;
+            out.push({ kind: 'unstake', height: Number(r.height), time: r.timestamp, address: m.sender, token_ids: ids.map(Number) });
+        }
+    }
+    return out;
+}
+
+// claim_nfts: message is empty {}. Returned tokens live in transfer_nft events
+// where the staking contract is the SENDER. Parsing those makes removal
+// token-precise (this is what correctly resolves re-unstaked tokens like 1319).
+function parseClaimTxs(txResponses, nftContract, stakingContract) {
+    const out = [];
+    for (const r of txResponses || []) {
+        const claimant = r?.tx?.body?.messages?.[0]?.sender || null;
+        const tokenIds = [];
+        for (const ev of r?.events || []) {
+            if (ev.type !== 'wasm') continue;
+            const a = {};
+            for (const kv of ev.attributes || []) a[kv.key] = kv.value;
+            if (a._contract_address === nftContract && a.action === 'transfer_nft' &&
+                a.sender === stakingContract && a.token_id != null) {
+                tokenIds.push(Number(a.token_id));
+            }
+        }
+        if (tokenIds.length) out.push({ kind: 'claim', height: Number(r.height), time: r.timestamp, address: claimant, token_ids: tokenIds });
+    }
+    return out;
+}
+
+// PURE reducer: fold new unstake/claim events onto prior state, in true block
+// order (a token can be unstaked, claimed, then unstaked again — only the last
+// event decides whether it's currently queued). Returns { block, updatedState }.
+// No IO — kept pure so it can be unit-tested against real data.
+function applyPendingEvents(priorState, unstakeTxResponses, claimTxResponses, opts) {
+    const { custodyCount, totalPower, tipHeight, scanFailed = false, now = Date.now() } = opts;
+    const byToken = new Map((priorState.entries || []).map(e => [Number(e.token_id), e]));
+    let maxHeight = priorState.lastScannedHeight || 0;
+
+    const events = [
+        ...parseUnstakeTxs(unstakeTxResponses || []),
+        ...parseClaimTxs(claimTxResponses || [], ADAO_NFT_CONTRACT, DAODAO_STAKING_CONTRACT),
+    ].sort((a, b) => a.height - b.height);
+
+    for (const ev of events) {
+        if (ev.kind === 'unstake') {
+            const releaseAt = new Date(Date.parse(ev.time) + UNSTAKE_WINDOW_MS).toISOString();
+            for (const tid of ev.token_ids) byToken.set(tid, { token_id: tid, address: ev.address, unstaked_at: ev.time, release_at: releaseAt });
+        } else {
+            for (const tid of ev.token_ids) byToken.delete(tid);
+        }
+        if (ev.height > maxHeight) maxHeight = ev.height;
+    }
+
+    const entries = [...byToken.values()].sort((a, b) => a.token_id - b.token_id);
+    // Advance the scan height only if the scan succeeded (else we'd skip events next run).
+    const newLastScanned = scanFailed ? (priorState.lastScannedHeight || 0) : Math.max(maxHeight, tipHeight || 0);
+    const updatedState = { lastScannedHeight: newLastScanned, entries };
+
+    const inWindow = [], claimable = [];
+    for (const e of entries) (Date.parse(e.release_at) <= now ? claimable : inWindow).push(e);
+
+    let count, reconciled;
+    if (totalPower == null) {           // chain-truth query failed → best-effort
+        count = entries.length; reconciled = null;
+    } else {
+        count = custodyCount - totalPower;          // authoritative
+        reconciled = entries.length === count;
+    }
+
+    const block = {
+        count, tracked: entries.length, reconciled,
+        active_staked: totalPower, custody: custodyCount,
+        unstake_window_seconds: UNSTAKE_WINDOW_SECONDS,
+        in_window: inWindow, claimable,
+    };
+    return { block, updatedState };
+}
+
+// Fetch all matching txs for an action above minHeight (paginated, oldest-first).
+// Returns tx_responses array, or null if both LCDs fail.
+async function fetchDaodaoTxs(action, minHeight) {
+    const LIMIT = 100, MAX_PAGES = 10;
+    const tryBase = async (base) => {
+        const all = [];
+        for (let page = 0; page < MAX_PAGES; page++) {
+            const url = buildTxSearchUrl(base, DAODAO_STAKING_CONTRACT, action, minHeight, LIMIT, page * LIMIT);
+            const resp = await fetchJson(url, `daodao ${action} p${page}`);
+            const batch = resp?.tx_responses || [];
+            all.push(...batch);
+            if (batch.length < LIMIT) break;
+        }
+        return all;
+    };
+    try { return await tryBase(TERRA_LCD_PRIMARY); }
+    catch (e1) {
+        try { return await tryBase(TERRA_LCD_FALLBACK); }
+        catch (e2) { console.warn(`  ⚠ DAODAO ${action} tx-search failed on both LCDs: ${e2.message}`); return null; }
+    }
+}
+
+// Read persisted pending-claim state from the data repo (public raw URL).
+async function loadPendingState() {
+    const state = await tryFetchJson(PENDING_CLAIMS_RAW_URL, 'pending-claims state');
+    if (state && Array.isArray(state.entries) && Number.isFinite(state.lastScannedHeight)) {
+        return { lastScannedHeight: state.lastScannedHeight, entries: state.entries };
+    }
+    // No state yet (or unreadable) → replay from genesis (events paginate;
+    // replaying all unstakes+claims reconstructs the exact current pending set).
+    return { lastScannedHeight: 0, entries: [] };
+}
+
+// IO wrapper: query total_power, fetch forward events, fold via applyPendingEvents,
+// and emit operator warnings. Caller persists updatedState in the publish phase.
+async function computePendingClaims(summary, priorState) {
+    const custodyCount = summary.daodao_staked_count;
+    const powerRes  = await queryContractSafe(DAODAO_STAKING_CONTRACT, { total_power_at_height: {} }, 'daodao total_power');
+    const totalPower = powerRes?.power  != null ? Number(powerRes.power)  : null;
+    const tipHeight  = powerRes?.height != null ? Number(powerRes.height) : priorState.lastScannedHeight;
+
+    const unstakeTxs = await fetchDaodaoTxs('unstake',    priorState.lastScannedHeight);
+    const claimTxs   = await fetchDaodaoTxs('claim_nfts', priorState.lastScannedHeight);
+    const scanFailed = (unstakeTxs === null || claimTxs === null);
+
+    const { block, updatedState } = applyPendingEvents(
+        priorState, unstakeTxs || [], claimTxs || [],
+        { custodyCount, totalPower, tipHeight, scanFailed },
+    );
+
+    if (totalPower == null) {
+        console.warn('  ⚠ total_power_at_height failed — pending count is best-effort (tracked), not chain-verified');
+    } else if (scanFailed) {
+        console.warn('  ⚠ pending-claim tx-search failed this run — per-wallet detail may be stale (count is chain-truth)');
+    } else if (!block.reconciled) {
+        console.warn(`  ⚠ pending-claim DRIFT: chain says ${block.count}, tracked ${block.tracked} — missed event or NFT sent directly to contract`);
+    }
+    return { block, updatedState };
+}
+
+// -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
 
@@ -1082,6 +1257,17 @@ async function captureSnapshot() {
     }
     console.log();
 
+    // ── DAODAO pending-claim reconciliation ────────────────────────
+    console.log('🔁 Reconciling DAODAO pending claims...');
+    const priorPendingState = await loadPendingState();
+    const pending = await computePendingClaims(summary, priorPendingState);
+    summary.daodao_pending_claim = pending.block;
+    console.log(`  Pending claims:      ${pending.block.count} chain / ${pending.block.tracked} tracked / reconciled: ${pending.block.reconciled}`);
+    if (pending.block.claimable.length) {
+        console.log(`  Claimable now:       token ${pending.block.claimable.map(e => e.token_id).join(', ')}`);
+    }
+    console.log();
+
     // ── Assemble output documents ───────────────────────────────────────────
     const status = captureRate >= 0.99 ? 'ok' : 'partial';
     const contracts = {
@@ -1145,6 +1331,8 @@ async function captureSnapshot() {
             unique_holders: summary.unique_holders,
             ampluna_balance: summary.backing?.ampluna_balance ?? null,
             per_nft_ampluna: summary.backing?.per_nft_ampluna ?? null,
+            daodao_pending_claim: pending.block.count,
+            daodao_pending_reconciled: pending.block.reconciled,
         },
         next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
     };
@@ -1184,12 +1372,14 @@ async function captureSnapshot() {
         await pushToGithub(`${OUTPUT_PATH}/summary.json`,   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.broken_count} broken / ${summary.bbl_listed_count + summary.atrium_listed_count + summary.boost_listed_count} listed`);
         await pushToGithub(`${OUTPUT_PATH}/heartbeat.json`, JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${status}`);
         await pushToGithub(`${OUTPUT_PATH}/daily/${dateKey}.json`, JSON.stringify(dailyDoc, null, 2), `daily snapshot — ${dateKey}`);
+        await pushToGithub(PENDING_CLAIMS_PATH, JSON.stringify(pending.updatedState, null, 2), `pending-claims — ${pending.block.count} pending${pending.block.reconciled === false ? ' (DRIFT)' : ''}`);
     } else {
         console.log('⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('nfts.json', JSON.stringify(nftsDoc));
         fs.writeFileSync('summary.json', JSON.stringify(summaryDoc, null, 2));
         fs.writeFileSync('heartbeat.json', JSON.stringify(heartbeatDoc, null, 2));
         fs.writeFileSync(`daily-${dateKey}.json`, JSON.stringify(dailyDoc, null, 2));
+        fs.writeFileSync('pending-claims.json', JSON.stringify(pending.updatedState, null, 2));
         console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json, daily-${dateKey}.json`);
     }
 
@@ -1220,6 +1410,12 @@ module.exports = {
     fetchBackingData,
     fetchPriceData,
     aggregate,
+    // Pending-claim tracking (Rev B.3)
+    parseUnstakeTxs,
+    parseClaimTxs,
+    applyPendingEvents,
+    computePendingClaims,
+    loadPendingState,
     // Constants (might be useful for tests / sanity checks)
     ADAO_NFT_CONTRACT,
     DAO_MAIN_WALLET,
