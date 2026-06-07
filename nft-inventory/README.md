@@ -77,11 +77,29 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 
 | File | Purpose | Update cadence |
 |---|---|---|
-| `data/v2/nfts.json` | Per-NFT records (canonical full state) | Every run (~2.5 MB) |
+| `data/v2/nfts.json` | Per-NFT records (canonical full state) | Every run (~6 MB) |
 | `data/v2/summary.json` | Aggregates + stakers + marketplaces + backing | Every run |
-| `data/v2/heartbeat.json` | Freshness contract + stats | Every run |
+| `data/v2/heartbeat.json` | Freshness contract + stats (`runMode` = full/warm/hot) | Every run |
 | `data/v2/daily/<date>.json` | End-of-day snapshot (for movement/yield timeline) | Overwritten each run; last write of day wins |
 | `data/v2/pending-claims.json` | DAODAO unstaked-but-unclaimed tracking (self-maintaining state) | Every run — cron adds/removes entries automatically |
+| `data/v2/hot-set.json` | Token IDs the hot path polls (user-held + marketplace + pending) | Rebuilt on **full** runs only |
+
+## Deployment (tiered modes — Rev C.1)
+
+One script, three Render cron jobs, distinguished by the `RUN_MODE` env var. All three share the same repo, start command (`node nft-inventory.js`), `GITHUB_TOKEN`, and `GITHUB_REPO`. `RUN_MODE` defaults to `full`, so a job with no env set runs a full scan.
+
+Roll out in this order (each step is safe on its own):
+
+1. **Deploy the code.** The existing job (still hourly) runs `full` by default — behaves exactly as before, and now also writes `hot-set.json`. Confirm `hot-set.json` appears with ~1,100 token IDs before continuing.
+2. **Repurpose the existing job as the weekly cold/full reconcile:** set its schedule to `0 2 * * 1` (Mon 02:00 UTC); `RUN_MODE` unset or `full`.
+3. **Add the warm job:** schedule `10 0 * * *` (daily 00:10 UTC), env `RUN_MODE=warm`.
+4. **Add the hot job:** schedule `*/15 * * * *` (every 15 min), env `RUN_MODE=hot`.
+
+Notes:
+- Hot/warm read the last full `nfts.json` as their base. If it (or `hot-set.json`) is missing/unreadable, they auto-fall-back to a full scan, so they're safe to enable even before the first scheduled full run.
+- Hot rewrites the full `nfts.json` (~6 MB) every 15 min. That's deliberate (the page reads one merged file), but it means ~96 commits/day to the data repo. The `*-data_2026` yearly rotation bounds the growth; if churn becomes a problem, stage 1.5 can split a slim `hot.json` out and merge client-side.
+- Stage 2 (activity deltas) and stage 3 (rollups) are not in this rev — daily files are still last-write-wins snapshots for now.
+
 
 ## Pre-Rev-B data (abandoned)
 
@@ -155,6 +173,7 @@ If you want to migrate or salvage pre-Rev-B data later, document the analysis in
 
 ## Rev history
 
+- **Rev C.1 (2026-06-07)** — Tiered run modes (stage 1: mode infrastructure + hot-set). One script, three Render jobs, selected by `RUN_MODE` env (`full` default / `warm` / `hot`). Mode changes ONLY the per-NFT scope (Phase 1+2); Phases 3-7 (cheap aggregate queries) run identically, so every mode publishes a complete 10k `nfts.json`. **full** (weekly): enumerate + fetch all 10k, full reconcile, and (re)write `data/v2/hot-set.json` = the token IDs the hot path polls (user-held + marketplace-owned + pending-claim). **warm** (daily): re-fetch hot ∪ staked (~3.2k), merge onto the last full base. **hot** (every 15 min): re-fetch the hot set only (~1.1k), merge onto base. Hot/warm load the prior full `nfts.json` as the base and overlay freshly-fetched in-scope records via `mergeRecords`; if the base or hot-set is unreadable they **fall back to a full scan** so output is never partial. Default `full` means an unconfigured deploy behaves exactly as before (plus it now emits `hot-set.json`). Merge/derive logic unit-tested across all buckets (sale/delist/claim transitions, stable carry-through). Live hot/warm cadence verified on Render. Stage 2 (per-run activity deltas) and stage 3 (daily→weekly→monthly→yearly rollups) follow. See "Deployment (tiered modes)" below.
 - **Rev B.7 (2026-06-07)** — Atrium listings schema-drift fix. Atrium's `listings_by_collection` query started 500'ing with `unknown field \`collection\`` (the variant is still valid; the contract upgraded and renamed the collection field). `fetchAtriumListings` now calls `resolveAtriumCollectionField()`, which probes the common CosmWasm field-name conventions (`collection_addr`, `nft_contract`, `collection_address`, `address`, `contract`, `contract_addr`, `cw721`, `collection`), memoizes the first the contract accepts, and reuses it for pagination. If none match, it logs the contract's full untruncated "expected one of …" list so the right name can be pinned in one follow-up. No regression: Atrium-held NFTs were already classified by cw721 ownership; this only restores price/seller detail on Atrium listings. Marketplace data layer only. NOTE: the live-accepted field name is confirmed on the Render run (sandbox can't reach the contract) — watch for the `ℹ Atrium collection field resolved to '…'` line.
 - **Rev B.6 (2026-06-07)** — DAODAO pending-claim tx-search fix. The LCD began rejecting the tx-search query with `HTTP 400 "Please specify tx.height with strict equality"` because the query carried a `tx.height>${minHeight}` **range** condition, which publicnode's tx index no longer accepts. Fix: dropped the height term from the query (`buildTxSearchUrl` now filters only on `wasm._contract_address` + `wasm.action`) and moved height filtering **client-side** in `fetchDaodaoTxs` (`.filter(r => r.height > minHeight)`). The event set handed to the reducer is identical to before, so per-wallet attribution tracking is restored without changing `parseUnstakeTxs` / `parseClaimTxs` / `applyPendingEvents`. Before this, the count stayed correct (chain-truth) and `reconciled` flagged honestly, but forward attribution was frozen. Logic re-verified (genesis replay → [1319,3605,6847,7123]; incremental run no-ops; forward claim removes its token). Confirmed live: `lastScannedHeight` advanced 21353559 → 21355202 on first run. Bounded result set (a few dozen lifetime unstake/claim txs); if it ever exceeds ~1000 lifetime events, switch to DESC paging (see failure modes).
 - **Rev B.5 (2026-06-07)** — USD pricing fix (was silently skipped). Two bugs: (1) both sister-cron URLs were wrong — corrected to `network-and-prices-data_2026/main/data/network-and-prices.json` and `tla-chain-registry/main/2026/current.json` (the old `data/current.json` paths 404'd); (2) `fetchPriceData` parsed an assumed schema that didn't match. Now reads LUNA from `token_prices.LUNA.final_price_usd` (fallback `luna_market.usd_price`), ampLUNA from `token_prices.ampLUNA.final_price_usd` (fallback `lst_ratios.ampLUNA.ratio × luna_usd`), and joins the registry token catalog (keyed by address → symbol + decimals) with `token_prices` (keyed by symbol → `final_price_usd`) so `decodeTokenDenom` finds prices by address as it expects. Verified live: LUNA $0.0512, ampLUNA $0.1103, → `treasury_value_usd` ≈ $86.8K, `per_nft_value_usd` ≈ $9.74 (all were null before). Marketplace listing USD now resolves for LUNA/USDC/ampLUNA/SOLID/CAPA denoms. Price layer only; classification/pending-claim/marketplace-pagination logic untouched.

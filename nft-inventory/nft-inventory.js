@@ -118,6 +118,26 @@ const PENDING_CLAIMS_RAW_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}
 const UNSTAKE_WINDOW_SECONDS = 604800;                      // 7-day DAODAO claim queue (claim_duration in unstake events)
 const UNSTAKE_WINDOW_MS      = UNSTAKE_WINDOW_SECONDS * 1000;
 
+// ─── Rev C: tiered run modes (hot / warm / cold-full) ───────────────────────
+// One script, three Render cron jobs, selected by RUN_MODE. The ONLY thing mode
+// changes is which token IDs get per-NFT fetched (Phase 1+2). Phases 3-7 (cheap
+// aggregate queries) run identically in every mode, so the merged output is always
+// a complete 10k picture — just with stale-but-stable records for tokens outside
+// the scope (those can't move without a governance prop and are reconciled weekly).
+//   full (weekly, default): enumerate + fetch all 10k, full reconcile, (re)write hot-set.json
+//   warm (daily):           hot set ∪ staked sets; merge fresh onto the last full base
+//   hot  (every 15 min):    hot set only (user-held + marketplace + pending); merge onto base
+// Default is 'full' so existing/unconfigured deployments behave exactly as before.
+const RUN_MODE = (process.env.RUN_MODE || 'full').toLowerCase();
+const HOT_SET_PATH    = `${OUTPUT_PATH}/hot-set.json`;
+const HOT_SET_RAW_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/hot-set.json`;
+const NFTS_RAW_URL    = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/nfts.json`;
+// Owners that mark an NFT as "stable" (pure DAO custody, can't move without a prop).
+// Anything NOT owned by one of these is user-held or marketplace-owned → hot.
+// The two staking contracts are stable-ish but get their own (warm) refresh cadence.
+const STABLE_DAO_OWNERS = [DAO_MAIN_WALLET, DAO_TREASURY_CONTRACT, DAO_WALLET_8YWV];
+const STAKING_OWNERS    = [DAODAO_STAKING_CONTRACT, ENTERPRISE_NFT_STAKING];
+
 // TLA epoch math (for heartbeat consistency with other crons)
 const TLA_EPOCH_START_MS = Date.parse('2022-10-31T00:00:00Z');
 const TLA_EPOCH_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1280,6 +1300,68 @@ async function computePendingClaims(summary, priorState) {
 }
 
 // -----------------------------------------------------------------------------
+// Rev C: tiered-mode helpers (base load, scope derivation, merge)
+// -----------------------------------------------------------------------------
+
+// Load the last full inventory's records from the data repo. Hot/warm runs merge
+// fresh in-scope records onto this base so the published nfts.json is always a
+// complete 10k picture. Returns null if unreadable (caller falls back to full scan).
+async function loadBaseRecords() {
+    const doc = await tryFetchJson(NFTS_RAW_URL, 'base nfts.json');
+    if (doc && Array.isArray(doc.records) && doc.records.length > 0) return doc.records;
+    return null;
+}
+
+// Load the persisted hot-set token-ID list (rebuilt every full run). Returns an
+// array of string IDs, or null if unreadable.
+async function loadHotSet() {
+    const doc = await tryFetchJson(HOT_SET_RAW_URL, 'hot-set.json');
+    if (doc && Array.isArray(doc.token_ids) && doc.token_ids.length > 0) {
+        return doc.token_ids.map(String);
+    }
+    return null;
+}
+
+// Hot set = everything NOT in pure DAO custody and NOT staked → user-held +
+// marketplace-owned. Plus any pending-claim token_ids (recently unstaked, may be
+// landing in a user wallet this window). Derived from a full record set.
+function deriveHotSet(records, pendingBlock) {
+    const stable = new Set(STABLE_DAO_OWNERS);
+    const staking = new Set(STAKING_OWNERS);
+    const ids = new Set();
+    for (const r of records) {
+        if (r.id == null) continue;
+        if (stable.has(r.owner) || staking.has(r.owner)) continue; // cold or warm
+        ids.add(String(r.id)); // user-held or marketplace-owned → hot
+    }
+    for (const e of (pendingBlock?.claimable || [])) {
+        if (e.token_id != null) ids.add(String(e.token_id));
+    }
+    return [...ids].sort((a, b) => Number(a) - Number(b));
+}
+
+// Warm set = hot set ∪ staked NFTs (DAODAO + Enterprise). Staked NFTs rarely move
+// intra-day, so they refresh daily rather than every 15 min.
+function deriveWarmSet(records, pendingBlock) {
+    const staking = new Set(STAKING_OWNERS);
+    const ids = new Set(deriveHotSet(records, pendingBlock));
+    for (const r of records) {
+        if (r.id != null && staking.has(r.owner)) ids.add(String(r.id));
+    }
+    return [...ids].sort((a, b) => Number(a) - Number(b));
+}
+
+// Overlay freshly-fetched records onto the base set (by token id). Returns a new
+// complete record array: fresh where re-fetched, base otherwise.
+function mergeRecords(baseRecords, freshRecords) {
+    const byId = new Map(baseRecords.map(r => [String(r.id), r]));
+    for (const r of freshRecords) {
+        if (r.id != null) byId.set(String(r.id), r);
+    }
+    return [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id));
+}
+
+// -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
 
@@ -1287,23 +1369,53 @@ async function captureSnapshot() {
     const startedAt = new Date();
     const epoch = currentEpoch();
     const dateKey = todayUtcDate();
-    console.log(`🚀 NFT Inventory Cron Rev B — ${startedAt.toISOString()} (epoch ${epoch})`);
+    console.log(`🚀 NFT Inventory Cron Rev B — ${startedAt.toISOString()} (epoch ${epoch}, mode: ${RUN_MODE})`);
     console.log();
 
-    // ── Phase 1: enumerate token IDs ────────────────────────────────────────
-    const tokenIds = await enumerateAllTokens();
-    // Sanity check against num_tokens
-    const numTokensData = await queryContractSafe(ADAO_NFT_CONTRACT, { num_tokens: {} }, 'num_tokens');
-    const declaredCount = numTokensData?.count ?? null;
-    if (declaredCount != null && tokenIds.length !== declaredCount) {
-        console.warn(`  ⚠ Enumerated ${tokenIds.length} but contract reports ${declaredCount}`);
+    // ── Phase 1+2: per-NFT info — scope depends on RUN_MODE ─────────────────
+    // full → enumerate + fetch all 10k. hot/warm → fetch only the in-scope subset
+    // and merge it onto the last full inventory (base). If the base or hot-set is
+    // unreadable, we fall back to a full scan so output is never incomplete.
+    let records, captureRate, effectiveMode = RUN_MODE;
+    if (RUN_MODE === 'hot' || RUN_MODE === 'warm') {
+        const base = await loadBaseRecords();
+        if (!base) {
+            console.warn(`  ⚠ ${RUN_MODE} mode but base nfts.json unreadable — falling back to FULL scan`);
+            effectiveMode = 'full';
+        } else {
+            // Scope: hot uses the persisted hot-set; warm derives hot ∪ staked from base.
+            let scopeIds = null;
+            if (RUN_MODE === 'hot') {
+                scopeIds = await loadHotSet();
+                if (!scopeIds) {
+                    console.warn('  ⚠ hot-set.json unreadable — deriving hot set from base this run');
+                    scopeIds = deriveHotSet(base, null);
+                }
+            } else {
+                scopeIds = deriveWarmSet(base, null);
+            }
+            console.log(`📦 ${RUN_MODE} scope: re-fetching ${scopeIds.length} of ${base.length} NFTs (rest carried from last full run)`);
+            const fresh = await fetchAllNftInfo(scopeIds);
+            captureRate = scopeIds.length > 0 ? fresh.length / scopeIds.length : 1;
+            records = mergeRecords(base, fresh);
+            console.log(`  ✓ merged → ${records.length} total records`);
+            console.log();
+        }
     }
-    console.log();
-
-    // ── Phase 2: per-NFT info ────────────────────────────────────────────────
-    const records = await fetchAllNftInfo(tokenIds);
-    const captureRate = tokenIds.length > 0 ? records.length / tokenIds.length : 0;
-    console.log();
+    if (effectiveMode === 'full') {
+        // ── Phase 1: enumerate token IDs ────────────────────────────────────
+        const tokenIds = await enumerateAllTokens();
+        const numTokensData = await queryContractSafe(ADAO_NFT_CONTRACT, { num_tokens: {} }, 'num_tokens');
+        const declaredCount = numTokensData?.count ?? null;
+        if (declaredCount != null && tokenIds.length !== declaredCount) {
+            console.warn(`  ⚠ Enumerated ${tokenIds.length} but contract reports ${declaredCount}`);
+        }
+        console.log();
+        // ── Phase 2: per-NFT info ────────────────────────────────────────────
+        records = await fetchAllNftInfo(tokenIds);
+        captureRate = tokenIds.length > 0 ? records.length / tokenIds.length : 0;
+        console.log();
+    }
 
     // ── Phases 3-5: parallel data fetches (independent systems) ─────────────
     console.log('🔀 Phases 3-7: parallel data fetches...');
@@ -1415,7 +1527,7 @@ async function captureSnapshot() {
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
         runId: `nft-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
-        runMode: 'hourly',
+        runMode: effectiveMode,
         currentEpoch: epoch,
         status,
         stats: {
@@ -1442,7 +1554,11 @@ async function captureSnapshot() {
             daodao_pending_claim: pending.block.count,
             daodao_pending_reconciled: pending.block.reconciled,
         },
-        next_expected_run_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+        next_expected_run_at: new Date(startedAt.getTime() + (
+            effectiveMode === 'hot'  ? 15 * 60 * 1000 :
+            effectiveMode === 'warm' ? 24 * 60 * 60 * 1000 :
+                                       7 * 24 * 60 * 60 * 1000
+        )).toISOString(),
     };
     // Daily snapshot — overwrites today's file each run; final write of the day "wins"
     // and represents the day-end state. Subsequent runs see the previous day's snapshot
@@ -1473,14 +1589,30 @@ async function captureSnapshot() {
         marketplaces: summary.marketplaces,
     };
 
+    // Hot-set membership — rebuilt on FULL runs only (the full reconcile is the source
+    // of truth for which tokens are user-held/marketplace vs stable DAO custody). The
+    // hot/warm runs read this file to scope their per-NFT fetches.
+    const hotSetIds = deriveHotSet(records, pending.block);
+    const hotSetDoc = {
+        schemaVersion: 1,
+        rebuiltAt: startedAt.toISOString(),
+        rebuiltByMode: effectiveMode,
+        note: 'Token IDs the hot (15-min) path polls: user-held + marketplace-owned + pending-claim. Rebuilt on full runs; warm derives hot ∪ staked at runtime.',
+        count: hotSetIds.length,
+        token_ids: hotSetIds,
+    };
+
     // ── Publish / save ──────────────────────────────────────────────────────
     if (GITHUB_TOKEN) {
         console.log('📤 Publishing to GitHub...');
-        await pushToGithub(`${OUTPUT_PATH}/nfts.json`,      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs (rev B.2 schema v2)`);
+        await pushToGithub(`${OUTPUT_PATH}/nfts.json`,      JSON.stringify(nftsDoc),                 `nft inventory — ${records.length} NFTs (${effectiveMode} run)`);
         await pushToGithub(`${OUTPUT_PATH}/summary.json`,   JSON.stringify(summaryDoc, null, 2),     `nft summary — ${summary.broken_count} broken / ${summary.bbl_listed_count + summary.atrium_listed_count + summary.boost_listed_count} listed`);
-        await pushToGithub(`${OUTPUT_PATH}/heartbeat.json`, JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${status}`);
+        await pushToGithub(`${OUTPUT_PATH}/heartbeat.json`, JSON.stringify(heartbeatDoc, null, 2),   `📍 nft-inventory heartbeat — ${effectiveMode}/${status}`);
         await pushToGithub(`${OUTPUT_PATH}/daily/${dateKey}.json`, JSON.stringify(dailyDoc, null, 2), `daily snapshot — ${dateKey}`);
         await pushToGithub(PENDING_CLAIMS_PATH, JSON.stringify(pending.updatedState, null, 2), `pending-claims — ${pending.block.count} pending${pending.block.reconciled === false ? ' (DRIFT)' : ''}`);
+        if (effectiveMode === 'full') {
+            await pushToGithub(HOT_SET_PATH, JSON.stringify(hotSetDoc, null, 2), `hot-set rebuild — ${hotSetIds.length} tokens`);
+        }
     } else {
         console.log('⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('nfts.json', JSON.stringify(nftsDoc));
@@ -1488,7 +1620,8 @@ async function captureSnapshot() {
         fs.writeFileSync('heartbeat.json', JSON.stringify(heartbeatDoc, null, 2));
         fs.writeFileSync(`daily-${dateKey}.json`, JSON.stringify(dailyDoc, null, 2));
         fs.writeFileSync('pending-claims.json', JSON.stringify(pending.updatedState, null, 2));
-        console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json, daily-${dateKey}.json`);
+        if (effectiveMode === 'full') fs.writeFileSync('hot-set.json', JSON.stringify(hotSetDoc, null, 2));
+        console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json, daily-${dateKey}.json${effectiveMode === 'full' ? ', hot-set.json' : ''}`);
     }
 
     const elapsed = (Date.now() - startedAt.getTime()) / 1000;
@@ -1524,6 +1657,10 @@ module.exports = {
     applyPendingEvents,
     computePendingClaims,
     loadPendingState,
+    // Tier-mode helpers (Rev C)
+    deriveHotSet,
+    deriveWarmSet,
+    mergeRecords,
     // Constants (might be useful for tests / sanity checks)
     ADAO_NFT_CONTRACT,
     DAO_MAIN_WALLET,
