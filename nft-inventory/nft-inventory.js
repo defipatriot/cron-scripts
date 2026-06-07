@@ -1080,8 +1080,12 @@ async function pushToGithub(filepath, content, message) {
 // — graceful degradation, honest data over false positives. No historical
 // backfill (public LCDs prune): seeded once, then tracks itself forward.
 
-function buildTxSearchUrl(base, contract, action, minHeight, limit, offset) {
-    const q = `wasm._contract_address='${contract}' AND wasm.action='${action}' AND tx.height>${minHeight}`;
+function buildTxSearchUrl(base, contract, action, limit, offset) {
+    // NOTE: we deliberately do NOT include a `tx.height>...` term. publicnode's LCD
+    // rejects any range condition on tx.height ("Please specify tx.height with strict
+    // equality"), so height filtering is done client-side in fetchDaodaoTxs instead.
+    // The wasm event conditions alone bound the result set (a few dozen txs total).
+    const q = `wasm._contract_address='${contract}' AND wasm.action='${action}'`;
     return `${base}/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(q)}` +
            `&order_by=ORDER_BY_ASC&pagination.limit=${limit}&pagination.offset=${offset}`;
 }
@@ -1177,13 +1181,15 @@ async function fetchDaodaoTxs(action, minHeight) {
     const tryBase = async (base) => {
         const all = [];
         for (let page = 0; page < MAX_PAGES; page++) {
-            const url = buildTxSearchUrl(base, DAODAO_STAKING_CONTRACT, action, minHeight, LIMIT, page * LIMIT);
+            const url = buildTxSearchUrl(base, DAODAO_STAKING_CONTRACT, action, LIMIT, page * LIMIT);
             const resp = await fetchJson(url, `daodao ${action} p${page}`);
             const batch = resp?.tx_responses || [];
             all.push(...batch);
             if (batch.length < LIMIT) break;
         }
-        return all;
+        // Height filtering is client-side (the LCD won't accept a tx.height range in
+        // the query). Keep only txs strictly newer than what we've already folded in.
+        return all.filter(r => Number(r.height) > Number(minHeight));
     };
     try { return await tryBase(TERRA_LCD_PRIMARY); }
     catch (e1) {
