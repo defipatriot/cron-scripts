@@ -109,8 +109,8 @@ const OUTPUT_PATH = 'data/v2';
 
 // Sister cron data repos (read-only fetches for prices & catalog token metadata)
 // These are PUBLIC — no auth needed.
-const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/current.json';
-const CATALOG_DATA_URL = 'https://raw.githubusercontent.com/defipatriot/tla-chain-registry/main/data/current.json';
+const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const CATALOG_DATA_URL = 'https://raw.githubusercontent.com/defipatriot/tla-chain-registry/main/2026/current.json';
 
 // DAODAO pending-claim tracking (Rev B.3). Forward-only state persisted in the data repo.
 const PENDING_CLAIMS_PATH    = `${OUTPUT_PATH}/pending-claims.json`;
@@ -708,32 +708,56 @@ async function fetchPriceData() {
         console.warn('  ⚠ Both price sources unavailable — USD computation will be skipped');
         return { prices: {}, tokens: {}, ampluna_usd: null, luna_usd: null };
     }
-    // LUNA → USD (preferred from network-and-prices)
-    const luna_usd = pricesDoc?.prices?.LUNA?.usd
+    // --- LUNA → USD ---
+    // Real network-and-prices schema: token_prices.LUNA.final_price_usd, plus luna_market.usd_price.
+    // (Older assumed schema prices.LUNA.usd / luna_usd kept as last-resort fallbacks.)
+    const luna_usd = pricesDoc?.token_prices?.LUNA?.final_price_usd
+                  ?? pricesDoc?.luna_market?.usd_price
+                  ?? pricesDoc?.prices?.LUNA?.usd
                   ?? pricesDoc?.luna_usd
                   ?? null;
-    // Token map for symbol/decimals/USD lookups
-    // The catalog publishes tokens keyed by address. We index for fast lookup.
+
+    // --- Per-symbol USD price map from network-and-prices token_prices ---
+    // token_prices is keyed by canonical symbol; each carries final_price_usd.
+    const priceBySymbol = {};
+    if (pricesDoc?.token_prices) {
+        for (const [sym, p] of Object.entries(pricesDoc.token_prices)) {
+            const usd = p?.final_price_usd ?? p?.prices?.astroport?.price_usd ?? null;
+            if (usd != null) priceBySymbol[sym] = Number(usd);
+        }
+    }
+
+    // --- Token map for symbol/decimals/USD lookups ---
+    // The catalog (tla-chain-registry) publishes tokens keyed by address with symbol+decimals
+    // but NO price. We join the per-symbol USD price onto each, so decodeTokenDenom finds
+    // `final_price_usd` keyed by address, the way it expects.
     const tokenByAddr = {};
     const tokenBySymbol = {};
     if (catalogDoc?.tokens) {
         for (const [addr, t] of Object.entries(catalogDoc.tokens)) {
-            const rec = { ...t, address: addr };
+            const usd = (t.symbol && priceBySymbol[t.symbol] != null) ? priceBySymbol[t.symbol] : null;
+            const rec = { ...t, address: addr, final_price_usd: usd };
             tokenByAddr[addr] = rec;
             if (t.symbol) tokenBySymbol[t.symbol] = rec;
         }
     }
-    // ampLUNA price
-    let ampluna_usd = null;
-    const amplunaToken = tokenByAddr[AMPLUNA_CW20] || tokenBySymbol['ampLUNA'];
-    if (amplunaToken?.final_price_usd != null) {
-        ampluna_usd = Number(amplunaToken.final_price_usd);
-    } else if (amplunaToken?.eris_exchange_rate != null && luna_usd != null) {
-        // Compute: ampLUNA → LUNA → USD
-        ampluna_usd = Number(amplunaToken.eris_exchange_rate) * Number(luna_usd);
+
+    // --- ampLUNA → USD ---
+    // Primary: token_prices.ampLUNA.final_price_usd (already LUNA × Eris hub ratio).
+    // Fallbacks: lst_ratios.ampLUNA.ratio × luna_usd; then the joined catalog token.
+    let ampluna_usd = priceBySymbol['ampLUNA'] ?? null;
+    if (ampluna_usd == null) {
+        const ratio = pricesDoc?.lst_ratios?.ampLUNA?.ratio;
+        if (ratio != null && luna_usd != null) ampluna_usd = Number(ratio) * Number(luna_usd);
     }
+    if (ampluna_usd == null) {
+        const amplunaToken = tokenByAddr[AMPLUNA_CW20] || tokenBySymbol['ampLUNA'];
+        if (amplunaToken?.final_price_usd != null) ampluna_usd = Number(amplunaToken.final_price_usd);
+    }
+
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`  ✓ LUNA $${luna_usd?.toFixed?.(4) ?? 'n/a'}, ampLUNA $${ampluna_usd?.toFixed?.(4) ?? 'n/a'}, ${Object.keys(tokenByAddr).length} catalog tokens in ${elapsed}s`);
+    const pricedCount = Object.values(tokenByAddr).filter(t => t.final_price_usd != null).length;
+    console.log(`  ✓ LUNA $${luna_usd?.toFixed?.(4) ?? 'n/a'}, ampLUNA $${ampluna_usd?.toFixed?.(4) ?? 'n/a'}, ${pricedCount}/${Object.keys(tokenByAddr).length} catalog tokens priced in ${elapsed}s`);
     return {
         luna_usd,
         ampluna_usd,
