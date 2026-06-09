@@ -71,6 +71,9 @@ const TLA_EPOCH_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 // we just loop). Use start_after to walk through.
 const PROPOSALS_PAGE_SIZE = 30;
 const MAX_PAGES = 50;   // safety cap — covers 1500 proposals (current PD DAO is at ~243)
+// Set true if the proposal walk ends on a query FAILURE (null) rather than a genuine empty page —
+// without this, a mid-pagination rate-limit silently truncates bribe history and still says 'ok'.
+let PROPOSALS_INCOMPLETE = false;
 
 // HTTP timeouts.
 const HTTP_TIMEOUT_MS = 15000;
@@ -148,6 +151,7 @@ async function fetchProposalsPage(startAfter = null) {
         ? { list_proposals: { start_after: startAfter, limit: PROPOSALS_PAGE_SIZE } }
         : { list_proposals: { limit: PROPOSALS_PAGE_SIZE } };
     const data = await queryContract(PD_PROPOSAL_MODULE, query);
+    if (data === null) { PROPOSALS_INCOMPLETE = true; console.warn('  ⚠ list_proposals returned null (query FAILED, not end-of-list) — proposal walk INCOMPLETE → status partial'); }
     const proposals = data?.proposals || [];
     return {
         proposals,
@@ -694,7 +698,7 @@ async function captureBribesHistory() {
                 (classification.reason ? `  — ${classification.reason}` : ''));
 
     // Status: stuck overrides ok (no chain-failure concept here)
-    const status = freshness.dataFreshness === 'stuck' ? 'stuck' : 'ok';
+    const status = freshness.dataFreshness === 'stuck' ? 'stuck' : (PROPOSALS_INCOMPLETE ? 'partial' : 'ok');
 
     // Publish or save locally
     if (GITHUB_TOKEN) {
