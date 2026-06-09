@@ -58,6 +58,9 @@ const TLA_VOTING_ESCROW  = process.env.TLA_VOTING_ESCROW  || 'terra1uqhj8agyeaz8
 const GITHUB_TOKEN       = process.env.GITHUB_TOKEN;
 const GITHUB_REPO        = process.env.GITHUB_REPO   || 'defipatriot/tla-vp-holders-data_2026';
 const GITHUB_BRANCH      = process.env.GITHUB_BRANCH || 'main';
+// Set true if all_tokens enumeration ends on a query FAILURE (null) rather than a genuine empty
+// page — prevents a silently-truncated holder list from publishing as 'ok'.
+let ENUM_INCOMPLETE = false;
 
 const BATCH_CONCURRENCY  = 5;     // matches adao-positions; safe for publicnode LCD
 const PAGE_LIMIT         = 100;   // all_tokens page size
@@ -135,6 +138,7 @@ async function enumerateAllTokens() {
     const q = startAfter ? { all_tokens: { limit: PAGE_LIMIT, start_after: startAfter } }
                          : { all_tokens: { limit: PAGE_LIMIT } };
     const r = await queryContract(TLA_VOTING_ESCROW, q);
+    if (r === null) { ENUM_INCOMPLETE = true; console.warn(`  ⚠ all_tokens page ${page} returned null (query FAILED, not end-of-list) — holder enumeration INCOMPLETE → status partial`); break; }
     const tokens = Array.isArray(r?.tokens) ? r.tokens : [];
     if (tokens.length === 0) break;
     out.push(...tokens);
@@ -302,7 +306,7 @@ async function run() {
     capturedAtUnix: startedAt.getTime(),
     runId: `vph-${startedAt.toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`,
     runMode: 'weekly',
-    status: dataFreshness === 'stuck' ? 'stuck' : (errors > 0 ? 'partial' : 'ok'),
+    status: dataFreshness === 'stuck' ? 'stuck' : ((errors > 0 || ENUM_INCOMPLETE) ? 'partial' : 'ok'),
     stats: {
       holder_count: holders.length,
       total_vp_human: metrics?.total_vp ?? null,
