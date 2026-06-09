@@ -84,6 +84,11 @@ async function fetchJson(url, label, timeoutMs = HTTP_TIMEOUT_MS) {
     } finally { clearTimeout(timeout); }
 }
 
+// Enumeration failures that occur MID-PAGINATION (queryContract returned null = a FAILURE, not
+// end-of-list). Without this, a rate-limit on page N silently truncates the catalog and it still
+// publishes as 'ok'. We collect them here and force status → 'partial' (see publish block).
+const ENUMERATION_FAILURES = [];
+
 function encodeQuery(q) { return Buffer.from(JSON.stringify(q)).toString('base64'); }
 
 async function queryContract(contractAddr, query, label) {
@@ -2281,8 +2286,9 @@ async function enrichWalletsWithDaodaoStakers(wallets, contracts) {
                 pageCount++;
                 const msg = { list_stakers: { limit: PAGE_SIZE, ...(pageStart ? { start_after: pageStart } : {}) } };
                 const result = await queryContract(contractAddr, msg, `${daoName}.list_stakers[p${pageCount}]`);
-                const batch = result?.stakers || result || [];
-                if (!Array.isArray(batch) || batch.length === 0) break;
+                if (result === null) { ENUMERATION_FAILURES.push(`${daoName}.list_stakers p${pageCount}`); console.warn(`  ⚠ ${daoName}.list_stakers page ${pageCount} returned null (query FAILED, not end-of-list) — staker enumeration INCOMPLETE → status will be partial`); break; }
+                const batch = result?.stakers || (Array.isArray(result) ? result : []);
+                if (batch.length === 0) break;
 
                 for (const s of batch) {
                     const walletAddr = s.address || s.staker || s.owner;
@@ -2369,8 +2375,9 @@ async function enrichWalletsWithTLALocks(wallets, votingEscrowAddr) {
             pageCount++;
             const msg = { all_tokens: { limit: PAGE_SIZE, ...(pageStart ? { start_after: pageStart } : {}) } };
             const result = await queryContract(votingEscrowAddr, msg, `voting-escrow.all_tokens[p${pageCount}]`);
-            const batch = result?.tokens || result || [];
-            if (!Array.isArray(batch) || batch.length === 0) break;
+            if (result === null) { ENUMERATION_FAILURES.push(`voting-escrow.all_tokens p${pageCount}`); console.warn(`  ⚠ voting-escrow.all_tokens page ${pageCount} returned null (query FAILED, not end-of-list) — lock enumeration INCOMPLETE → status will be partial`); break; }
+            const batch = result?.tokens || (Array.isArray(result) ? result : []);
+            if (batch.length === 0) break;
             tokenIds.push(...batch);
             pageStart = batch[batch.length - 1];
             if (batch.length < PAGE_SIZE) break;
@@ -2981,7 +2988,7 @@ async function main() {
             },
         },
         _unmapped: unmapped,
-        raw, _errors: errors, source_errors: external.source_errors,
+        raw, _errors: errors, source_errors: external.source_errors, enumeration_failures: ENUMERATION_FAILURES,
         sources: { primary_lcd: TERRA_LCD_PRIMARY, fallback_lcd: TERRA_LCD_FALLBACK },
     };
 
@@ -2993,7 +3000,7 @@ async function main() {
 
     let status = 'ok';
     if (freshness.dataFreshness === 'stuck') status = 'stuck';
-    else if (errors.length > 0 || Object.keys(external.source_errors).length > 0) status = 'partial';
+    else if (errors.length > 0 || Object.keys(external.source_errors).length > 0 || ENUMERATION_FAILURES.length > 0) status = 'partial';
 
     const tierCounts = { core: 0, tracked: 0, noise: 0 };
     for (const t of Object.values(tokens)) {
