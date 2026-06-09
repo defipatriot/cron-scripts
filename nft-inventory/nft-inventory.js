@@ -1143,14 +1143,15 @@ async function pushToGithub(filepath, content, message) {
 // — graceful degradation, honest data over false positives. No historical
 // backfill (public LCDs prune): seeded once, then tracks itself forward.
 
-function buildTxSearchUrl(base, contract, action, limit, offset) {
-    // NOTE: we deliberately do NOT include a `tx.height>...` term. publicnode's LCD
-    // rejects any range condition on tx.height ("Please specify tx.height with strict
-    // equality"), so height filtering is done client-side in fetchDaodaoTxs instead.
-    // The wasm event conditions alone bound the result set (a few dozen txs total).
+function buildTxSearchUrl(base, contract, action, limit, page) {
+    // publicnode HONORS the `page` param (1-indexed) but IGNORES pagination.offset — so the old
+    // offset-based ASC paging silently returned the same node-dependent slice every "page" and
+    // missed recent unstakes. We now page explicitly and NEWEST-FIRST, so the latest txs are
+    // reliably on page 1. Still no `tx.height>` term (publicnode rejects ranges); height filtering
+    // stays client-side in fetchDaodaoTxs.
     const q = `wasm._contract_address='${contract}' AND wasm.action='${action}'`;
     return `${base}/cosmos/tx/v1beta1/txs?query=${encodeURIComponent(q)}` +
-           `&order_by=ORDER_BY_ASC&pagination.limit=${limit}&pagination.offset=${offset}`;
+           `&order_by=ORDER_BY_DESC&page=${page}&limit=${limit}`;
 }
 
 // unstake: token_ids come straight from the execute message.
@@ -1243,11 +1244,15 @@ async function fetchDaodaoTxs(action, minHeight) {
     const LIMIT = 100, MAX_PAGES = 10;
     const tryBase = async (base) => {
         const all = [];
-        for (let page = 0; page < MAX_PAGES; page++) {
-            const url = buildTxSearchUrl(base, DAODAO_STAKING_CONTRACT, action, LIMIT, page * LIMIT);
+        for (let page = 1; page <= MAX_PAGES; page++) {
+            const url = buildTxSearchUrl(base, DAODAO_STAKING_CONTRACT, action, LIMIT, page);
             const resp = await fetchJson(url, `daodao ${action} p${page}`);
             const batch = resp?.tx_responses || [];
+            if (!batch.length) break;
             all.push(...batch);
+            // newest-first: once a page dips to/below what we've already folded in, we've covered the new region
+            const pageMin = Math.min(...batch.map(r => Number(r.height)));
+            if (pageMin <= Number(minHeight)) break;
             if (batch.length < LIMIT) break;
         }
         // Height filtering is client-side (the LCD won't accept a tx.height range in
