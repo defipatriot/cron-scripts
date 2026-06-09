@@ -299,6 +299,11 @@ function classifyOwner(owner, broken) {
         bbl_listed:              owner === BBL_MARKETPLACE,
         atrium_listed:           owner === ATRIUM_MARKETPLACE,
         boost_listed:            owner === BOOST_MARKETPLACE,
+
+        // Set later by applyPendingClaimFlags() once pending-claim data is known.
+        // A DAODAO-unstaked NFT sits in the contract's 7-day claim queue: still in
+        // custody (owner == staking contract) but no longer actively staked.
+        daodao_pending_claim:    false,
     };
     // user_held = everything else (individual wallet, not in any known custody)
     const knownCustody = (
@@ -705,6 +710,148 @@ async function fetchDaodaoStakers() {
 }
 
 // -----------------------------------------------------------------------------
+// PHASE 5b — Resolve staked NFTs to their REAL staker (per-token)
+// -----------------------------------------------------------------------------
+//
+// Holder/leaderboard views group records by `real_owner`. Active DAODAO and
+// Enterprise stakes sit at the staking CONTRACT on-chain, so without this they
+// appear as phantom whales (the contract counted as one giant holder) and the
+// real stakers vanish. We resolve each staked token back to its staker, exactly
+// the way mergeMarketplaceListings() resolves a listing back to its seller:
+//   • DAODAO     → staked_nfts{address,start_after,limit}  (flat array of token ids)
+//   • Enterprise → user_stake{user,limit}                  ({ tokens[], total_user_stake })
+//
+// Both verify completeness against the known per-staker count and push any gap
+// to `_errors` rather than silently truncating. `enterprise_dao_broken` (the ~100
+// DAO-governance NFTs) are NOT resolved — they correctly stay attributed to the
+// Enterprise contract address. Unresolved tokens fall back to real_owner = owner
+// (never null — the explorer hard-fails on a null owner).
+
+const STAKE_RESOLVE_CONCURRENCY = 5;          // gentle on publicnode (matches adao-positions ≤5 rule)
+const DAODAO_STAKED_PAGE = 30;                // cw721-staked staked_nfts page size
+const ENTERPRISE_USER_STAKE_LIMIT = 1000;     // larger than any single staker's holding (max ~100 today)
+
+// DAODAO: staked_nfts(address) per staker → { map: {token_id(str) -> staker}, errors }
+async function resolveDaodaoStakerTokens(daodaoStakers) {
+    console.log(`🧩 Phase 5b: resolving DAODAO staked tokens → staker (${daodaoStakers.length} stakers)...`);
+    const t0 = Date.now();
+    const map = {};
+    const errors = [];      // hard: flips heartbeat → partial
+    const warnings = [];    // soft: logged + surfaced, status stays ok (e.g. indexer lag)
+    await parallelMap(daodaoStakers, async (s) => {
+        const expected = Number(s.count || 0);
+        const collected = [];
+        let startAfter = null;
+        for (let page = 0; page < 500; page++) {
+            const q = { staked_nfts: { address: s.address, limit: DAODAO_STAKED_PAGE, ...(startAfter ? { start_after: startAfter } : {}) } };
+            const res = await queryContractSafe(DAODAO_STAKING_CONTRACT, q, `daodao staked_nfts ${s.address.slice(-6)} p${page}`);
+            if (res == null) {                                  // query FAILED (not empty) — do not coerce
+                errors.push({ scope: 'daodao', address: s.address, reason: 'query_failed', page });
+                return;                                         // leave this staker's tokens unresolved
+            }
+            const tokens = Array.isArray(res) ? res : (Array.isArray(res.token_ids) ? res.token_ids : []);
+            for (const t of tokens) collected.push(String(t));
+            if (tokens.length < DAODAO_STAKED_PAGE) break;      // authoritative: chain returned the full page-tail
+            startAfter = String(tokens[tokens.length - 1]);
+        }
+        // The chain pagination above is authoritative. The indexer count is only a
+        // cross-check — a mismatch usually means indexer lag, not missing data, so
+        // it's a warning, not a status-flipping error.
+        if (expected && collected.length !== expected) {
+            warnings.push({ scope: 'daodao', address: s.address, reason: 'count_vs_indexer', indexer: expected, chain: collected.length });
+        }
+        for (const tid of collected) map[tid] = s.address;
+    }, STAKE_RESOLVE_CONCURRENCY);
+    console.log(`  ✓ DAODAO: ${Object.keys(map).length} tokens → staker (${errors.length} errors, ${warnings.length} warnings) in ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    return { map, errors, warnings };
+}
+
+// Enterprise: user_stake(user,limit) per member → { map, errors }
+async function resolveEnterpriseStakerTokens(enterpriseStakers) {
+    console.log(`🧩 Phase 5b: resolving Enterprise staked tokens → staker (${enterpriseStakers.length} stakers)...`);
+    const t0 = Date.now();
+    const map = {};
+    const errors = [];      // hard: flips heartbeat → partial (incl. real truncation)
+    const warnings = [];    // soft: members-weight cross-check lag
+    await parallelMap(enterpriseStakers, async (s) => {
+        const expected = Number(s.count || 0);
+        const collected = [];
+        let startAfter = null;
+        let total = null;
+        for (let page = 0; page < 50; page++) {
+            const q = { user_stake: { user: s.address, limit: ENTERPRISE_USER_STAKE_LIMIT, ...(startAfter ? { start_after: startAfter } : {}) } };
+            const res = await queryContractSafe(ENTERPRISE_NFT_STAKING, q, `enterprise user_stake ${s.address.slice(-6)} p${page}`);
+            if (res == null) {                                  // query FAILED — do not coerce
+                errors.push({ scope: 'enterprise', address: s.address, reason: 'query_failed', page });
+                return;
+            }
+            const tokens = Array.isArray(res.tokens) ? res.tokens : [];
+            for (const t of tokens) collected.push(String(t));
+            total = res.total_user_stake != null ? Number(res.total_user_stake) : total;
+            // Default (no limit) caps at 50; with an explicit high limit the full set comes
+            // back. Stop once we have the whole set; only paginate if the contract truncated.
+            if (total != null && collected.length >= total) break;
+            if (tokens.length < ENTERPRISE_USER_STAKE_LIMIT) break;
+            startAfter = String(tokens[tokens.length - 1]);
+        }
+        // total_user_stake is the contract's own authoritative count → a shortfall is a
+        // REAL truncation (the exact bug class we're killing), so it's a hard error.
+        if (total != null && collected.length !== total) {
+            errors.push({ scope: 'enterprise', address: s.address, reason: 'truncated', total, got: collected.length });
+        } else if (expected && collected.length !== expected) {
+            warnings.push({ scope: 'enterprise', address: s.address, reason: 'count_vs_members', members: expected, chain: collected.length });
+        }
+        for (const tid of collected) map[tid] = s.address;
+    }, STAKE_RESOLVE_CONCURRENCY);
+    console.log(`  ✓ Enterprise: ${Object.keys(map).length} tokens → staker (${errors.length} errors, ${warnings.length} warnings) in ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    return { map, errors, warnings };
+}
+
+// Apply both maps to records. Active stakes only; enterprise_dao_broken stays = contract.
+// Unresolved staked token keeps real_owner = owner (never null) and is logged.
+function applyStakerResolution(records, daodaoMap, enterpriseMap, errors) {
+    let resolved = 0, fellBack = 0;
+    for (const r of records) {
+        const tid = String(r.id);
+        if (r.daodao_staked) {
+            const staker = daodaoMap[tid];
+            if (staker) { r.real_owner = staker; resolved++; }
+            else { errors.push({ scope: 'daodao', token_id: tid, reason: 'unresolved' }); r.real_owner = r.owner; fellBack++; }
+        } else if (r.enterprise_staked) {            // NOT enterprise_dao_broken (stays = DAO/contract)
+            const staker = enterpriseMap[tid];
+            if (staker) { r.real_owner = staker; resolved++; }
+            else { errors.push({ scope: 'enterprise', token_id: tid, reason: 'unresolved' }); r.real_owner = r.owner; fellBack++; }
+        }
+    }
+    console.log(`  ✓ Staker resolution applied: ${resolved} → real staker, ${fellBack} fell back to contract (logged)`);
+    return { resolved, fellBack };
+}
+
+// Change 2 — per-record pending-claim flag. in_window + claimable map token_id → unstaker.
+// Marks daodao_pending_claim=true, daodao_staked=false, real_owner=unstaker, so the token
+// attributes to the person (not the contract) and drops out of the "currently staked" filter.
+function applyPendingClaimFlags(records, pendingBlock) {
+    const pendingByToken = {};
+    for (const e of [...(pendingBlock.in_window || []), ...(pendingBlock.claimable || [])]) {
+        if (e && e.token_id != null && e.address) pendingByToken[String(e.token_id)] = e.address;
+    }
+    let flagged = 0;
+    for (const r of records) {
+        const addr = pendingByToken[String(r.id)];
+        if (addr) {
+            r.daodao_pending_claim = true;
+            r.daodao_staked = false;
+            r.real_owner = addr;
+            flagged++;
+        } else if (r.daodao_pending_claim) {
+            r.daodao_pending_claim = false;          // stale flag carried from base (claimed/restaked since)
+        }
+    }
+    console.log(`  ✓ Pending-claim flags: ${flagged} tokens marked daodao_pending_claim (excluded from staked)`);
+    return flagged;
+}
+
+// -----------------------------------------------------------------------------
 // PHASE 6 — Backing & yield: ampLUNA balance + per-NFT share
 // -----------------------------------------------------------------------------
 //
@@ -950,6 +1097,7 @@ function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, back
         enterprise_staked: 0,
         enterprise_dao_broken: 0,
         daodao_staked: 0,
+        daodao_pending_claim: 0,   // unstaked, in 7-day claim queue — counted separately from daodao_staked
         bbl_listed: 0,
         atrium_listed: 0,
         boost_listed: 0,
@@ -1279,8 +1427,7 @@ async function loadPendingState() {
 
 // IO wrapper: query total_power, fetch forward events, fold via applyPendingEvents,
 // and emit operator warnings. Caller persists updatedState in the publish phase.
-async function computePendingClaims(summary, priorState) {
-    const custodyCount = summary.daodao_staked_count;
+async function computePendingClaims(custodyCount, priorState) {
     const powerRes  = await queryContractSafe(DAODAO_STAKING_CONTRACT, { total_power_at_height: {} }, 'daodao total_power');
     const totalPower = powerRes?.power  != null ? Number(powerRes.power)  : null;
     const tipHeight  = powerRes?.height != null ? Number(powerRes.height) : priorState.lastScannedHeight;
@@ -1444,15 +1591,49 @@ async function captureSnapshot() {
     mergeMarketplaceListings(records, marketplaces, priceData);
     console.log();
 
-    // ── Aggregate ───────────────────────────────────────────────────────────
+    // ── Resolve staked NFTs → real staker (full/warm only; hot carries from base) ──
+    // In hot mode the staked tokens aren't re-fetched (they're outside the hot set),
+    // so their already-resolved real_owner is carried forward from the last full/warm run.
+    const stakerErrors = [];
+    const stakerWarnings = [];
+    if (effectiveMode === 'full' || effectiveMode === 'warm') {
+        console.log('🧩 Resolving staked NFTs → real staker...');
+        const [ddRes, entRes] = await Promise.all([
+            resolveDaodaoStakerTokens(daodaoStakers),
+            resolveEnterpriseStakerTokens(enterpriseStakers),
+        ]);
+        applyStakerResolution(records, ddRes.map, entRes.map, stakerErrors);
+        stakerErrors.push(...ddRes.errors, ...entRes.errors);
+        stakerWarnings.push(...ddRes.warnings, ...entRes.warnings);
+        console.log();
+    } else {
+        console.log('  ⏭ hot mode: staked real_owner carried from base (no staker re-resolution)');
+        console.log();
+    }
+
+    // ── DAODAO pending-claim reconciliation (BEFORE aggregate so counts reflect it) ──
+    console.log('🔁 Reconciling DAODAO pending claims...');
+    const daodaoCustodyCount = records.filter(r => r.daodao_staked).length;  // all DAODAO custody (pre-flag)
+    const priorPendingState = await loadPendingState();
+    const pending = await computePendingClaims(daodaoCustodyCount, priorPendingState);
+    console.log(`  Pending claims:      ${pending.block.count} chain / ${pending.block.tracked} tracked / reconciled: ${pending.block.reconciled}`);
+    if (pending.block.claimable.length) {
+        console.log(`  Claimable now:       token ${pending.block.claimable.map(e => e.token_id).join(', ')}`);
+    }
+    applyPendingClaimFlags(records, pending.block);   // Change 2: flag + daodao_staked=false + real_owner=unstaker
+    console.log();
+
+    // ── Aggregate (after staker + pending resolution, so summary is consistent) ──
     console.log('📊 Aggregating...');
     const summary = aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, backing, priceData);
+    summary.daodao_pending_claim = pending.block;
     console.log(`  Unminted (DAO):      ${summary.unminted_count.toLocaleString()}`);
     console.log(`  Treasury (broken):   ${summary.treasury_held_count.toLocaleString()}`);
     console.log(`  DAO wallet 8ywv:     ${summary.dao_wallet_8ywv_held_count.toLocaleString()} (broken, small DAO custody)`);
     console.log(`  Enterprise staked:   ${summary.enterprise_staked_count.toLocaleString()} (real user stakes)`);
     console.log(`  Enterprise DAO:      ${summary.enterprise_dao_broken_count.toLocaleString()} (DAO-controlled broken)`);
     console.log(`  DAODAO staked:       ${summary.daodao_staked_count.toLocaleString()} (of which ${summary.daodao_staked_broken_count} broken, kept for VP)`);
+    console.log(`  DAODAO pending claim:${summary.daodao_pending_claim_count.toLocaleString()} (unstaked, in 7-day queue)`);
     console.log(`  BBL listed:          ${summary.bbl_listed_count.toLocaleString()}`);
     console.log(`  Atrium listed:       ${summary.atrium_listed_count.toLocaleString()}`);
     console.log(`  Boost listed:        ${summary.boost_listed_count.toLocaleString()}`);
@@ -1461,6 +1642,12 @@ async function captureSnapshot() {
     console.log(`  Unbroken (total):    ${summary.unbroken_count.toLocaleString()}`);
     console.log(`  Unique real owners:  ${summary.unique_holders.toLocaleString()}`);
     console.log(`  DAO members:         ${summary.dao_members_count.toLocaleString()}`);
+    if (stakerErrors.length) {
+        console.warn(`  ⚠ Staker resolution errors: ${stakerErrors.length} (status → partial; see summary.staker_resolution)`);
+    }
+    if (stakerWarnings.length) {
+        console.log(`  ℹ Staker resolution warnings: ${stakerWarnings.length} (indexer/members lag — status stays ok)`);
+    }
     if (summary.backing) {
         console.log(`  Treasury ampLUNA:    ${summary.backing.ampluna_balance.toFixed(2)}`);
         console.log(`  Per-NFT share:       ${summary.backing.per_nft_ampluna.toFixed(4)} ampLUNA`);
@@ -1472,7 +1659,8 @@ async function captureSnapshot() {
     const classifiedSum = (
         summary.unminted_count + summary.treasury_held_count + summary.dao_wallet_8ywv_held_count +
         summary.enterprise_staked_count + summary.enterprise_dao_broken_count +
-        summary.daodao_staked_count + summary.bbl_listed_count + summary.atrium_listed_count +
+        summary.daodao_staked_count + summary.daodao_pending_claim_count +
+        summary.bbl_listed_count + summary.atrium_listed_count +
         summary.boost_listed_count + summary.user_held_count
     );
     if (classifiedSum !== summary.total_tokens) {
@@ -1482,19 +1670,8 @@ async function captureSnapshot() {
     }
     console.log();
 
-    // ── DAODAO pending-claim reconciliation ────────────────────────
-    console.log('🔁 Reconciling DAODAO pending claims...');
-    const priorPendingState = await loadPendingState();
-    const pending = await computePendingClaims(summary, priorPendingState);
-    summary.daodao_pending_claim = pending.block;
-    console.log(`  Pending claims:      ${pending.block.count} chain / ${pending.block.tracked} tracked / reconciled: ${pending.block.reconciled}`);
-    if (pending.block.claimable.length) {
-        console.log(`  Claimable now:       token ${pending.block.claimable.map(e => e.token_id).join(', ')}`);
-    }
-    console.log();
-
     // ── Assemble output documents ───────────────────────────────────────────
-    const status = captureRate >= 0.99 ? 'ok' : 'partial';
+    const status = (captureRate >= 0.99 && stakerErrors.length === 0) ? 'ok' : 'partial';
     const contracts = {
         nft:                       ADAO_NFT_CONTRACT,
         dao_main_wallet:           DAO_MAIN_WALLET,
@@ -1525,6 +1702,14 @@ async function captureSnapshot() {
         ...summary,
         daodao_stakers: daodaoStakers,
         enterprise_stakers: enterpriseStakers,
+        staker_resolution: {
+            mode: effectiveMode,
+            resolved_this_run: effectiveMode === 'full' || effectiveMode === 'warm',
+            error_count: stakerErrors.length,
+            warning_count: stakerWarnings.length,
+            errors: stakerErrors.slice(0, 100),       // capped; full set is in logs
+            warnings: stakerWarnings.slice(0, 100),
+        },
     };
     const heartbeatDoc = {
         schemaVersion: 2,
@@ -1557,6 +1742,8 @@ async function captureSnapshot() {
             ampluna_balance: summary.backing?.ampluna_balance ?? null,
             per_nft_ampluna: summary.backing?.per_nft_ampluna ?? null,
             daodao_pending_claim: pending.block.count,
+            daodao_pending_claim_records: summary.daodao_pending_claim_count,
+            staker_resolution_errors: stakerErrors.length,
             daodao_pending_reconciled: pending.block.reconciled,
         },
         next_expected_run_at: new Date(startedAt.getTime() + (
