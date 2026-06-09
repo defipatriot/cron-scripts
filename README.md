@@ -96,6 +96,20 @@ Catalog cron (`chain/tla-registry/`) additionally uses:
 - `TERRA_LCD_FALLBACK` (default `https://terra-rest.publicnode.com`)
 - `GLOBAL_CONFIG_ADDR` (the bootstrap contract — should never change)
 
+## Reliability audit & failure-class checklist (2026-06-09)
+
+A systemwide audit (triggered by a publicnode pagination quirk silently dropping unstakes in `nft-inventory` for months) hardened 6 crons. Common root: **code that couldn't distinguish "query failed" (`null`) from "no data" (`[]`/end-of-list)** → silent incomplete data, sometimes reaching permanent archives. Full record + per-file fixes: `website-adao-core/CHANGES_PENDING.md` → "Systemwide reliability audit".
+
+**Run this checklist against any new or modified cron:**
+- **F1 — Pagination truncation.** publicnode IGNORES `pagination.offset` (use `page` + `ORDER_BY_DESC`); also watch `page`-caps and `start_after` loops that stop early.
+- **F2 — Silent null-coercion.** `r || []` / `Array.isArray(r) ? r : []` right after a query that returns `null` on rate-limit → empty masquerades as "no data." Distinguish `null` (failed) from `[]` (genuine end).
+- **F3 — Overwrite-with-partial.** Never clobber last-good / a permanent archive with fewer/empty records on a bad run (history is append-only → guard before publish).
+- **F4 — Corrupt-vs-absent input.** A `try/catch` must treat a *corrupt* file (throw) differently from a *missing* one (skip) — else a whole source drops silently.
+- **F5 — Staleness / schema drift.** Static reference data going stale; upstream field renames silently zeroing a parser.
+- **F6 — Required-vs-optional.** A source that should be fatal must abort, not publish a partial marked `ok`.
+- **F7 — Heartbeat honesty.** `status` must flip to `partial`/`error`/`stuck` on real failure, or the health widget green-lights a quiet failure. `network-and-prices` is the model (per-source `.ok`, fingerprint staleness detector).
+- **F8 — Epoch/time boundary.** Off-by-one epoch, UTC flip, missed end-of-epoch window → irreversible wrong-epoch capture. (`epochIndex` 0-based internal; `currentEpoch = epochIndex + 1` canonical.)
+
 ## Where to find more detail
 
 | Question | Where to look |
