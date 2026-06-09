@@ -404,6 +404,22 @@ async function fetchChainState() {
         queryContract(TLA_GAUGE_CONTROLLER, { distributions: { time: "current" } }),
     ]);
 
+    // COMPLETENESS GATE — these chain queries ARE the snapshot; a null is a query FAILURE
+    // (vs [] = genuine empty). If any failed, do NOT continue: the `|| []` coercion below would
+    // silently drop a whole bucket, `status` would still read 'ok' (it only watches sister-cron
+    // input files), and at 23:xx that truncated capture is frozen into the PERMANENT daily archive
+    // — irreversible. Aborting here means no publish, last-good stays, heartbeat goes stale → red.
+    // Matches the documented failure contract (required source fails → fatal, no publish).
+    {
+        const core = { stableGauge, projectGauge, bluechipGauge, singleGauge, stableStaked, projectStaked, bluechipStaked, singleStaked, distributions };
+        const failed = Object.entries(core).filter(([, v]) => v === null).map(([k]) => k);
+        if (failed.length) {
+            console.error(`❌ ABORT: core chain queries failed (returned null): ${failed.join(', ')}.`);
+            console.error('   NOT publishing — a partial capture would corrupt the rolling snapshot and the permanent archive. Last-good stays; rerun when LCDs are healthy.');
+            process.exit(2);
+        }
+    }
+
     const gauges = {
         stable: stableGauge || [],
         project: projectGauge || [],
