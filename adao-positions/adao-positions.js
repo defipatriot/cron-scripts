@@ -1648,10 +1648,14 @@ async function captureSnapshot() {
         // 'stuck' overrides both 'ok' and 'partial' (worst wins).
         const allTreasuriesOk = validTreasuries.length === ADAO_TREASURY_WALLETS.length;
         const allCouncilsOk   = validCouncils.length === COUNCIL_TREASURY_WALLETS.length;
+        // Member-level failures are recorded per-portfolio in `_errors` (visible, not silent), but
+        // the run status must ALSO reflect them — otherwise the health widget stays green while a
+        // member's position is incomplete, and that gap gets frozen into the permanent weekly archive.
+        const membersWithErrors = validPortfolios.filter(p => Array.isArray(p._errors) && p._errors.length > 0).length;
         let status;
-        if (freshness.dataFreshness === 'stuck')                  status = 'stuck';
-        else if (!allTreasuriesOk || !allCouncilsOk)              status = 'partial';
-        else                                                      status = 'ok';
+        if (freshness.dataFreshness === 'stuck')                                       status = 'stuck';
+        else if (!allTreasuriesOk || !allCouncilsOk || membersWithErrors > 0)          status = 'partial';
+        else                                                                           status = 'ok';
 
         const heartbeat = {
             schemaVersion: 1,
@@ -1667,6 +1671,7 @@ async function captureSnapshot() {
             status,
             stats: {
                 members_count: validPortfolios.length,
+                members_with_errors: membersWithErrors,
                 treasury_present: !!portfoliosDoc.treasury,
                 council_present: !!portfoliosDoc.council_treasury,
                 council_count: validCouncils.length,
