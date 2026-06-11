@@ -461,25 +461,30 @@ async function fetchBblListings() {
         };
         const data = await queryContract(BBL_MARKETPLACE, { auction_by_contract: params }, `bbl page ${page}`);
         const auctions = data?.auctions || [];
-        if (auctions.length === 0) break;
-        // Defensive de-dupe: only keep auctions we haven't already collected. If a
-        // page contributes zero NEW auction_ids, pagination isn't advancing (BBL is
-        // returning the same window) — stop instead of looping to the page cap.
-        let added = 0;
+        if (auctions.length === 0) break;                       // exhausted
+        // Pagination-progress vs kept-listings are tracked SEPARATELY: a page can be all
+        // settled auctions (0 kept) while still advancing the cursor (new ids). Only zero
+        // NEW ids means the contract is returning the same window — the stuck guard.
+        let newIds = 0;
         for (const a of auctions) {
             const id = a?.auction_id;
             if (id == null || seenIds.has(String(id))) continue;
             seenIds.add(String(id));
+            newIds++;
+            if (a.is_settled === true) continue;                // settled = sold/closed, never a live listing
             out.push(a);
-            added++;
         }
-        if (added === 0) break;
+        if (newIds === 0) break;                                // stuck pagination (same window returned)
         // BBL pagination key: most likely auction_id (numeric, string-typed). We pass the last one.
         const lastId = auctions[auctions.length - 1]?.auction_id;
         if (!lastId) break;
         startAfter = lastId;
         page++;
-        if (auctions.length < MARKETPLACE_PAGE) break;
+        // NOTE (bug fix 2026-06-10): do NOT break on a short page (`auctions.length <
+        // MARKETPLACE_PAGE`). The contract can return fewer rows than the limit mid-sweep
+        // (server-side filtering after pagination), and breaking there silently dropped the
+        // NEWEST auctions — verified live: 6 listings (auction_ids ~17.7K, sellers …jy9mpm /
+        // …s2xt53) missing vs warlock's 35. Loop ends only on empty page / stuck ids / cap.
         if (page > 100) { console.warn('  ⚠ BBL pagination cap hit (100 pages) — stopping'); break; }
     }
     return out.map(a => ({
@@ -668,17 +673,89 @@ async function fetchBoostListings() {
 }
 
 // Orchestrator — runs all 3 in parallel, returns combined list
+//
+// BBL liveness cross-check (added 2026-06-10): the BBL contract can hold auctions that
+// are structurally live (is_settled:false, no bidder, end_time 0) yet NOT visible or
+// buyable on BBL — verified live with auction 14765 / token #745, which set a phantom
+// $17.59 floor while BBL's UI and API both ignored it. We can't fix BBL; we define what
+// "listed" means for this pipeline: VISIBLE AND BUYABLE ON THE VENUE. Warlock (BBL's own
+// API, the same one bbl-rarity mirrors) is the liveness oracle for BBL specifically:
+// chain auctions absent from warlock are EXCLUDED from listings and logged as warnings
+// (flagged, never silent). If warlock itself is unreachable, we keep the chain set
+// unfiltered and warn — a BBL API outage must not blank our listings (F7: degrade
+// honestly, don't amplify).
+
+const WARLOCK_NFTS_API = 'https://warlock.backbonelabs.io/api/v1/dapps/necropolis/nfts';
+const WARLOCK_PER_PAGE = 60;
+const WARLOCK_PAGE_CAP = 12;   // 720 records, far above any plausible live-listing count
+
+// Fetch the set of auction_ids warlock currently serves for this collection.
+// price-asc puts listed tokens first, so we stop at the first page with zero auctions.
+// Returns { ok, ids:Set<string>, byAuctionId:Map<string,{token_id,seller}> }.
+async function fetchWarlockLiveBblAuctions() {
+    const ids = new Set();
+    const byAuctionId = new Map();
+    try {
+        for (let p = 1; p <= WARLOCK_PAGE_CAP; p++) {
+            const url = `${WARLOCK_NFTS_API}?nftContract=${ADAO_NFT_CONTRACT}&page=${p}&perPage=${WARLOCK_PER_PAGE}&types=all&sort=price-asc`;
+            const j = await fetchJsonWithRetry(url, `warlock listings p${p}`);
+            const nfts = Array.isArray(j?.nfts) ? j.nfts : [];
+            if (nfts.length === 0) break;
+            let pageAuctions = 0;
+            for (const n of nfts) {
+                if (n?.auction?.auction_id != null) {
+                    const id = String(n.auction.auction_id);
+                    ids.add(id);
+                    byAuctionId.set(id, { token_id: String(n.nft_token_id), seller: n.auction.seller });
+                    pageAuctions++;
+                }
+            }
+            if (pageAuctions === 0) break;   // price-asc lists auctions first — past them now
+        }
+        return { ok: true, ids, byAuctionId };
+    } catch (e) {
+        console.warn(`  ⚠ warlock liveness check unavailable: ${e.message}`);
+        return { ok: false, ids, byAuctionId };
+    }
+}
+
 async function fetchMarketplaces() {
     console.log('🏪 Phase 4: fetching marketplace listings (BBL + Atrium + Boost)...');
     const t0 = Date.now();
-    const [bbl, atrium, boost] = await Promise.all([
+    const [bblChain, atrium, boost, warlock] = await Promise.all([
         fetchBblListings().catch(e => { console.warn(`  ⚠ BBL failed: ${e.message}`); return []; }),
         fetchAtriumListings().catch(e => { console.warn(`  ⚠ Atrium failed: ${e.message}`); return []; }),
         fetchBoostListings().catch(e => { console.warn(`  ⚠ Boost failed: ${e.message}`); return []; }),
+        fetchWarlockLiveBblAuctions(),
     ]);
+
+    const listingWarnings = [];
+    let bbl = bblChain;
+    if (warlock.ok && warlock.ids.size > 0) {
+        // Exclude chain-only auctions (on-chain but not served by BBL's own API/UI).
+        bbl = [];
+        for (const l of bblChain) {
+            if (warlock.ids.has(String(l.internal_id))) { bbl.push(l); continue; }
+            listingWarnings.push({ scope: 'bbl', reason: 'chain_only_not_on_warlock', auction_id: String(l.internal_id), token_id: String(l.token_id), seller: l.seller });
+            console.warn(`  ⚠ BBL auction ${l.internal_id} (token #${l.token_id}) is on-chain but NOT on warlock — excluded from listings (phantom/cancelled-unclaimed)`);
+        }
+        // Inverse check — warlock listings our chain sweep missed. After the pagination
+        // fix this should be empty; if it ever isn't, that's the completeness detector.
+        const chainIds = new Set(bblChain.map(l => String(l.internal_id)));
+        for (const [id, info] of warlock.byAuctionId) {
+            if (!chainIds.has(id)) {
+                listingWarnings.push({ scope: 'bbl', reason: 'warlock_only_missing_from_chain_sweep', auction_id: id, token_id: info.token_id, seller: info.seller });
+                console.warn(`  ⚠ warlock serves auction ${id} (token #${info.token_id}) but the chain sweep didn't return it — completeness gap`);
+            }
+        }
+    } else if (bblChain.length > 0) {
+        listingWarnings.push({ scope: 'bbl', reason: 'warlock_unavailable_chain_set_unfiltered', chain_count: bblChain.length });
+        console.warn(`  ⚠ warlock unavailable — BBL listings (${bblChain.length}) published unfiltered (no liveness cross-check this run)`);
+    }
+
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    console.log(`  ✓ BBL ${bbl.length}, Atrium ${atrium.length}, Boost ${boost.length} listings in ${elapsed}s`);
-    return { bbl, atrium, boost };
+    console.log(`  ✓ BBL ${bbl.length} (chain ${bblChain.length}, warlock ${warlock.ids.size}), Atrium ${atrium.length}, Boost ${boost.length} listings in ${elapsed}s`);
+    return { bbl, atrium, boost, listingWarnings };
 }
 
 // -----------------------------------------------------------------------------
@@ -1746,6 +1823,10 @@ async function captureSnapshot() {
             errors: stakerErrors.slice(0, 100),       // capped; full set is in logs
             warnings: stakerWarnings.slice(0, 100),
         },
+        listing_resolver: {
+            warning_count: (marketplaces.listingWarnings || []).length,
+            warnings: (marketplaces.listingWarnings || []).slice(0, 100),
+        },
     };
     const heartbeatDoc = {
         schemaVersion: 2,
@@ -1781,6 +1862,7 @@ async function captureSnapshot() {
             daodao_pending_claim_records: summary.daodao_pending_claim_count,
             staker_resolution_errors: stakerErrors.length,
             staker_resolution_warnings: stakerWarnings.length,
+            listing_resolver_warnings: (marketplaces.listingWarnings || []).length,
             enterprise_unattributed: summary.enterprise_unattributed_count,
             daodao_pending_reconciled: pending.block.reconciled,
         },
