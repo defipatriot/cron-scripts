@@ -704,9 +704,18 @@ async function fetchWarlockLiveBblAuctions() {
             let pageAuctions = 0;
             for (const n of nfts) {
                 if (n?.auction?.auction_id != null) {
-                    const id = String(n.auction.auction_id);
+                    const a = n.auction;
+                    const id = String(a.auction_id);
                     ids.add(id);
-                    byAuctionId.set(id, { token_id: String(n.nft_token_id), seller: n.auction.seller });
+                    byAuctionId.set(id, {
+                        token_id: String(n.nft_token_id),
+                        seller: a.seller,
+                        reserve_price: a.reserve_price,
+                        denom: a.denom,
+                        auction_type: a.auction_type,
+                        end_time: a.end_time,
+                        raw: a,
+                    });
                     pageAuctions++;
                 }
             }
@@ -739,13 +748,33 @@ async function fetchMarketplaces() {
             listingWarnings.push({ scope: 'bbl', reason: 'chain_only_not_on_warlock', auction_id: String(l.internal_id), token_id: String(l.token_id), seller: l.seller });
             console.warn(`  ⚠ BBL auction ${l.internal_id} (token #${l.token_id}) is on-chain but NOT on warlock — excluded from listings (phantom/cancelled-unclaimed)`);
         }
-        // Inverse check — warlock listings our chain sweep missed. After the pagination
-        // fix this should be empty; if it ever isn't, that's the completeness detector.
+        // Inverse gap — live warlock listings the chain sweep didn't return. Verified live
+        // 2026-06-11: the contract's `auction_by_contract` cursor skips entries (holes in
+        // the MIDDLE of the id range — e.g. returns 17744/17746 but not 17696–17742), so
+        // its pagination semantics can't be trusted for completeness. Warlock's auction
+        // object carries every field our listing shape needs, so we RECOVER the missing
+        // listings from warlock directly (source-tagged), and still log each one so the
+        // chain-sweep gap stays visible for a future contract-side investigation.
         const chainIds = new Set(bblChain.map(l => String(l.internal_id)));
         for (const [id, info] of warlock.byAuctionId) {
             if (!chainIds.has(id)) {
-                listingWarnings.push({ scope: 'bbl', reason: 'warlock_only_missing_from_chain_sweep', auction_id: id, token_id: info.token_id, seller: info.seller });
-                console.warn(`  ⚠ warlock serves auction ${id} (token #${info.token_id}) but the chain sweep didn't return it — completeness gap`);
+                listingWarnings.push({ scope: 'bbl', reason: 'warlock_only_missing_from_chain_sweep', auction_id: id, token_id: info.token_id, seller: info.seller, recovered: true });
+                console.warn(`  ⚠ warlock serves auction ${id} (token #${info.token_id}) but the chain sweep didn't return it — RECOVERED from warlock`);
+                bbl.push({
+                    marketplace: 'BBL',
+                    internal_id: id,
+                    token_id: info.token_id,
+                    seller: info.seller,
+                    price_raw: info.reserve_price,
+                    denom: info.denom,                       // same format as chain ("cw20:addr" / native) — verified identical
+                    listing_type: info.auction_type,
+                    royalty_fee: null,                       // not exposed by warlock; chain-only field
+                    creator_address: null,
+                    bidder: null,
+                    end_time: info.end_time,
+                    source: 'warlock_recovered',
+                    raw: info.raw,
+                });
             }
         }
     } else if (bblChain.length > 0) {
