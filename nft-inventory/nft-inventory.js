@@ -1,5 +1,18 @@
 // =============================================================================
-// NFT Inventory Cron — Rev B.2
+// NFT Inventory Cron — Rev C.4
+//
+// Rev C.4 (2026-06-11) — Floor history + days-on-market + bid capture:
+//     data/v2/floor-history.json (daily per-tier listing+sales floors via notional_usd,
+//     DOM, backing, bids; upsert-by-date, never-shrink) + listing-first-seen.json.
+//     Full/warm runs only.
+// Rev C.3 (2026-06-10/11) — BBL listing-resolver fixes:
+//     warlock liveness oracle ("listed" = visible AND buyable); chain-only auctions
+//     excluded+warned; cursor-skipped listings recovered from warlock
+//     (source:'warlock_recovered'). Canary: heartbeat listing_resolver_warnings.
+// Rev C.2 (2026-06-09/10) — Staked-NFT staker resolution:
+//     DAODAO/Enterprise real_owner per token; dao_members_count=157 (DAODAO only);
+//     daodao_pending_claim flag; enterprise_unattributed (81).
+// Rev C.1 (2026-06-07) — Tiered run modes (full/warm/hot), one script, three Render jobs.
 // =============================================================================
 //
 // Captures full per-NFT state for the aDAO collection from on-chain truth.
@@ -2062,6 +2075,7 @@ async function captureSnapshot() {
             staker_resolution_errors: stakerErrors.length,
             staker_resolution_warnings: stakerWarnings.length,
             listing_resolver_warnings: (marketplaces.listingWarnings || []).length,
+            rev: 'C.4',
             enterprise_unattributed: summary.enterprise_unattributed_count,
             daodao_pending_reconciled: pending.block.reconciled,
         },
