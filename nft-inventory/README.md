@@ -83,6 +83,8 @@ Phases 3-7 run in parallel. Each is independently fallible — a failure in one 
 | `data/v2/daily/<date>.json` | End-of-day snapshot (for movement/yield timeline) | Overwritten each run; last write of day wins |
 | `data/v2/pending-claims.json` | DAODAO unstaked-but-unclaimed tracking (self-maintaining state) | Every run — cron adds/removes entries automatically |
 | `data/v2/hot-set.json` | Token IDs the hot path polls (user-held + marketplace + pending) | Rebuilt on **full** runs only |
+| `data/v2/floor-history.json` | Append-only daily per-tier floor row: listed count, listing floor, sales floor (median last 5/10/3 by `notional_usd`), DOM, backing, active bids. Same-date upsert; prior dates immutable; never-shrink guard | **full/warm** runs only |
+| `data/v2/listing-first-seen.json` | `{marketplace:internal_id → first_seen_at}` for days-on-market (accrues from 2026-06-11); Atrium `created_at` heights preserved | **full/warm** runs only |
 
 ## Deployment (tiered modes — Rev C.1)
 
@@ -100,6 +102,12 @@ Notes:
 - Hot rewrites the full `nfts.json` (~6 MB) every 15 min. That's deliberate (the page reads one merged file), but it means ~96 commits/day to the data repo. The `*-data_2026` yearly rotation bounds the growth; if churn becomes a problem, stage 1.5 can split a slim `hot.json` out and merge client-side.
 - Stage 2 (activity deltas) and stage 3 (rollups) are not in this rev — daily files are still last-write-wins snapshots for now.
 
+
+## Recent changes
+
+- **2026-06-11 — floor history + first-seen + bid capture.** New outputs above. Sales floor uses `notional_usd` from `sales-enriched.json` (NOT `price_usd_at_sale`, which is the denom UNIT price — a $0.09 "floor" means you grabbed the wrong field). Tiers: broken flag + the 25 immutable Phoenix token ids (hardcoded, provenance-commented). Sales tiering currently uses the CURRENT broken flag; `broken-at.json` (data-repo events backfill) enables timestamp-aware tiering as a follow-up.
+- **2026-06-10/11 — BBL listing-resolver fixes.** (1) Warlock is the liveness oracle for BBL: "listed" = visible AND buyable on the venue. Chain-only auctions (e.g. 14765 — escrowed, `is_settled:false`, yet not served by BBL) are excluded + warned. Warlock down ⇒ chain set published unfiltered + warned, never blanked. (2) The contract's `auction_by_contract` cursor SKIPS entries (mid-range holes; root cause unknown) — live listings missing from the chain sweep are recovered from warlock (`source:'warlock_recovered'`; denom/price formats verified byte-identical). Canary: heartbeat `listing_resolver_warnings` (steady state ≈ 7: 1 chain-only + 6 recovered). A jump or a `warlock_unavailable` warning means BBL changed something.
+- **2026-06-09/10 — staked-NFT staker resolution.** See `staker_resolution` in summary.json; details in the shipped log in `website-adao-core/CHANGES_PENDING.md`.
 
 ## Pre-Rev-B data (abandoned)
 
