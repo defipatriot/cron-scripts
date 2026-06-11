@@ -138,4 +138,59 @@ Adding a new cron:
 
 10 production crons running on schedule as of 2026-06-06. Catalog cron (`chain/tla-registry/`) at Rev 0.15 deployed; Rev 0.16 packaged but not yet deployed (Phase 0 lock-in). All other crons stable.
 
+Data & Pipeline Registry (NFT pipeline) — audited 2026-06-11
+> **Why this exists:** on 2026-06-11 we nearly built a second wallet-name capture
+> because nobody remembered `adao-positions` already owns names via pfpk. Every fact
+> must have exactly ONE producer; everyone else consumes its output file. Before
+> building capture for anything, read this table first. Before deleting anything,
+> check its Consumers column.
+>
+> **Status legend:**
+> `CANONICAL` actively produced + consumed · `FROZEN-LEGACY` old system, kept read-only,
+> nothing should read it · `ORPHAN-REMOVE` safe to delete · `ONE-TIME-DONE` seed job,
+> finished, keep script for re-seeds
+1. Producers → outputs → consumers
+Producer (job)	Runs	Output file(s)	Status	Consumed by
+`cron-scripts/nft-inventory/nft-inventory.js` (Render ×3: hot 15m / warm daily / full weekly)	live	`nft-inventory-data_2026:data/v2/` → `nfts.json`, `summary.json`, `heartbeat.json`, `daily/YYYY-MM-DD.json`, `pending-claims.json`, `hot-set.json` (full only), `floor-history.json` + `listing-first-seen.json` (full/warm only)	CANONICAL	NFT Explorer (`data/v2/nfts.json`, `summary.json`), Analytics tab (floor panel), future unstaked-wallets UI (`pending-claims.json`)
+`nft-inventory-data_2026` Action: NFT Incremental Update (6h) — `nft-forward-incremental.js` + `nft-analytics-builder.js`	live	`data/v2/` → `sales-history.json` (BBL), `atrium-sales.json`, `boost-sales.json`, `nft-provenance.json`, `sales-enriched.json`, `nft-analytics.json`	CANONICAL	Analytics tab (`nft-analytics.json`, `sales-enriched.json`), nft-inventory floor-history (sales floor ← `sales-enriched.json`), events-backfill outcome derivation
+`nft-inventory-data_2026` Action: NFT Full Reconcile (weekly Sun)	live	re-verifies the same files	CANONICAL (backstop)	same as above
+`nft-inventory-data_2026` Action: NFT History Backfill (`nft-backfill.yml` + `bbl-sales-backfill.js`, `atrium-sales-backfill.js`, `nft-provenance-backfill.js`)	one-time, done	seeded sales + provenance	ONE-TIME-DONE — keep scripts (pager is `require`d by other scripts!), workflow can be disabled	—
+`nft-inventory-data_2026` Action: NFT Events Backfill (`nft-events-backfill.yml` + `.js`)	one-time, done 2026-06-11	`data/v2/broken-at.json` (1,093), `data/v2/listing-history.json` (3,264)	ONE-TIME-DONE — re-runnable (shrink-guarded); NOTE: forward capture of NEW breaks/creates is NOT yet wired into the incremental — new events after 2026-06-11 are not appended. Decide: fold into incremental, or re-run periodically	Explorer broken-tier classification (`broken-at.json`), days-on-market / floor history backstory (`listing-history.json`)
+`boost-sales-fetch.js` (within incremental)	live	`data/v2/boost-sales.json`	CANONICAL	`sales-enriched.json` build
+`cron-scripts/adao-positions/adao-positions.js` (Render, daily + 25h archives)	live	`adao-positions-data_2026:data/` → `members.json` (SOLE OWNER of wallet names via pfpk.daodao.zone), `current.json`, `weekly_epoch-N.json`, `daily/YYYY-MM-DD.json`, `heartbeat.json`	CANONICAL	future Member Stats page, any UI needing wallet→name (e.g. unstaked-wallets panel). Never create a second name source.
+`nft-metadata` Action: BBL Rarity Refresh (weekly Mon) — `bbl-rarity.js`	live	`nft-metadata:adao-rarity-bbl.json`	CANONICAL	Explorer rank toggle (pending wiring), rarity-explained.html references
+`nft-metadata:adao-rarity-intended.json`	static (collection immutable)	itself	CANONICAL (never changes)	Explorer rank toggle, rarity page, DAO proposal
+`nft-metadata:all_nfts_metadata.json`	static	itself	CANONICAL (never changes)	Explorer traits, rarity builds
+2. Cleanup actions (verified safe order)
+DELETE `nft-inventory-data_2026:nft-inventory.js` — ORPHAN-REMOVE. Misplaced upload (the cron lives in `cron-scripts/nft-inventory/`); now two revisions stale. Nothing executes it (no workflow references it). Still present as of 2026-06-11.
+`nft-inventory-data_2026:data/nfts.json` — FROZEN-LEGACY (pre-v2 path, last write 2026-06-07; explorer reads `data/v2/nfts.json`). Before deleting: grep `aDAO-links-site` for the string `data/nfts.json` (only the v2 path was found in the explorer; the other 15 site pages were NOT audited this pass). Until then treat as frozen, not orphan.
+Check for any other pre-v2 stragglers under `data/` (e.g. old `data/daily/`) the same way: grep the site repo for the path before removing.
+3. Hardcoded-value inventory (NFT pipeline)
+Risk classes: `IMMUTABLE` safe forever · `CONFIG` tunable, ages fine · `ASSUMPTION` breaks if an external party changes behavior — monitored/guarded · `STALE-PRONE` will drift, has a plan.
+Where	What	Class	Notes / mitigation
+nft-inventory.js, backfills, explorer	Contract addresses (NFT, BBL, Atrium, Boost, DAODAO, Enterprise, ampLUNA)	IMMUTABLE	Contracts can't change address. Single-sourced per file top.
+nft-inventory.js	`PHOENIX_TOKEN_IDS` (25 ids)	IMMUTABLE	Collection fully minted; ids can never change. Provenance comment points to adao-rarity-intended.json.
+nft-inventory.js, bbl-rarity.js	`EXPECTED_TOTAL = 10000`	IMMUTABLE	Supply fixed.
+nft-inventory.js	`SALES_FLOOR_K = {broken:5, base:10, phoenix:3}`	CONFIG	Methodology choice from the brief; change = methodology change, not breakage.
+nft-inventory.js	Warlock URL + response shape (`nfts[].auction`), `WARLOCK_PAGE_CAP=12`, price-asc-lists-auctions-first	ASSUMPTION	Top external-breakage risk. Guarded: warlock-down/empty ⇒ unfiltered + warning, never blanked. If BBL redesigns the API, the `warlock_unavailable` warning fires — watch heartbeat `listing_resolver_warnings`.
+nft-inventory.js	BBL `auction_by_contract` cursor semantics (known to skip entries)	ASSUMPTION	Mitigated: warlock recovery + `warlock_only_…` warnings make any regression visible. Contract-side root cause never found — documented, accepted.
+nft-events-backfill.js	sales-enriched shape quirk: BBL rows have `auction_id` and NO `marketplace` field	ASSUMPTION	If analytics-builder ever adds the label, matching still works (auction_id branch first). If it RENAMES auction_id, the creates≥sales gate fails loudly.
+nft-events-backfill.js	Escrow capture via `send_nft` only	ASSUMPTION	If a marketplace uses pull-based `transfer_nft` listing, historical creates under-capture. Evidence it doesn't: all current live listings (BBL/Atrium/Boost) have matched creates.
+bbl-rarity.js	`MIN_CAPTURED = 8500` sanity floor; null-block fill logic	CONFIG/ASSUMPTION	Tied to BBL's unstable null-block pagination. 5 structural self-checks fail the run before a bad file publishes.
+nft-provenance-backfill.js	Mint PHASES table (date windows → LUNA price)	STALE-PRONE by design	Marked "rough but honest" in-file; refinement = later per-tx pass. Won't silently break anything.
+adao-positions.js	pfpk.daodao.zone URL + bech32-hex scheme; fallback CSV column guessing	ASSUMPTION	Names degrade to null (not wrong) if pfpk dies; `named_count` in members.json is the canary.
+nft-explorer-app.js	System-wallet label map (3 addresses), `SYSTEM_ADDRESSES` set, `PLANET_*` maps, CDN/IPFS URLs	IMMUTABLE + ASSUMPTION	Addresses immutable. PLANET maps had the Pampa typo (fix queued in CHANGES_PENDING P1 item 9). CDN URL is an external assumption with IPFS fallback already in place.
+rarity-explained.html	Trait-count tables + match stats (967 / 80) baked into HTML	IMMUTABLE	Collection immutable ⇒ counts can never drift. Safe forever.
+floor-history.json rows	`sales_tiering: current_broken_flag`	STALE-PRONE, planned	broken-at.json now exists ⇒ next floor-history improvement is timestamp-aware tiering (queued). Rows self-describe their basis, so old rows stay honest.
+4. Not audited this pass (do these the same way before touching)
+The other Render crons + their data repos: `tla-snapshot`, `astroport-snapshot`, `bribes-history`, skeleton-swap, treasury (TLA side of the house).
+The 15 non-explorer site pages in `aDAO-links-site` (which data paths they fetch).
+`website-adao-core` knowledge files for references to retired paths.
+5. Next project (queued): TLA Lock NFT backfill
+Same playbook as the aDAO events backfill, new subject: the TLA Locks CW721
+(`terra1uqhj8agyeaz8fu6mdggfuwr3lp32jlrx5hqag4jxexde92rzkamq3l62zg`) — lifecycle events
+for member lock creation, merges, unlock starts/completions, plus Boost marketplace
+activity for lock NFTs (listings/sales already partially covered by the Boost machinery
+above; locks need their own event probes first, browser-probe style).
+
 See `CHANGELOG.md` for revision history.
