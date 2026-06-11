@@ -132,6 +132,18 @@ const RUN_MODE = (process.env.RUN_MODE || 'full').toLowerCase();
 const HOT_SET_PATH    = `${OUTPUT_PATH}/hot-set.json`;
 const HOT_SET_RAW_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/hot-set.json`;
 const NFTS_RAW_URL    = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/nfts.json`;
+
+// Floor-history / days-on-market / bid capture (2026-06-11, analytics brief items 1-3)
+const SALES_ENRICHED_RAW_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${OUTPUT_PATH}/sales-enriched.json`;
+const FIRST_SEEN_PATH        = `${OUTPUT_PATH}/listing-first-seen.json`;
+const FIRST_SEEN_RAW_URL     = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${FIRST_SEEN_PATH}`;
+const FLOOR_HISTORY_PATH     = `${OUTPUT_PATH}/floor-history.json`;
+const FLOOR_HISTORY_RAW_URL  = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${FLOOR_HISTORY_PATH}`;
+// Sales-floor medians: last K sales per tier (analytics brief: broken 5 / base 10 / phoenix 3)
+const SALES_FLOOR_K = { broken: 5, base: 10, phoenix: 3 };
+// Grade-40 (Phoenix Rising) token ids — IMMUTABLE: the collection is fully minted, so this
+// set can never change. Source: adao-rarity-intended.json (defipatriot/nft-metadata).
+const PHOENIX_TOKEN_IDS = new Set(['16','183','1128','1131','1433','1546','1622','2068','2227','2605','2633','2639','3445','4736','4983','5048','5088','5247','6013','6067','6151','6479','7755','9068','9941']);
 // Owners that mark an NFT as "stable" (pure DAO custody, can't move without a prop).
 // Anything NOT owned by one of these is user-held or marketplace-owned → hot.
 // The two staking contracts are stable-ish but get their own (warm) refresh cadence.
@@ -1361,6 +1373,137 @@ function aggregate(records, daodaoStakers, enterpriseStakers, marketplaces, back
 }
 
 // -----------------------------------------------------------------------------
+// FLOOR HISTORY + DAYS-ON-MARKET + BID CAPTURE  (2026-06-11, brief items 1-3)
+// -----------------------------------------------------------------------------
+//
+// Three small, additive outputs so the explorer's Analytics tab can chart floor
+// history, show days-on-market, and (later) bid/ask:
+//   • listing-first-seen.json — {marketplace:internal_id → first_seen_at} map,
+//     updated on full/warm runs, pruned when a listing disappears. Atrium's raw
+//     created_at (a BLOCK HEIGHT) is stored alongside so the future listing
+//     backfill can upgrade DOM precision without rescanning.
+//   • floor-history.json — append-only daily rows: per-tier (broken / base /
+//     phoenix) listed_count, listing floor, sales floor (median of last K
+//     enriched sales), avg days-on-market, plus per-NFT backing USD and any
+//     active bids. Same-date row is upserted (latest run of the day wins);
+//     prior dates are never touched; never-shrink guard before publish.
+//
+// Honesty notes baked into the data:
+//   • sales tiering uses the CURRENT broken flag until broken-at.json lands
+//     (known caveat, recorded in the file header).
+//   • days-on-market derives from first-seen, which starts accruing at deploy
+//     time — early rows will read low. dom_basis records this.
+
+function tierOf(record) {
+    if (record.broken) return 'broken';
+    if (PHOENIX_TOKEN_IDS.has(String(record.id))) return 'phoenix';
+    return 'base';
+}
+
+// Update the first-seen map from currently-attached listings.
+// prior: {entries:{key→{token_id, first_seen_at, atrium_created_at_height?}}} | null
+function updateFirstSeen(prior, records, nowIso) {
+    const priorEntries = (prior && prior.entries && typeof prior.entries === 'object') ? prior.entries : {};
+    const entries = {};
+    let added = 0, kept = 0, pruned = 0;
+    for (const r of records) {
+        const l = r.listing;
+        if (!l || !l.marketplace || l.internal_id == null) continue;
+        const key = `${l.marketplace}:${l.internal_id}`;
+        if (priorEntries[key]) { entries[key] = priorEntries[key]; kept++; }
+        else {
+            entries[key] = { token_id: String(r.id), first_seen_at: nowIso };
+            // Atrium exposes the on-chain listing height — keep it for the future backfill.
+            const h = l.raw && (l.raw.created_at ?? l.raw.createdAt);
+            if (l.marketplace === 'Atrium' && h != null) entries[key].atrium_created_at_height = Number(h);
+            added++;
+        }
+    }
+    pruned = Object.keys(priorEntries).filter(k => !entries[k]).length;
+    return {
+        doc: { schemaVersion: 1, updatedAt: nowIso, count: Object.keys(entries).length, entries },
+        stats: { added, kept, pruned },
+    };
+}
+
+// Median of the most-recent K usd-valued sales in a tier. <2 sales → null (no fake floors).
+// NOTE: `notional_usd` is the sale's USD VALUE (amount × denom price at sale);
+// `price_usd_at_sale` is the DENOM's unit price — do not confuse them (bLUNA ≈ $0.09/unit).
+function salesFloorForTier(sales, tier, recordById, k) {
+    const inTier = sales.filter(s => {
+        if (s.notional_usd == null) return false;
+        const r = recordById.get(String(s.token_id));
+        return r && tierOf(r) === tier;
+    });
+    inTier.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    const recent = inTier.slice(0, k).map(s => Number(s.notional_usd)).sort((a, b) => a - b);
+    if (recent.length < 2) return { floor: null, n: recent.length };
+    const mid = Math.floor(recent.length / 2);
+    const median = recent.length % 2 ? recent[mid] : +( (recent[mid - 1] + recent[mid]) / 2 ).toFixed(6);
+    return { floor: median, n: recent.length };
+}
+
+// Build today's floor-history row from live records + enriched sales + first-seen.
+function buildFloorHistoryRow(records, sales, firstSeenEntries, backing, nowIso) {
+    const recordById = new Map(records.map(r => [String(r.id), r]));
+    const nowMs = new Date(nowIso).getTime();
+    const perTier = {};
+    for (const tier of ['broken', 'base', 'phoenix']) {
+        const listed = records.filter(r => r.listing && r.listing.marketplace && tierOf(r) === tier);
+        const priced = listed.filter(r => r.listing.price_usd != null).map(r => r.listing.price_usd);
+        const sf = sales ? salesFloorForTier(sales, tier, recordById, SALES_FLOOR_K[tier]) : { floor: null, n: 0 };
+        // Days-on-market: mean age of currently-listed items with a first-seen entry.
+        const ages = [];
+        for (const r of listed) {
+            const e = firstSeenEntries[`${r.listing.marketplace}:${r.listing.internal_id}`];
+            if (e && e.first_seen_at) ages.push((nowMs - new Date(e.first_seen_at).getTime()) / 86400000);
+        }
+        perTier[tier] = {
+            listed_count: listed.length,
+            listing_floor_usd: priced.length ? +Math.min(...priced).toFixed(6) : null,
+            sales_floor_usd: sf.floor,
+            sales_floor_n: sf.n,
+            avg_days_on_market: ages.length ? +(ages.reduce((a, b) => a + b, 0) / ages.length).toFixed(2) : null,
+        };
+    }
+    // Bid capture (brief item 3): any listing carrying a live bidder.
+    const activeBids = [];
+    for (const r of records) {
+        const l = r.listing;
+        if (l && l.bidder) {
+            activeBids.push({ token_id: String(r.id), marketplace: l.marketplace, bidder: l.bidder, amount_raw: (l.raw && l.raw.amount) ?? null, denom: l.denom ?? null });
+        }
+    }
+    return {
+        date: nowIso.slice(0, 10),
+        capturedAt: nowIso,
+        per_tier: perTier,
+        backing_per_nft_usd: backing ? backing.per_nft_value_usd : null,
+        dom_basis: 'first_seen',          // upgrades to listing-history once the backfill lands
+        sales_tiering: 'current_broken_flag',   // upgrades to broken-at.json once available
+        active_bids: activeBids,
+    };
+}
+
+// Upsert today's row; prior dates immutable; refuse to shrink.
+function upsertFloorHistory(prior, row, nowIso) {
+    const priorRows = (prior && Array.isArray(prior.rows)) ? prior.rows : [];
+    const rows = priorRows.filter(r => r.date !== row.date);
+    rows.push(row);
+    rows.sort((a, b) => a.date < b.date ? -1 : 1);
+    if (rows.length < priorRows.length) {
+        throw new Error(`floor-history would shrink (${priorRows.length} → ${rows.length}) — refusing to publish`);
+    }
+    return {
+        schemaVersion: 1,
+        updatedAt: nowIso,
+        caveat: 'sales_floor tiers use each token\'s CURRENT broken flag until broken-at.json lands; avg_days_on_market accrues from first-seen at deploy (2026-06-11), so early values read low.',
+        row_count: rows.length,
+        rows,
+    };
+}
+
+// -----------------------------------------------------------------------------
 // GITHUB PUBLISH
 // -----------------------------------------------------------------------------
 
@@ -1812,6 +1955,33 @@ async function captureSnapshot() {
     }
     console.log();
 
+    // ── Floor history + first-seen + bid capture (full/warm only; hot stays lean) ──
+    // Listings are attached to records by now (mergeMarketplaceListings), summary has
+    // backing. Hot runs skip this: 15-min cadence would add commit noise for a daily file.
+    let firstSeenDoc = null, floorHistoryDoc = null;
+    if (effectiveMode === 'full' || effectiveMode === 'warm') {
+        console.log('📈 Floor history + days-on-market...');
+        const nowIso = new Date().toISOString();
+        const [priorFirstSeen, priorFloorHistory, salesEnriched] = await Promise.all([
+            tryFetchJson(FIRST_SEEN_RAW_URL, 'listing-first-seen'),
+            tryFetchJson(FLOOR_HISTORY_RAW_URL, 'floor-history'),
+            tryFetchJson(SALES_ENRICHED_RAW_URL, 'sales-enriched'),
+        ]);
+        const fs2 = updateFirstSeen(priorFirstSeen, records, nowIso);
+        firstSeenDoc = fs2.doc;
+        const sales = salesEnriched && Array.isArray(salesEnriched.sales) ? salesEnriched.sales : null;
+        if (!sales) console.warn('  ⚠ sales-enriched unavailable — sales_floor will be null this row (no fake floors)');
+        const row = buildFloorHistoryRow(records, sales, firstSeenDoc.entries, summary.backing, nowIso);
+        floorHistoryDoc = upsertFloorHistory(priorFloorHistory, row, nowIso);
+        console.log(`  ✓ first-seen: +${fs2.stats.added} new / ${fs2.stats.kept} kept / ${fs2.stats.pruned} pruned`);
+        for (const t of ['broken', 'base', 'phoenix']) {
+            const x = row.per_tier[t];
+            console.log(`  ${t.padEnd(7)}: listed ${x.listed_count}, listing floor $${x.listing_floor_usd ?? '—'}, sales floor $${x.sales_floor_usd ?? '—'} (n=${x.sales_floor_n}), DOM ${x.avg_days_on_market ?? '—'}d`);
+        }
+        if (row.active_bids.length) console.log(`  active bids: ${row.active_bids.length}`);
+        console.log();
+    }
+
     // ── Assemble output documents ───────────────────────────────────────────
     const status = (captureRate >= 0.99 && stakerErrors.length === 0) ? 'ok' : 'partial';
     const contracts = {
@@ -1954,6 +2124,10 @@ async function captureSnapshot() {
         if (effectiveMode === 'full') {
             await pushToGithub(HOT_SET_PATH, JSON.stringify(hotSetDoc, null, 2), `hot-set rebuild — ${hotSetIds.length} tokens`);
         }
+        if (floorHistoryDoc) {
+            await pushToGithub(FLOOR_HISTORY_PATH, JSON.stringify(floorHistoryDoc, null, 2), `floor-history — ${floorHistoryDoc.row_count} rows`);
+            await pushToGithub(FIRST_SEEN_PATH, JSON.stringify(firstSeenDoc, null, 2), `listing-first-seen — ${firstSeenDoc.count} live listings`);
+        }
     } else {
         console.log('⚠️  GITHUB_TOKEN not set — saving locally');
         fs.writeFileSync('nfts.json', JSON.stringify(nftsDoc));
@@ -1962,6 +2136,10 @@ async function captureSnapshot() {
         fs.writeFileSync(`daily-${dateKey}.json`, JSON.stringify(dailyDoc, null, 2));
         fs.writeFileSync('pending-claims.json', JSON.stringify(pending.updatedState, null, 2));
         if (effectiveMode === 'full') fs.writeFileSync('hot-set.json', JSON.stringify(hotSetDoc, null, 2));
+        if (floorHistoryDoc) {
+            fs.writeFileSync('floor-history.json', JSON.stringify(floorHistoryDoc, null, 2));
+            fs.writeFileSync('listing-first-seen.json', JSON.stringify(firstSeenDoc, null, 2));
+        }
         console.log(`  Saved locally: nfts.json (${(JSON.stringify(nftsDoc).length / 1024).toFixed(1)} KB), summary.json, heartbeat.json, daily-${dateKey}.json${effectiveMode === 'full' ? ', hot-set.json' : ''}`);
     }
 
