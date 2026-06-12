@@ -1,0 +1,8 @@
+{
+  "name": "dao-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DAO dashboard aggregates cron - successor to the legacy epoch-end dashboard block",
+  "main": "dao-dashboard.js",
+  "engines": { "node": ">=18" }
+}
