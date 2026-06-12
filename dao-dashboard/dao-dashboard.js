@@ -503,22 +503,36 @@ async function captureTreasury(prices) {
 
 // ── Section: Lion DAO alliance (chain staking) ──────────────────────────────
 async function captureLionAlliance() {
-    // Find which DAO wallet holds the Lion delegation (main or council)
-    let stakedLuna = 0, rewardLuna = 0, delegatorWallet = null, anyQueryOk = false;
+    // Find the Lion delegation by VALIDATOR MONIKER, not a hardcoded address.
+    // Lesson from 2026-06-12: the legacy epoch-185 file's validator address
+    // matched no delegation, yet DAODAO's treasury page (standard staking
+    // module via RPC ABCI) shows 10,000 LUNA staked to "The Lion DAO" from
+    // the main wallet — i.e. the validator address rotated/differed. Matching
+    // the moniker (or the legacy address as a fallback) survives rotation.
+    let stakedLuna = 0, rewardLuna = 0, delegatorWallet = null, lionValoper = null, lionMoniker = null, anyQueryOk = false;
     for (const wallet of LION_DELEGATOR_CANDIDATES) {
         const dels = await lcdGet(`/cosmos/staking/v1beta1/delegations/${wallet}`);
         if (!dels) continue;
         anyQueryOk = true;
-        const del = (dels.delegation_responses || []).find(d => d.delegation?.validator_address === LION_VALIDATOR);
-        if (!del) continue;
-        stakedLuna = Number(del.balance?.amount || 0) / 1e6;
-        delegatorWallet = wallet;
-        const rews = await lcdGet(`/cosmos/distribution/v1beta1/delegators/${wallet}/rewards`);
-        const vr = (rews?.rewards || []).find(r => r.validator_address === LION_VALIDATOR);
-        for (const c of (vr?.reward || [])) {
-            if (c.denom === 'uluna') rewardLuna += Number(c.amount) / 1e6;
+        for (const d of (dels.delegation_responses || [])) {
+            const val = d.delegation?.validator_address;
+            if (!val) continue;
+            let moniker = '';
+            const vi = await lcdGet(`/cosmos/staking/v1beta1/validators/${val}`);
+            moniker = vi?.validator?.description?.moniker || '';
+            if (/lion/i.test(moniker) || val === LION_VALIDATOR) {
+                stakedLuna += Number(d.balance?.amount || 0) / 1e6;
+                delegatorWallet = wallet;
+                lionValoper = val;
+                lionMoniker = moniker || 'Lion DAO';
+                const rews = await lcdGet(`/cosmos/distribution/v1beta1/delegators/${wallet}/rewards`);
+                const vr = (rews?.rewards || []).find(r => r.validator_address === val);
+                for (const c of (vr?.reward || [])) {
+                    if (c.denom === 'uluna') rewardLuna += Number(c.amount) / 1e6;
+                }
+            }
         }
-        break;
+        if (lionValoper) break;
     }
     if (!anyQueryOk) throw new Error('delegations query failed for all candidate wallets');
     const apr = await (async () => {
@@ -533,8 +547,8 @@ async function captureLionAlliance() {
         })();
     const chain_staking = {
         validators: [{
-            name: 'Lion DAO',
-            address: LION_VALIDATOR,
+            name: lionMoniker || 'Lion DAO',
+            address: lionValoper || LION_VALIDATOR,
             staked_luna: stakedLuna,
             unclaimed_rewards_luna: rewardLuna,
             delegator_wallet: delegatorWallet,
