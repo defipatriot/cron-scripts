@@ -89,6 +89,13 @@ const ZLUNA_CONNECTORS = {
 
 // Lion DAO alliance (constants carried over from the legacy v3 dashboard block)
 const LION_VALIDATOR = 'terravaloper1dcegyrekltswvyy0xy69ydgxn9x8x32zdtapd8';
+// The 10K LUNA alliance stake may be delegated from the council multisig rather
+// than the main wallet — check all candidates and report whichever holds it.
+const LION_DELEGATOR_CANDIDATES = [
+    DAO_MAIN_WALLET,
+    'terra1yqv0af22675wlcmgflxk4ve07vt8qlm999gk0cuw5l64r5xxgadsyg8ywv', // council treasury (legacy v3 block)
+    'terra1qjxlk5skflwhgwgknh3hdfn93pcfhcm6q9wmm3z9zsxq7auf5nrsrqurqp', // council multisig (lib constant)
+];
 const LION_ALLIANCE_META = {
     description: 'Alliance with Lion DAO ecosystem',
     established: '2025-08-01',
@@ -350,6 +357,10 @@ async function captureDeposits(catalog) {
 // ── Section: unclaimed rewards (deposit / vote / rebase) ────────────────────
 // Pure transform, exported for testing.
 function aggregateUnclaimed({ bucketResps, rebaseResp, voteResp, connectorRates }, prices, ampRatio) {
+    // Null responses = failed queries, NEVER zero/empty values. A claimed rebase
+    // is {amount:"0"}; null is a rate-limited query that must surface as an error.
+    if (rebaseResp === null) throw new Error('user_pending_rebase null after retries');
+    if (voteResp === null) throw new Error('user_claimable null after retries');
     // Deposit rewards: zLUNA per bucket → LUNA via connector share_exchange_rate
     let zTotal = 0, depositLuna = 0;
     for (const bucket of TLA_BUCKETS) {
@@ -402,6 +413,15 @@ function aggregateUnclaimed({ bucketResps, rebaseResp, voteResp, connectorRates 
         const epNum = ep?.period ?? ep?.epoch ?? null;
         if (epochHadClaim && epNum != null) periods.add(Number(epNum));
     }
+    // Fallback: if entries carried no epoch numbers but the response declares a
+    // claimable window (start/end) and there ARE claims, report that window.
+    if (periods.size === 0 && Object.keys(by_token).length > 0
+        && voteResp?.start != null && voteResp?.end != null) {
+        const s = Number(voteResp.start), e = Number(voteResp.end);
+        if (Number.isFinite(s) && Number.isFinite(e) && e >= s && e - s < 200) {
+            for (let i = s; i <= e; i++) periods.add(i);
+        }
+    }
     const vote_rewards = {
         by_token,
         periods: [...periods].sort((a, b) => a - b),
@@ -446,10 +466,25 @@ async function captureUnclaimed(prices, ampRatio) {
 
 // ── Section: Lion DAO alliance (chain staking) ──────────────────────────────
 async function captureLionAlliance() {
-    const [dels, rews, apr] = await Promise.all([
-        lcdGet(`/cosmos/staking/v1beta1/delegations/${DAO_MAIN_WALLET}`),
-        lcdGet(`/cosmos/distribution/v1beta1/delegators/${DAO_MAIN_WALLET}/rewards`),
-        (async () => {
+    // Find which DAO wallet holds the Lion delegation (main or council)
+    let stakedLuna = 0, rewardLuna = 0, delegatorWallet = null, anyQueryOk = false;
+    for (const wallet of LION_DELEGATOR_CANDIDATES) {
+        const dels = await lcdGet(`/cosmos/staking/v1beta1/delegations/${wallet}`);
+        if (!dels) continue;
+        anyQueryOk = true;
+        const del = (dels.delegation_responses || []).find(d => d.delegation?.validator_address === LION_VALIDATOR);
+        if (!del) continue;
+        stakedLuna = Number(del.balance?.amount || 0) / 1e6;
+        delegatorWallet = wallet;
+        const rews = await lcdGet(`/cosmos/distribution/v1beta1/delegators/${wallet}/rewards`);
+        const vr = (rews?.rewards || []).find(r => r.validator_address === LION_VALIDATOR);
+        for (const c of (vr?.reward || [])) {
+            if (c.denom === 'uluna') rewardLuna += Number(c.amount) / 1e6;
+        }
+        break;
+    }
+    if (!anyQueryOk) throw new Error('delegations query failed for all candidate wallets');
+    const apr = await (async () => {
             try {
                 const r = await fetch(URL_STAKING_APR, { signal: AbortSignal.timeout(15000) });
                 if (!r.ok) return null;
@@ -458,22 +493,14 @@ async function captureLionAlliance() {
                 const m = last.match(/"?(\d{4}-\d{2}-\d{2})"?\s*,\s*"?(-?\d+(?:\.\d+)?)"?/);
                 return m ? { date: m[1], apr: parseFloat(m[2]) } : null;
             } catch (_) { return null; }
-        })(),
-    ]);
-    if (!dels) throw new Error('delegations query failed');
-    const del = (dels.delegation_responses || []).find(d => d.delegation?.validator_address === LION_VALIDATOR);
-    const stakedLuna = del ? Number(del.balance?.amount || 0) / 1e6 : 0;
-    let rewardLuna = 0;
-    const vr = (rews?.rewards || []).find(r => r.validator_address === LION_VALIDATOR);
-    for (const c of (vr?.reward || [])) {
-        if (c.denom === 'uluna') rewardLuna += Number(c.amount) / 1e6; // amount is a decimal string
-    }
+        })();
     const chain_staking = {
         validators: [{
             name: 'Lion DAO',
             address: LION_VALIDATOR,
             staked_luna: stakedLuna,
             unclaimed_rewards_luna: rewardLuna,
+            delegator_wallet: delegatorWallet,
         }],
     };
     if (apr) { chain_staking.staking_apr_pct = apr.apr; chain_staking.staking_apr_date = apr.date; }
