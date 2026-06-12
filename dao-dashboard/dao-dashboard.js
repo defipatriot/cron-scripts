@@ -233,6 +233,7 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
     if (failures.length) throw new Error('LP capture partial failure: ' + failures.join(', '));
 
     let totalLpUsd = 0;
+    const positions = []; // per-pool position list (consumed by dao_tla_deposits.html)
     const bySymbol = {}; // symbol -> { amount, usd }
     const addToken = (symbol, amount, usd) => {
         if (!symbol || !(usd > 0 || amount > 0)) return;
@@ -266,6 +267,7 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
                 positionUsd = pool.staked_in_tla_usd * (shares / totalShares);
             }
             totalLpUsd += positionUsd;
+            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: false, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null });
             if (!decompose(pool, positionUsd) && pool) {
                 // single-asset pool: the position IS the token
                 const sym = pool.lp_health?.asset_0?.symbol || pool.name;
@@ -273,7 +275,6 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
                 const amt = price > 0 ? positionUsd / price : 0;
                 addToken(sym, amt, positionUsd);
             }
-            void bucket;
         }
     }
 
@@ -297,13 +298,13 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
                 positionUsd = (userLp / 1e6) * price;
             }
             totalLpUsd += positionUsd;
+            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: true, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null });
             if (!decompose(pool, positionUsd) && pool) {
                 const sym = pool.lp_health?.asset_0?.symbol || pool.name;
                 const price = catalog.prices[sym] || pool.lp_health?.asset_0?.price_usd || 0;
                 const amt = price > 0 ? positionUsd / price : 0;
                 addToken(sym, amt, positionUsd);
             }
-            void bucket;
         }
     }
 
@@ -333,6 +334,7 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
         lp_usd: totalLpUsd,
         zluna_usd: zlunaUsd,
         tokens,
+        positions: positions.filter(p => p.position_usd > 0.01),
         composition: 'lp_underlying+zluna',
     };
 }
@@ -464,6 +466,41 @@ async function captureUnclaimed(prices, ampRatio) {
     return aggregateUnclaimed({ bucketResps, rebaseResp, voteResp, connectorRates }, prices, ampRatio);
 }
 
+// ── Section: DAO treasury (main-wallet balances, legacy shape) ──────────────
+// Legacy v3 dashboard.treasury = [{token, amount, price, usd}] for the main
+// wallet's native + cw20 holdings. dao_treasury.html uses this as the snapshot
+// baseline for its "What Changed" comparison, and the daily archives give the
+// treasury history charts a future. Receipt/LP tokens are not in DENOM_MAP so
+// they're naturally excluded, matching the legacy isReceiptToken filtering.
+async function captureTreasury(prices) {
+    const bank = await lcdGet(`/cosmos/bank/v1beta1/balances/${DAO_MAIN_WALLET}?pagination.limit=200`);
+    if (!bank) throw new Error('bank balances query failed');
+    const tokens = [];
+    for (const b of (bank.balances || [])) {
+        const info = DENOM_MAP[b.denom];
+        if (!info) continue;
+        const amount = Number(b.amount) / Math.pow(10, info.decimals);
+        if (amount <= 0) continue;
+        const sym = info.symbol === 'wBTC' ? 'wBTC' : info.symbol;
+        const price = prices[sym] || prices[info.symbol] || prices[info.symbol.toUpperCase()] || 0;
+        tokens.push({ token: info.symbol, amount, price, usd: amount * price });
+    }
+    const cw20s = Object.entries(DENOM_MAP).filter(([d]) => d.startsWith('terra1'));
+    const results = await Promise.all(cw20s.map(async ([contract, info]) => {
+        const r = await queryChain(contract, { balance: { address: DAO_MAIN_WALLET } });
+        if (r === null) return { _err: info.symbol };
+        const amount = Number(r.balance || 0) / Math.pow(10, info.decimals);
+        if (amount <= 0) return null;
+        const price = prices[info.symbol] || prices[info.symbol.toUpperCase()] || 0;
+        return { token: info.symbol, amount, price, usd: amount * price };
+    }));
+    const failed = results.filter(r => r?._err).map(r => r._err);
+    if (failed.length) throw new Error('cw20 balance null after retries: ' + failed.join(','));
+    for (const r of results) if (r && !r._err) tokens.push(r);
+    tokens.sort((a, b) => b.usd - a.usd);
+    return { tokens, total_usd: tokens.reduce((s, t) => s + t.usd, 0) };
+}
+
 // ── Section: Lion DAO alliance (chain staking) ──────────────────────────────
 async function captureLionAlliance() {
     // Find which DAO wallet holds the Lion delegation (main or council)
@@ -579,6 +616,10 @@ async function main() {
     try { alliances = await captureLionAlliance(); console.log(`  lion_dao: ${alliances.lion_dao.chain_staking.validators[0].staked_luna} LUNA staked`); }
     catch (e) { errors.push(`alliances: ${e.message}`); }
 
+    let treasury = null;
+    try { treasury = await captureTreasury(prices); console.log(`  treasury: $${treasury.total_usd.toFixed(2)} across ${treasury.tokens.length} tokens`); }
+    catch (e) { errors.push(`treasury: ${e.message}`); }
+
     // Hard-fail rule: if the two headline sections both failed, don't publish.
     if (!deposits && !unclaimed) {
         console.error('  ❌ both tla_deposits and unclaimed_rewards failed — not publishing. Errors:', errors);
@@ -596,6 +637,7 @@ async function main() {
             errors,
         },
         dashboard: {
+            treasury,
             unclaimed_rewards: unclaimed ? unclaimed.unclaimed_rewards : null,
             vote_rewards:      unclaimed ? unclaimed.vote_rewards : null,
             rebase:            unclaimed ? unclaimed.rebase : null,
