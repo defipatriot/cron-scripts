@@ -510,8 +510,14 @@ async function captureLionAlliance() {
     // the main wallet — i.e. the validator address rotated/differed. Matching
     // the moniker (or the legacy address as a fallback) survives rotation.
     let stakedLuna = 0, rewardLuna = 0, delegatorWallet = null, lionValoper = null, lionMoniker = null, anyQueryOk = false;
+    // Diagnostic scan: every delegation seen on every candidate wallet, with
+    // resolved monikers — emitted in the output so a zero result is one-glance
+    // diagnosable (wrong moniker? empty LCD response? wrong wallet?).
+    const scan = [];
     for (const wallet of LION_DELEGATOR_CANDIDATES) {
         const dels = await lcdGet(`/cosmos/staking/v1beta1/delegations/${wallet}`);
+        const walletScan = { wallet, lcd_ok: !!dels, delegations: [] };
+        scan.push(walletScan);
         if (!dels) continue;
         anyQueryOk = true;
         for (const d of (dels.delegation_responses || [])) {
@@ -520,6 +526,7 @@ async function captureLionAlliance() {
             let moniker = '';
             const vi = await lcdGet(`/cosmos/staking/v1beta1/validators/${val}`);
             moniker = vi?.validator?.description?.moniker || '';
+            walletScan.delegations.push({ validator: val, moniker, luna: Number(d.balance?.amount || 0) / 1e6 });
             if (/lion/i.test(moniker) || val === LION_VALIDATOR) {
                 stakedLuna += Number(d.balance?.amount || 0) / 1e6;
                 delegatorWallet = wallet;
@@ -534,6 +541,7 @@ async function captureLionAlliance() {
         }
         if (lionValoper) break;
     }
+    console.log('  lion scan:', JSON.stringify(scan));
     if (!anyQueryOk) throw new Error('delegations query failed for all candidate wallets');
     const apr = await (async () => {
             try {
@@ -553,6 +561,7 @@ async function captureLionAlliance() {
             unclaimed_rewards_luna: rewardLuna,
             delegator_wallet: delegatorWallet,
         }],
+        delegation_scan: scan,
     };
     if (apr) { chain_staking.staking_apr_pct = apr.apr; chain_staking.staking_apr_date = apr.date; }
     return { lion_dao: { ...LION_ALLIANCE_META, chain_staking } };
@@ -642,7 +651,7 @@ async function main() {
 
     const payload = {
         meta: {
-            version: 'dao-dashboard-1.0',
+            version: 'dao-dashboard-1.3-lion-scan',
             epoch,
             phase: 'live',
             generated_at: new Date().toISOString(),
