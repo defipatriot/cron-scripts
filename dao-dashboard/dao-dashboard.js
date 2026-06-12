@@ -615,6 +615,21 @@ async function main() {
     if (!GITHUB_TOKEN) { console.error('  ❌ GITHUB_TOKEN not set'); process.exit(1); }
     const ok = await pushToGithub(OUTPUT_PATH, json, `dao-dashboard — epoch ${epoch} ${payload.meta.status} (${new Date().toISOString().slice(0, 16)}Z)`);
     if (!ok) process.exit(1);
+
+    // Daily archive: first successful run of each UTC day is preserved at
+    // data/daily/dao-dashboard-YYYY-MM-DD.json so the dashboard's chart modals
+    // can accrue TLA-metric history (deposits, vote/deposit/rebase USD) going
+    // forward — the legacy per-epoch history died at 185. Skipped if today's
+    // archive already exists (one commit per day, not 24).
+    try {
+        const day = new Date().toISOString().slice(0, 10);
+        const archivePath = `data/daily/dao-dashboard-${day}.json`;
+        const existing = await githubApiRequest('GET', `/repos/${GITHUB_REPO}/contents/${archivePath}?ref=${GITHUB_BRANCH}`);
+        if (existing.status === 404) {
+            await pushToGithub(archivePath, json, `dao-dashboard daily archive ${day}`);
+        }
+    } catch (e) { console.warn(`  ⚠ daily archive skipped: ${e.message}`); }
+
     console.log(`  done: ${payload.meta.status}${errors.length ? ' — ' + errors.join('; ') : ''}`);
 }
 
