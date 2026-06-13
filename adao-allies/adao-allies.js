@@ -51,7 +51,7 @@ const ALLIES = [
         slug: 'liondao',
         name: 'Lion DAO',
         coreAddress: 'terra1tkersa2mqwy2h8exj799qx2xrhdu0dkymk9psp6v0k4kz4tkxucssgluec',
-        stakeType: 'token',   // ROAR — staked balances are raw micro-units (billions); not USD-valued in v1
+        stakeType: 'cw20',   // ROAR is a cw20 — module is dao-voting-cw20-staked (confirmed via contract info). staked balances are raw micro-units (billions); not USD-valued in v1
         retention: 'registered_only',
     },
 ];

@@ -9,7 +9,7 @@ service.
 | Ally | Stake type | DAODAO formula |
 |---|---|---|
 | Pixel Lions | NFT-staked | `daoVotingCw721Staked` |
-| Lion DAO | ROAR-token-staked | `daoVotingTokenStaked` |
+| Lion DAO | ROAR (cw20-staked) | `daoVotingCw20Staked` |
 
 ## Independence (preserved even when bundled)
 Each ally is captured in its own try/catch. One ally failing (indexer hiccup,
