@@ -1,0 +1,8 @@
+{
+  "name": "tla-locks",
+  "version": "1.0.0",
+  "description": "System-wide veLUNA lock health & intelligence capture",
+  "main": "tla-locks.js",
+  "scripts": { "start": "node tla-locks.js" },
+  "license": "MIT"
+}
