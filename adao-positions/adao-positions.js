@@ -2,21 +2,32 @@
 // aDAO Positions Cron — Phase 1
 // =============================================================================
 //
-// Captures full TLA portfolio data for every named aDAO member. The dashboard
-// uses this to render per-member "portfolio tracker" views with:
+// Captures full TLA portfolio data for EVERY aDAO member (named + unknown). The
+// dashboard uses this to render per-member "portfolio tracker" views with:
 //   • LP positions and their performance over epochs
 //   • Lock holdings and what they'd be worth if adjusted today (LST ratio gains)
 //   • Voting allocations and pool status (active / at-risk / inactive)
 //   • Pending rewards (zluna), pending rebase, pending bribes
 //   • Wallet balances for TLA-relevant tokens
 //
+// CURRENT vs HISTORY (decision 2026-06-13):
+//   • current.json captures ALL members (named + unknown) — the live view is
+//     complete, totals are DAO-wide. Each member is tagged `is_registered`.
+//   • Retained history (daily/weekly/epoch archives) is REGISTERED-ONLY —
+//     unknown wallets are counted live but not tracked across time (their
+//     retained-history section is intentionally blank). Registered members
+//     opted into an identity (PFPK name), so their story is persisted.
+//   • current.json also carries `totals` (DAO-wide) and `totals_named`
+//     (registered-only, back-compat with the prior named-only figure).
+//
 // Schedule: Mondays at 01:00 UTC — runs ~1 hour after each TLA epoch boundary
 //           (epoch starts at Monday 00:00 UTC, so we capture the just-settled state).
 //           Cron string:  "0 1 * * 1"
 // Runtime:  ~3-5 minutes (~1000 chain queries with parallelism)
-// Output:   data/members.json    (light: all 157 members, named or not)
-//           data/current.json    (heavy: full portfolios for ~46 named)
-//           data/weekly/epoch-{n}.json  (frozen archive per epoch)
+// Output:   data/members.json    (light: all members, named or not)
+//           data/current.json    (heavy: full portfolios for ALL members, is_registered-tagged)
+//           data/weekly/epoch-{n}.json  (frozen archive per epoch — REGISTERED-ONLY)
+//           data/daily/YYYY-MM-DD.json  (daily snapshot — REGISTERED-ONLY)
 //
 // Member discovery (self-updating):
 //   1. PRIMARY: indexer.daodao.zone topStakers → all current DAO members
@@ -450,11 +461,25 @@ async function captureSnapshot() {
     // Phase 2: Load shared data
     const ctx = await loadSharedData();
 
-    // Phase 3: Per-member portfolio queries (parallel batched)
-    console.log(`💼 Fetching portfolios for ${namedMembers.length} named members...`);
-    const portfolios = await parallelMap(namedMembers, m => fetchMemberPortfolio(m, ctx), BATCH_CONCURRENCY);
+    // Phase 3: Per-member portfolio queries (parallel batched).
+    // We now capture ALL members (named + unknown) so the CURRENT-run view is
+    // complete (totals reflect the whole DAO, not just named members). History
+    // retention, however, is registered-only — see Phase 6 (the daily/weekly/
+    // epoch archives carry named members; unknowns live only in current.json).
+    // Decision (2026-06-13): registered members opted into an identity (PFPK
+    // name), so we persist their story; unknown wallets are counted live but
+    // not tracked across time (their retained-history section is intentionally
+    // blank). Each portfolio is tagged `is_registered` so consumers can split.
+    console.log(`💼 Fetching portfolios for ${allMembers.length} members (${namedMembers.length} named + ${allMembers.length - namedMembers.length} unknown)...`);
+    const namedSet = new Set(namedMembers.map(m => m.address));
+    const portfolios = await parallelMap(allMembers, m => fetchMemberPortfolio(m, ctx).then(p => {
+        if (p) p.is_registered = namedSet.has(p.wallet);
+        return p;
+    }), BATCH_CONCURRENCY);
     const validPortfolios = portfolios.filter(p => p && !p._error);
-    console.log(`  ✓ ${validPortfolios.length}/${namedMembers.length} portfolios captured`);
+    const validNamed = validPortfolios.filter(p => p.is_registered);
+    const validUnknown = validPortfolios.filter(p => !p.is_registered);
+    console.log(`  ✓ ${validPortfolios.length}/${allMembers.length} portfolios captured (${validNamed.length} named, ${validUnknown.length} unknown)`);
 
     // Phase 3b: Treasury wallets (aDAO Core + any other tracked DAO addresses).
     // Tracked alongside members so the TLA Stats page can show treasury-only data.
@@ -511,13 +536,22 @@ async function captureSnapshot() {
         console.log(`    ${t.name}: Wallet $${s.total_wallet_balances_usd?.toFixed(2) ?? '0.00'} (${t.wallet_balances?.length ?? 0} tokens)`);
     }
 
-    // Phase 4: Sort + rank
+    // Phase 4: Sort + rank ALL current members by VP (registered + unknown),
+    // so the live view ranks the whole DAO. Registered-only rank also stamped
+    // for consumers that show the named leaderboard.
     validPortfolios.sort((a, b) => (b.voting?.total_voting_power_human || 0) - (a.voting?.total_voting_power_human || 0));
     validPortfolios.forEach((p, i) => { p.rank_by_vp = i + 1; });
+    validNamed.forEach((p, i) => { p.rank_by_vp_named = i + 1; });
 
-    // Phase 5: Rollups
+    // Phase 5: Rollups. Two sets — ALL-member totals (the true DAO-wide figure)
+    // and named-only totals (back-compat with consumers expecting the prior
+    // named-only number). `computeRollups` is reused for both.
     const totals = computeRollups(validPortfolios);
-    console.log(`📊 Totals: ${totals.named_member_count} members, ${totals.total_voting_power_human.toFixed(0)} VP, $${totals.total_lp_position_usd.toFixed(0)} LP`);
+    const totalsNamed = computeRollups(validNamed);
+    totals.all_member_count = validPortfolios.length;
+    totals.named_only_count = validNamed.length;
+    totals.unknown_count = validUnknown.length;
+    console.log(`📊 Totals (all ${validPortfolios.length}): ${totals.total_voting_power_human.toFixed(0)} VP, $${totals.total_lp_position_usd.toFixed(0)} LP | named-only: ${totalsNamed.total_voting_power_human.toFixed(0)} VP`);
     if (totals.at_risk_lp_positions > 0) {
         console.log(`  ⚠ ${totals.at_risk_lp_positions} at-risk LP positions across ${totals.members_with_at_risk_positions} members`);
     }
@@ -552,12 +586,24 @@ async function captureSnapshot() {
         sources: {
             tla_snapshot_captured_at: ctx.tlaSnapshot?.capturedAt || null,
         },
-        totals,
+        totals,            // DAO-wide (all current members)
+        totals_named: totalsNamed,  // registered-only (back-compat / named leaderboard)
         treasury: validTreasuries.length === 1 ? validTreasuries[0] : null,
         treasuries: validTreasuries,
         council_treasury: validCouncils.length === 1 ? validCouncils[0] : null,
         council_treasuries: validCouncils,
-        members: validPortfolios,
+        members: validPortfolios,   // ALL current members (named + unknown), each tagged is_registered
+    };
+
+    // History-retention split (decision 2026-06-13): the RETAINED archives keep
+    // registered members only — unknowns are live-only (blank history). So the
+    // daily/weekly/epoch snapshots carry a registered-only portfolios doc.
+    const portfoliosDocRetained = {
+        ...portfoliosDoc,
+        totals: totalsNamed,
+        members: validNamed,
+        retention: 'registered_only',
+        note: 'Unknown (unnamed) members are intentionally excluded from retained history — see current.json for the full live view.',
     };
 
     // Phase 7: Save / publish
@@ -570,14 +616,15 @@ async function captureSnapshot() {
     } else {
         const membersContent = JSON.stringify(membersDoc, null, 2);
         const portfoliosContent = JSON.stringify(portfoliosDoc, null, 2);
+        const portfoliosRetainedContent = JSON.stringify(portfoliosDocRetained, null, 2);
         const archivePath = `data/weekly/epoch-${epochInfo.number}.json`;
 
         await publishFile('data/members.json', membersContent, `members refresh epoch ${epochInfo.number}`);
         console.log(`  ✓ Published data/members.json`);
         await publishFile('data/current.json', portfoliosContent, `positions epoch ${epochInfo.number}`);
         console.log(`  ✓ Published data/current.json`);
-        await publishFile(archivePath, portfoliosContent, `archive epoch ${epochInfo.number}`);
-        console.log(`  ✓ Published ${archivePath}`);
+        await publishFile(archivePath, portfoliosRetainedContent, `archive epoch ${epochInfo.number} (registered-only history)`);
+        console.log(`  ✓ Published ${archivePath} (registered-only)`);
 
         // Daily archive — gives Portfolio Tracker enough time-series granularity
         // for P&L tracking and fee-accrual trends without bloating the repo. The
@@ -592,7 +639,7 @@ async function captureSnapshot() {
         // what we actually want for daily P&L computation.
         const dateStr = startedAt.toISOString().slice(0, 10);
         const dailyPath = `data/daily/${dateStr}.json`;
-        await publishFile(dailyPath, portfoliosContent, `📸 positions daily snapshot — ${dateStr}`);
+        await publishFile(dailyPath, portfoliosRetainedContent, `📸 positions daily snapshot — ${dateStr} (registered-only history)`);
         console.log(`  ✓ Published ${dailyPath}`);
 
         // Compute data fingerprint and check freshness vs previous run.
