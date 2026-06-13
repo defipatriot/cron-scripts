@@ -28,11 +28,12 @@ No backend server. No database. Each cron is independent — a failure in one do
 
 ## Cron inventory
 
-### 🟢 Active production crons (10)
+### 🟢 Active production crons (11)
 
 | Folder | Writes to | Cadence | Purpose |
 |---|---|---|---|
-| `adao-positions/` | `adao-positions-data_2026` | Daily 01:00 UTC* | Member position snapshots (16 positions × all members) — foundation for Portfolio Tracker |
+| `adao-positions/` | `adao-positions-data_2026` | **Weekly `0 1 * * 1` ⚠ should be daily `0 1 * * *`** | Member position snapshots (16 positions × named members) — foundation for Portfolio Tracker. **The code constant expects daily; the Render schedule was never switched. Until it is, no daily P&L history accumulates.** |
+| `dao-dashboard/` | `tla-snapshot-data_2026` (`data/dao-dashboard.json` + `data/daily/` archives) | Hourly — **chained into the tla-snapshot job** (`node tla-snapshot.js && node ../dao-dashboard/dao-dashboard.js`) | Successor to the dead "TLA Admin Core v3" epoch cron. DAO-specific live aggregates (treasury, unclaimed/vote/rebase rewards, TLA deposits + per-pool positions, Lion alliance) in a legacy-v3-compatible shape. Feeds index.html's rewards/deposits/Lion tiles + the two deep-dive pages. Self-archives daily for chart history. See its README. |
 | `astroport/` | `astroport-pool-data_2026` | Daily | Astroport pool stats (liquidity, APR, volume) |
 | `bribes-history/` | `bribes-data_2026` | Daily | Bribes per epoch — voting incentive history |
 | `marketplace-stats/` | `marketplace-data_2026` | Daily | NFT marketplace activity for Pixel Lions |
@@ -109,6 +110,54 @@ A systemwide audit (triggered by a publicnode pagination quirk silently dropping
 - **F6 — Required-vs-optional.** A source that should be fatal must abort, not publish a partial marked `ok`.
 - **F7 — Heartbeat honesty.** `status` must flip to `partial`/`error`/`stuck` on real failure, or the health widget green-lights a quiet failure. `network-and-prices` is the model (per-source `.ok`, fingerprint staleness detector).
 - **F8 — Epoch/time boundary.** Off-by-one epoch, UTC flip, missed end-of-epoch window → irreversible wrong-epoch capture. (`epochIndex` 0-based internal; `currentEpoch = epochIndex + 1` canonical.)
+
+## Project status & roadmap (2026-06-12)
+
+### Recently shipped (this multi-day arc)
+- **NFT Explorer v6.0** — chain-of-truth migration, full Analytics tab, deep-linking. (`explorer-log.md`)
+- **Dashboard Revs 3.51–3.54** — marketplace v2 (Atrium, multi-venue feed, tier floors), dao-dashboard cron repoint, cron-first instant paint (~9s→3-5s cold load), deving.zone eliminated, chart history revived past epoch 185, heartbeat false-stale fix, deep-dive pages onto the live layer. (`index-log.md`)
+- **dao-dashboard cron** built + deployed (chained into tla-snapshot). Notable bug caught in fixture testing: bribe-manager `user_claimable` claims can nest `amount` inside `asset`. Notable production discovery: the legacy Lion DAO validator address (`terravaloper1dce…`) was WRONG — the real validator is **`terravaloper1pet430t7ykswxuyhh56d4gk6rt7qgu9as6a5r0`** ("🦁 The Lion DAO", 10,000 LUNA staked from the DAO main wallet). The cron now discovers it by moniker (`/lion/i`) rather than hardcoded address, and emits a `delegation_scan` diagnostic block. **Lesson: never trust a recorded validator/contract address that yields zero — scan and resolve by moniker.**
+- **ally.html** — live daily gain + staking share, deving.zone removed.
+
+### TLA Stats — the four product pillars (the "what makes us different from Eris" work)
+Goals: **Portfolio Tracker** (member position time-series + P&L), **LP Performance & Health Scoring** (multi-epoch ungameable metrics), **Bribes Tracking**, **Vote Intelligence**. History strategy is **forward-only chain capture** (public LCDs prune ~100 blocks; no archive node) — so the accumulation clock matters, every un-captured week is lost.
+
+**Phase status:**
+- Phase 1 (chain-query discovery) — ✅ done (all Eris ve3 contracts mapped).
+- Phase 2 (pipeline-in-scripts) — ✅ effectively done (tla-snapshot, network-and-prices, nft-inventory v2, dao-dashboard all prove the layered pattern).
+- Phase 3 (forward accumulation) — ⏳ partially running; **gap: adao-positions still weekly** (see ⚠ above).
+- Phase 4 (the four pillars on tla-stats.html) — 🔲 not started.
+
+### Planned member-expansion crons (designed, NOT built — discovery complete)
+Decided architecture: **separate cron per source, each its own repo + heartbeat + schedule**, so allies can never break aDAO capture and can be paused independently. All share a (to-be-extracted) `lib/capture-engine.js` (the per-address position logic currently inside `adao-positions.js`). Membership is always LIVE — no hardcoded member CSVs.
+
+| Planned cron | Tracks | Discovery (all live) |
+|---|---|---|
+| `adao-positions` (exists) | aDAO registered + (add) unknown members | DAODAO `topStakers` + PFPK name resolve. Currently filters to named only; widening to include unknowns is a one-line change. |
+| `tla-participants` (new) | All TLA-lock holders + all bribe providers | Lock holders via CW721 enumeration (confirmed works, below); bribe providers from `bribes-data_2026` (a read). |
+| `pixellions-positions` (new) | Pixel Lions registered members | DAO core `terra1c690mdrwdetnr09zfk3tf9xz9jhrgd9wpjyf3tuccj74ql09eqmq6sh7en` → voting module via indexer `dumpState` → `topStakers` + PFPK filter (`name != null`). |
+| `liondao-positions` (new) | Lion DAO registered members | DAO core `terra1tkersa2mqwy2h8exj799qx2xrhdu0dkymk9psp6v0k4kz4tkxucssgluec` → same pattern. |
+
+**Name registry mechanism (how "registered names" stays live):** DAODAO names live in **PFPK** at `pfpk.daodao.zone/bech32/{hexAddress}` — per-address GET, returns `{name}` (non-null = registered). `adao-positions` already uses this every run; the ally crons reuse it. No memo-scanning, no snapshot — registrations/removals reflect on the next run.
+
+### Planned `tla-locks` cron (designed, NOT built — full schema mapped)
+**This is the highest-value new capture** — the stale-VP-gap and unlock-cliff metrics don't exist anywhere else in the ecosystem. Its own cron (big enough to stand alone). Forward-tracking, so clock-start has urgency.
+
+Lock contract (veLUNA / "Vote Escrowed LUNA"): **`terra1uqhj8agyeaz8fu6mdggfuwr3lp32jlrx5hqag4jxexde92rzkamq3l62zg`**. CW721-enumerable (confirmed: `num_tokens`→431, `all_tokens` works). Per-lock `lock_info` returns: `owner`, `asset.info` (LST type), `asset.amount`, `underlying_amount` (with the **ratio frozen at lock time**), `coefficient` (VP multiplier tier 1–10ish), `start`/`end` periods, `slope` (exact VP decay/week), `voting_power`, `fixed_amount`.
+
+Capture design:
+- **System totals: ONE call.** `total_vamp` → `{fixed, voting_power, vp}` (fixed = non-decaying floor, voting_power = decaying part, vp = total). Decay *projection* via `total_vamp{time:{period:N}}` (NOT `at_period` — that variant is rejected; valid: current/next/last/time/period).
+- **Per-lock (×431):** `lock_info` + `owner_of`.
+- **Auto-max-lock detection (no extra query):** `end=="permanent"` && `slope==0` = auto-max ON; `end=={period:N}` && `slope>0` = decaying, N = unlock period.
+- **Stale-VP gap (the unique metric):** VP is stamped at lock-time ratio. Compute "VP if re-stamped today" = `amount × current_ratio × coefficient` vs the frozen `underlying`. Asset oracles are in the lock contract's `config.deposit_assets[].config.exchange_rate.contract` (LUNA native 1:1; ampLUNA, bLUNA, arbLUNA-ibc, + a 4th cw20 each carry their oracle).
+- **Participation order = free:** ascending `token_id` is the lock order (NFT #1 = first participant); `start` period dates it.
+- **Per-member rollups:** group locks by owner → total VP, stale-VP upside, personal unlock cliff, first-participation.
+- **Marketplace cross-ref:** locks are listable on Boost (already in the marketplace pipeline) → discounted-VP-for-sale flagging.
+- **Voter behavior (rides along):** vote churn + votes-on-dead-LPs from gauge controller `user_info.gauge_votes` snapshots (changes between runs = churn).
+
+### Open cron-side items (routed to cron chat, see CRON-FIXES-BRIEF.md)
+- **Stake/destake event sweep** (extend nft-inventory pending-claims tx-search → `data/v2/staking-events.json`) — unlocks Stake/Destake in the dashboard feed + DAO-Members chart history.
+- SOLID + ampLUNA daily price oracles (improves Atrium floor-band valuation), bid/offer capture, wash-trade flagging.
 
 ## Where to find more detail
 
