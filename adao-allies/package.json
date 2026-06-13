@@ -1,0 +1,8 @@
+{
+  "name": "adao-allies",
+  "version": "1.0.0",
+  "description": "aDAO ally DAO member TLA-position capture (Pixel Lions, Lion DAO, ...)",
+  "main": "adao-allies.js",
+  "scripts": { "start": "node adao-allies.js" },
+  "license": "MIT"
+}
