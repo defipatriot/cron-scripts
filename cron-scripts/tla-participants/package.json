@@ -1,0 +1,8 @@
+{
+  "name": "tla-participants",
+  "version": "1.0.0",
+  "description": "TLA participants (lock holders + bribe providers) position capture",
+  "main": "tla-participants.js",
+  "scripts": { "start": "node tla-participants.js" },
+  "license": "MIT"
+}
