@@ -12,6 +12,36 @@ re-attributes the big "anonymous whale" lock-holders that `tla-participants`
 flagged — those whales ARE the Votion MAX vaults; this cron maps that VP to the
 real underlying users.
 
+## What Votion actually does (the mechanism)
+Votion is a **vote aggregator + auto-compounder**. You lock your TLA position via
+Votion; it uses your VP to **chase bribes automatically**. When bribes pay out
+each epoch (in CAPA, ASTRO, LUNA, etc.), Votion **swaps them all into the vault's
+LST** (e.g. ampLUNA) and adds them back to the lockup pool — compounding your
+position and boosting the LST APR. "Lock and chill" — max VP, auto-bribe-chasing,
+auto-compounding, no manual vote management. That's why each vault's `staked`
+grows over time (the daily `Compound` txs) and why the APR is a *realized* number.
+
+## ⚠️ Pricing transparency (arbLUNA)
+Verified against Votion's own UI: our **ampLUNA** USD matches within ~1.5% (clean
+staking LST — hub ratio == market). But our **arbLUNA** USD runs **~14% high**:
+our `network-and-prices` feed only has arbLUNA's *hub-ratio* price (LUNA × 2.952
+≈ $0.1516), while arbLUNA actually trades at a *market* price (~$0.133) because
+it's an arbitrage strategy, not a clean staking derivative. The vault `staked`
+LST amounts match Votion EXACTLY (same `{state:{}}` query); only the USD differs,
+and only for arbLUNA. Each holder's `underlying_usd` is tagged
+`underlying_usd_price_source` so the UI can show **both our feed and a market /
+CoinGecko feed side by side** — mismatched prices are exactly how users get
+misled, so we surface the discrepancy rather than hide it. (Proper fix:
+add an arbLUNA market-price source to `network-and-prices` — affects tla-locks
+and portfolios too, not just Votion. Tracked separately.)
+
+## Price source (matches Votion's own feed)
+Votion prices each vault from TWO queries on the vault contract (confirmed via
+HAR of votion.money → `phoenix-rpc.erisprotocol.com`):
+- `{state:{}}` → `{staked}` — total underlying LST (THIS is the TVL; we use it,
+  byte-for-byte match to their UI).
+- `{exchange_rates:{limit:30}}` → the vault's internal share/compound rate history.
+
 ## Vault matrix (v1 seed; cron self-discovers via code_id 3677)
 | | MAX | 3 Months | 1 Week |
 |---|---|---|---|

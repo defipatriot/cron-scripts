@@ -125,10 +125,22 @@ async function discoverVaults() {
 // -----------------------------------------------------------------------------
 // Per-vault state: total staked LST, vdenom supply -> exchange rate, lock VP
 // -----------------------------------------------------------------------------
-async function loadVaultState(vault) {
-    // staked = total underlying LST in the vault
-    const stakedRes = await queryContract(vault.address, { staked: {} });
-    const stakedRaw = stakedRes && stakedRes.staked != null ? Number(stakedRes.staked) : null;
+async function loadVaultState(vault, ctx) {
+    // Total underlying LST = the vault's `{state:{}}` -> `staked` field. This is
+    // EXACTLY the query Votion's own UI uses (verified byte-for-byte against their
+    // displayed TVL: arbLUNA-MAX 207,069.98, ampLUNA-MAX 51,063.53, etc.). My
+    // earlier `{staked:{}}` guess was wrong — the field lives under `state`.
+    let stakedRaw = null;
+    const stateRes = await queryContract(vault.address, { state: {} });
+    if (stateRes && stateRes.staked != null) stakedRaw = Number(stateRes.staked);
+
+    // Lock VP from the escrow (the vault owns one lock NFT). lock_info is the
+    // known-good query tla-locks uses on all 431 locks.
+    let lockVp = null;
+    if (vault.lock_id) {
+        const li = await queryContract(TLA_VOTING_ESCROW, { lock_info: { token_id: String(vault.lock_id), time: 'next' } });
+        if (li && li.voting_power != null) lockVp = Number(li.voting_power) / 1e6;
+    }
 
     // vdenom total supply (factory denom) via bank
     let supplyRaw = null;
@@ -137,22 +149,18 @@ async function loadVaultState(vault) {
         if (sup && sup.amount && sup.amount.amount != null) supplyRaw = Number(sup.amount.amount);
     }
 
-    // exchange rate = staked / supply  (underlying LST per 1 vtoken)
+    // exchange rate = underlying LST (from the lock) / vdenom supply = LST per vtoken.
+    // The vault's bond ratio — DISTINCT from the LST->LUNA ratio (don't conflate).
     const exchangeRate = (stakedRaw != null && supplyRaw && supplyRaw > 0) ? stakedRaw / supplyRaw : null;
-
-    // vault's veLUNA lock VP (it owns one lock NFT)
-    let lockVp = null;
-    if (vault.lock_id) {
-        const li = await queryContract(TLA_VOTING_ESCROW, { lock_info: { token_id: String(vault.lock_id), time: 'next' } });
-        if (li && li.voting_power != null) lockVp = Number(li.voting_power) / 1e6;
-    }
+    const exchangeRateSource = exchangeRate != null ? 'state_staked_div_supply' : null;
 
     return {
         staked_lst_raw: stakedRaw,
         staked_lst_human: stakedRaw != null ? stakedRaw / 1e6 : null,
         vdenom_supply_raw: supplyRaw,
         vdenom_supply_human: supplyRaw != null ? supplyRaw / 1e6 : null,
-        exchange_rate: exchangeRate,      // underlying LST per 1 vtoken (both 6-dec, so unitless)
+        exchange_rate: exchangeRate,
+        exchange_rate_source: exchangeRateSource,
         lock_vp_human: lockVp,
     };
 }
@@ -201,7 +209,7 @@ async function run() {
     const vaults = await discoverVaults();
     console.log(`📊 Loading state for ${vaults.length} vaults...`);
     for (const v of vaults) {
-        v.state = await loadVaultState(v);
+        v.state = await loadVaultState(v, ctx);
         const ex = v.state.exchange_rate;
         console.log(`  ${v.label || v.address.slice(0,12)}: staked ${v.state.staked_lst_human?.toFixed(2)} ${v.lst_symbol} | rate ${ex?.toFixed(4)} | lock VP ${v.state.lock_vp_human?.toLocaleString()}`);
     }
@@ -228,6 +236,11 @@ async function run() {
             if (vtokenRaw <= 0) return null;   // deposited historically but no current balance (withdrew/transferred)
             const vtoken = vtokenRaw / 1e6;
             const underlyingLst = v.state.exchange_rate != null ? vtoken * v.state.exchange_rate : null;
+            // USD via our network-and-prices feed (hub-ratio price). NOTE: for
+            // arbLUNA this hub-ratio price runs ~14% above market (arbLUNA is an
+            // arb strategy, not a clean staking LST), so we tag the source so the
+            // UI can show both our feed and a market/CoinGecko feed side by side —
+            // mismatched prices are exactly how users get misled.
             const underlyingUsd = (underlyingLst != null && lstRatio != null) ? underlyingLst * lstRatio * lunaUsd : null;
             const shareOfVault = v.state.vdenom_supply_human ? vtoken / v.state.vdenom_supply_human : null;
             const impliedVp = (shareOfVault != null && v.state.lock_vp_human != null) ? shareOfVault * v.state.lock_vp_human : null;
@@ -236,6 +249,7 @@ async function run() {
                 vtoken_balance: vtoken,
                 underlying_lst: underlyingLst,
                 underlying_usd: underlyingUsd,
+                underlying_usd_price_source: 'network-and-prices/hub-ratio',
                 share_of_vault_pct: shareOfVault != null ? shareOfVault * 100 : null,
                 implied_vp: impliedVp,
             };
