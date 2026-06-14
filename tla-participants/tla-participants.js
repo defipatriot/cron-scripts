@@ -364,6 +364,13 @@ async function run() {
         console.log('  ✓ data/participants.json');
         await publishFile('data/heartbeat.json', hbContent, `heartbeat ${status} epoch ${epochInfo.number}`);
         console.log('  ✓ data/heartbeat.json');
+
+        // Daily archive — one snapshot per calendar day (same-day overwrite). The
+        // full electorate's position history feeds Portfolio Tracker + Vote
+        // Intelligence. Was live-only; this starts the time-series accumulation.
+        const dateStr = startedAt.toISOString().slice(0, 10);
+        await publishFile(`data/daily/${dateStr}.json`, partContent, `📸 participants daily snapshot — ${dateStr} (${valid.length})`);
+        console.log(`  ✓ data/daily/${dateStr}.json`);
     }
 
     console.log(`\n✅ Done — status ${status} — ${valid.length} participants captured\n`);
