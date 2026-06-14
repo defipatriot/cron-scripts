@@ -335,6 +335,15 @@ async function run() {
         console.log('  ✓ data/vaults.json');
         await publishFile('data/heartbeat.json', hbContent, `heartbeat ${status} epoch ${epochInfo.number}`);
         console.log('  ✓ data/heartbeat.json');
+
+        // Daily archive — one snapshot per calendar day (same-day overwrite keeps
+        // the most recent capture). This is the time-series the Portfolio Tracker
+        // reads for Votion growth over time. Without it, Votion stays live-only and
+        // no history accumulates — every day skipped is a permanently lost data
+        // point. Mirrors the proven adao-positions daily pattern.
+        const dateStr = startedAt.toISOString().slice(0, 10);
+        await publishFile(`data/daily/${dateStr}.json`, fullContent, `📸 votion daily snapshot — ${dateStr} (${totalHolders} holders, TVL $${Math.round(totalTvlUsd)})`);
+        console.log(`  ✓ data/daily/${dateStr}.json`);
     }
 
     console.log(`\n✅ votion-positions — status ${status}`);
