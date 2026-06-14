@@ -635,40 +635,37 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
         };
         if (marketBlock) pricesObj.market = marketBlock;
 
-        // SMART PRICE SELECTION (Camron's rule):
-        //  - within tolerance → prices AGREE → use hub-ratio (most robust, rarely
-        //    breaks, continuously updated from the staking contract).
-        //  - beyond tolerance → REAL disagreement → market is what users actually
-        //    transact at, so it's the accurate one → use market as final, and
-        //    surface BOTH + the spread so the gap is never hidden.
-        // If no market price exists at all (clean LST not on Astroport), hub is the
-        // only source → use it.
-        let finalPrice = calcPrice;
-        let finalSource = 'calculated-' + (ratioObj.source === 'astroport-trpc' ? 'astroport' : 'eris');
-        let priceSelection = marketBlock ? 'agree-hub' : 'hub-only';
-        if (marketBlock && divergenceFlagged) {
-            finalPrice = marketBlock.price_usd;
-            finalSource = 'astroport-market';
-            priceSelection = 'disagree-market';
-        }
+        // PRICE SELECTION — corrected 2026-06-14 after CoinGecko ground-truth check.
+        // LESSON: hub-ratio (LUNA × eris ratio) is PROVEN ACCURATE — it matches
+        // CoinGecko within ~1.6% for arbLUNA. The single Astroport pool price we
+        // read can be thin/stale/manipulated (it read ~11% LOW for arbLUNA, the
+        // outlier). So:
+        //  - hub-ratio is PRIMARY and stays as final_price_usd (robust + accurate).
+        //  - the single-pool "market" price is a WEAK cross-check: we surface it and
+        //    compute the spread, but we DO NOT flip to it (a thin pool must not
+        //    override the proven hub price).
+        //  - we only FLAG a divergence for human review when the gap is large
+        //    (>10%), as a data-quality signal that the pool may be broken OR the
+        //    asset genuinely depegged — but we still hold hub as final until a
+        //    TRUSTWORTHY source (CoinGecko) confirms otherwise.
+        const REVIEW_FLAG_PCT = 10;
+        const reviewFlagged = marketBlock && Math.abs(divergencePct) > REVIEW_FLAG_PCT;
 
         tokens[symbol] = {
             canonical: symbol,
             prices: pricesObj,
             match_quality: 'calculated',
             astroport_vs_cg_delta_pct: null,
-            market_price_usd: marketBlock ? marketBlock.price_usd : null,
             hub_price_usd: calcPrice,
-            price_divergence_pct: divergencePct,              // hub vs market (+ = hub high)
-            price_divergence_flagged: divergenceFlagged,      // |divergence| > tolerance
-            price_selection: priceSelection,                  // agree-hub | disagree-market | hub-only
-            final_price_usd: finalPrice,
-            final_source: finalSource,
+            pool_market_price_usd: marketBlock ? marketBlock.price_usd : null,  // weak signal
+            price_divergence_pct: divergencePct,              // hub vs single-pool (+ = hub high)
+            price_divergence_flagged: reviewFlagged,          // large gap → review (NOT auto-flip)
+            price_selection: 'hub-ratio-primary',
+            final_price_usd: calcPrice,                       // HUB stays final — proven accurate
+            final_source: 'calculated-' + (ratioObj.source === 'astroport-trpc' ? 'astroport' : 'eris'),
         };
-        if (divergenceFlagged) {
-            console.warn(`  ⚠ ${symbol}: hub $${calcPrice.toFixed(5)} vs market $${marketBlock.price_usd.toFixed(5)} = ${divergencePct.toFixed(1)}% spread → using MARKET (accurate); both surfaced`);
-        } else if (marketBlock) {
-            console.log(`  ✓ ${symbol}: hub & market agree within ${LST_PRICE_DIVERGENCE_FLAG_PCT}% (${divergencePct.toFixed(1)}%) → using hub (robust)`);
+        if (reviewFlagged) {
+            console.warn(`  ⚠ ${symbol}: single-pool price $${marketBlock.price_usd.toFixed(5)} is ${divergencePct.toFixed(1)}% off hub $${calcPrice.toFixed(5)} — pool may be thin/stale. Holding HUB (proven vs CoinGecko). Review pool.`);
         }
         calcCount++;
     }
