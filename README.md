@@ -28,12 +28,16 @@ No backend server. No database. Each cron is independent — a failure in one do
 
 ## Cron inventory
 
-### 🟢 Active production crons (11)
+### 🟢 Active production crons (16)
 
 | Folder | Writes to | Cadence | Purpose |
 |---|---|---|---|
-| `adao-positions/` | `adao-positions-data_2026` | **Weekly `0 1 * * 1` ⚠ should be daily `0 1 * * *`** | Member position snapshots (16 positions × named members) — foundation for Portfolio Tracker. **The code constant expects daily; the Render schedule was never switched. Until it is, no daily P&L history accumulates.** |
+| `adao-positions/` | `adao-positions-data_2026` | Daily `0 1 * * *` | Member position snapshots for **ALL aDAO members** (named + unknown) via the shared capture engine. current.json = full live view (156 members, `is_registered`-tagged); daily/weekly archives = registered-only history. Foundation for Portfolio Tracker. **Schedule switched to daily 2026-06-13 — daily P&L history now accumulating.** |
 | `dao-dashboard/` | `tla-snapshot-data_2026` (`data/dao-dashboard.json` + `data/daily/` archives) | Hourly — **chained into the tla-snapshot job** (`node tla-snapshot.js && node ../dao-dashboard/dao-dashboard.js`) | Successor to the dead "TLA Admin Core v3" epoch cron. DAO-specific live aggregates (treasury, unclaimed/vote/rebase rewards, TLA deposits + per-pool positions, Lion alliance) in a legacy-v3-compatible shape. Feeds index.html's rewards/deposits/Lion tiles + the two deep-dive pages. Self-archives daily for chart history. See its README. |
+| `tla-participants/` | `tla-participants-data_2026` | Daily | **All TLA participants** = veLUNA lock holders (CW721 enumeration) ∪ bribe providers (from bribes-data). Surfaces TLA liquidity providers who never staked an aDAO NFT — the full ~26.8M-VP electorate (~203 participants), invisible to adao-positions. Live-only retention. Shared engine. |
+| `adao-allies/` | `adao-allies-data_2026` | Daily (after aDAO+TLA) | **All ally DAOs in one cron** (Pixel Lions NFT-staked + Lion DAO cw20-staked). Registered-members-only TLA-position capture. Per-ally isolation (one failing can't break others; pause = comment out an `ALLIES` entry). Add a future ally = one array entry. Shared `lib/ally-capture.js` + engine. |
+| `tla-locks/` | `tla-locks-data_2026` | Daily (after aDAO+TLA) | **System-wide veLUNA lock intelligence** — stale-VP gap (~3.5M VP unclaimed system-wide!), unlock cliffs, VP decay projection, per-asset VP totals, auto-max vs decaying split, per-holder rollups. The differentiated capture (exists nowhere else, not even Eris). Live-only + daily summary archive. Shared engine. |
+| `lib/` (shared modules, not a cron) | — | — | `capture-engine.js` (DAO-agnostic per-address TLA position capture, extracted from adao-positions 2026-06-13 — every member cron imports it) + `ally-capture.js` (shared ally discovery/capture). See `lib/README.md`. |
 | `astroport/` | `astroport-pool-data_2026` | Daily | Astroport pool stats (liquidity, APR, volume) |
 | `bribes-history/` | `bribes-data_2026` | Daily | Bribes per epoch — voting incentive history |
 | `marketplace-stats/` | `marketplace-data_2026` | Daily | NFT marketplace activity for Pixel Lions |
@@ -111,7 +115,7 @@ A systemwide audit (triggered by a publicnode pagination quirk silently dropping
 - **F7 — Heartbeat honesty.** `status` must flip to `partial`/`error`/`stuck` on real failure, or the health widget green-lights a quiet failure. `network-and-prices` is the model (per-source `.ok`, fingerprint staleness detector).
 - **F8 — Epoch/time boundary.** Off-by-one epoch, UTC flip, missed end-of-epoch window → irreversible wrong-epoch capture. (`epochIndex` 0-based internal; `currentEpoch = epochIndex + 1` canonical.)
 
-## Project status & roadmap (2026-06-12)
+## Project status & roadmap (2026-06-13)
 
 ### Recently shipped (this multi-day arc)
 - **NFT Explorer v6.0** — chain-of-truth migration, full Analytics tab, deep-linking. (`explorer-log.md`)
@@ -124,24 +128,32 @@ Goals: **Portfolio Tracker** (member position time-series + P&L), **LP Performan
 
 **Phase status:**
 - Phase 1 (chain-query discovery) — ✅ done (all Eris ve3 contracts mapped).
-- Phase 2 (pipeline-in-scripts) — ✅ effectively done (tla-snapshot, network-and-prices, nft-inventory v2, dao-dashboard all prove the layered pattern).
-- Phase 3 (forward accumulation) — ⏳ partially running; **gap: adao-positions still weekly** (see ⚠ above).
-- Phase 4 (the four pillars on tla-stats.html) — 🔲 not started.
+- Phase 2 (pipeline-in-scripts) — ✅ done.
+- Phase 3 (forward accumulation) — ✅ **running.** adao-positions switched to daily 2026-06-13; the full member-expansion + lock-capture layer built and live (see below). Every capture cron the pillars need now exists and is accumulating.
+- Phase 4 (the four pillars on tla-stats.html) — 🔲 not started. **All raw data feeds now exist** — this is the next major work.
 
-### Planned member-expansion crons (designed, NOT built — discovery complete)
-Decided architecture: **separate cron per source, each its own repo + heartbeat + schedule**, so allies can never break aDAO capture and can be paused independently. All share a (to-be-extracted) `lib/capture-engine.js` (the per-address position logic currently inside `adao-positions.js`). Membership is always LIVE — no hardcoded member CSVs.
+### Member-expansion + lock-capture layer — ✅ BUILT & LIVE (2026-06-13)
+Architecture as decided: **shared `lib/capture-engine.js`** (DAO-agnostic per-address TLA position capture, extracted verbatim from `adao-positions.js`) imported by every member cron. Each cron keeps only its own discovery + output. Membership is always LIVE (DAODAO topStakers / lock enumeration / bribes read) — no hardcoded member lists.
 
-| Planned cron | Tracks | Discovery (all live) |
-|---|---|---|
-| `adao-positions` (exists) | aDAO registered + (add) unknown members | DAODAO `topStakers` + PFPK name resolve. Currently filters to named only; widening to include unknowns is a one-line change. |
-| `tla-participants` (new) | All TLA-lock holders + all bribe providers | Lock holders via CW721 enumeration (confirmed works, below); bribe providers from `bribes-data_2026` (a read). |
-| `pixellions-positions` (new) | Pixel Lions registered members | DAO core `terra1c690mdrwdetnr09zfk3tf9xz9jhrgd9wpjyf3tuccj74ql09eqmq6sh7en` → voting module via indexer `dumpState` → `topStakers` + PFPK filter (`name != null`). |
-| `liondao-positions` (new) | Lion DAO registered members | DAO core `terra1tkersa2mqwy2h8exj799qx2xrhdu0dkymk9psp6v0k4kz4tkxucssgluec` → same pattern. |
+| Cron | Status | Tracks | Discovery |
+|---|---|---|---|
+| `adao-positions` | ✅ widened | ALL aDAO members (named + unknown) | DAODAO topStakers + PFPK. current.json = all 156; archives = registered-only. Surfaced ~510K VP (21%) previously invisible. |
+| `tla-participants` | ✅ built | Lock holders ∪ bribe providers | CW721 enumeration (431 locks → 202 holders) + bribes-data read (today: just PD). ~203 participants, 26.8M VP — the full electorate. |
+| `adao-allies` | ✅ built | Pixel Lions + Lion DAO (registered only) | core → votingModule → type-appropriate topStakers. **Bundled — one cron, both allies, per-ally isolation.** |
+| `tla-locks` | ✅ built | System + per-holder lock intelligence | Enumerate all 431 + total_vamp. Stale-VP gap 3.49M VP, unlock cliffs, decay, per-asset VP. |
 
-**Name registry mechanism (how "registered names" stays live):** DAODAO names live in **PFPK** at `pfpk.daodao.zone/bech32/{hexAddress}` — per-address GET, returns `{name}` (non-null = registered). `adao-positions` already uses this every run; the ally crons reuse it. No memo-scanning, no snapshot — registrations/removals reflect on the next run.
+**Engine v1.1 enrichments (all additive, live):** `first_participation` (chain-native tenure via gauge `user_first_participation` — NOT forward-accumulated, it's a direct read); lock `end_period`/`is_auto_max_locked`/`weeks_to_unlock`; `inactive_take_exposure_usd` (inactive LP × 10%); VP spread (`current_vp_human`/`potential_vp_human`/`vp_gap_human`).
 
-### Planned `tla-locks` cron (designed, NOT built — full schema mapped)
-**This is the highest-value new capture** — the stale-VP-gap and unlock-cliff metrics don't exist anywhere else in the ecosystem. Its own cron (big enough to stand alone). Forward-tracking, so clock-start has urgency.
+**⚠️ GOTCHAS LEARNED 2026-06-13 (cost real time — preserve):**
+1. **`GITHUB_REPO` env var MUST include the `defipatriot/` owner prefix.** Setting just `tla-locks-data_2026` → 404 on publish (capture succeeds, publish fails). Bit us 3×. Every working cron uses full `owner/repo`.
+2. **DAODAO voting-module formula depends on the contract TYPE** (from `{info:{}}`): `dao-voting-cw721-staked`→`daoVotingCw721Staked`, `dao-voting-cw20-staked`→`daoVotingCw20Staked`, `dao-voting-token-staked`→`daoVotingTokenStaked`. **Lion DAO is cw20-staked** (ROAR is a cw20), NOT token-staked — wrong formula returns 0 stakers (empty, not an error). Confirm type via the voting module's `info` query.
+3. **Lock-asset symbols must resolve correctly for stale-VP math.** The LST-ratio lookup keys off symbol; raw contract-address "symbols" default ratio→1 and silently UNDERCOUNT the gap (saw 269K with raw keys → 3.49M with correct symbols). Hardcoded map in tla-locks. Lock assets: `native:uluna`=LUNA, `cw20:terra1ecgaz…`=ampLUNA, `cw20:terra17aj4ty…`=bLUNA, `cw20:terra1se7rvue…`=arbLUNA (ERIS Arbitrage LUNA, 15M VP — biggest), `native:ibc/08095CED…`=stLUNA.
+4. **GitHub web-UI partial commits**: double-underscore filenames upload as NEW files instead of replacing; edit existing file in place (pencil→select-all→paste) and verify via codeload tarball (raw.githubusercontent.com CDN lags ~5min → false "not committed" alarms).
+
+**Name registry (live):** DAODAO names via **PFPK** `pfpk.daodao.zone/bech32/{hexAddress}` → `{name}` (non-null = registered). Every member cron reuses it — registrations reflect next run.
+
+### `tla-locks` cron — ✅ BUILT & LIVE (2026-06-13)
+**The highest-value capture** — stale-VP-gap and unlock-cliff metrics exist nowhere else (not even Eris). First live run (epoch 189): system VP 26.86M (fixed 2.88M + decaying 23.98M), **stale-VP gap 3.49M (≈13% of all VP unclaimed)**, 277 auto-max locks holding 94% of VP vs 154 decaying, no unlock cliff for 6mo (95% of decaying VP 26w+ out), per-asset: arbLUNA 15.1M / ampLUNA 7.78M / bLUNA 757K / LUNA 287K / stLUNA 22.9K. Cross-check passes (per-lock VP sum = decaying total). Schema reference retained below.
 
 Lock contract (veLUNA / "Vote Escrowed LUNA"): **`terra1uqhj8agyeaz8fu6mdggfuwr3lp32jlrx5hqag4jxexde92rzkamq3l62zg`**. CW721-enumerable (confirmed: `num_tokens`→431, `all_tokens` works). Per-lock `lock_info` returns: `owner`, `asset.info` (LST type), `asset.amount`, `underlying_amount` (with the **ratio frozen at lock time**), `coefficient` (VP multiplier tier 1–10ish), `start`/`end` periods, `slope` (exact VP decay/week), `voting_power`, `fixed_amount`.
 
