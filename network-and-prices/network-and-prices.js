@@ -134,6 +134,25 @@ const CALCULATED_TOKENS = {
     // xASTRO: skip calculated derivation; Astroport provides ratio + xASTRO USD directly.
 };
 
+// Astroport MARKET addresses for the calculated LSTs that actually trade on a
+// market (phoenix-1). The hub ratio is the THEORETICAL backing; for clean staking
+// derivatives (ampLUNA/bLUNA) market ≈ hub, but for STRATEGY tokens (arbLUNA =
+// arbitrage; amp* = compounding strategies) the market can trade meaningfully
+// BELOW the theoretical ratio. We look up the market price, compute divergence,
+// and surface BOTH so a price gap is visible (and we can flag it) instead of
+// silently overvaluing. Discovered 2026-06-14: arbLUNA hub-ratio price ran ~14%
+// above market (vs Votion's own UI). See NOTE-arbLUNA-pricing-gap.md.
+const CALCULATED_LST_MARKET_ADDR = {
+    arbLUNA: { 'phoenix-1': 'terra1se7rvuerys4kd2snt6vqswh9wugu49vhyzls8ymc02wl37g2p2ms5yz490' },
+    ampLUNA: { 'phoenix-1': 'terra1ecgazyd0waaj3g7l9cmy5gulhxkps2gmxu9ghducvuypjq68mq2s5lvsct' },
+    bLUNA:   { 'phoenix-1': 'terra17aj4ty4sz4yhgm08na8drc0v03v2jwr3waxcqrwhajj729zhl7zqnpc0ml' },
+    // ampCAPA / ampROAR market addresses TBD — add if Astroport lists them, so the
+    // divergence check can confirm whether they share arbLUNA's gap.
+};
+// Divergence threshold: if market is more than this % from the hub-ratio price,
+// flag it. arbLUNA's gap was ~14%, so 5% is a sensible alarm line.
+const LST_PRICE_DIVERGENCE_FLAG_PCT = 5;
+
 // Match quality thresholds (delta-pct between Astroport and CoinGecko)
 const MATCH_DIRECT_THRESHOLD_PCT  = 5;    // within ±5% → direct_match
 const MATCH_MINOR_THRESHOLD_PCT   = 25;   // within ±25% → minor_disagreement
@@ -582,25 +601,54 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
 
         const calcPrice = basePrice * ratioObj.ratio;
 
-        // Check if Astroport ALSO has a price for this LST (rare but possible)
-        // We treat the calculation as authoritative since chain ratios change second-to-second.
+        // Strategy-LST divergence check: does Astroport also price this LST on the
+        // open market? If so, the market price is what users actually transact at.
+        // For clean LSTs (ampLUNA/bLUNA) market≈hub; for strategy LSTs (arbLUNA,
+        // amp*) it can run well below. We surface BOTH + a divergence flag rather
+        // than silently overvaluing. (Non-breaking: `final_price_usd` stays the
+        // calculated price for now — flip per-LST only after the divergence data
+        // confirms the gap on a real run. See NOTE-arbLUNA-pricing-gap.md.)
+        let marketBlock = null, divergencePct = null, divergenceFlagged = false;
+        const mAddrByChain = CALCULATED_LST_MARKET_ADDR[symbol];
+        if (mAddrByChain) {
+            for (const [chain, addr] of Object.entries(mAddrByChain)) {
+                const mpRes = getAstroportPrice(astroData, chain, addr);   // returns {price_usd,...} or null
+                const mp = mpRes && mpRes.price_usd;
+                if (mp && mp > 0) {
+                    marketBlock = { price_usd: mp, chain, address: addr, source: 'astroport-market' };
+                    divergencePct = ((calcPrice - mp) / mp) * 100;   // + = our calc is HIGH vs market
+                    divergenceFlagged = Math.abs(divergencePct) > LST_PRICE_DIVERGENCE_FLAG_PCT;
+                    break;
+                }
+            }
+        }
+
+        const pricesObj = {
+            calculated: {
+                price_usd: calcPrice,
+                formula: `${config.base} × ${ratioObj.ratio.toFixed(6)}`,
+                base_token: config.base,
+                base_price: basePrice,
+                ratio: ratioObj.ratio,
+                ratio_source: ratioObj.source,
+            },
+        };
+        if (marketBlock) pricesObj.market = marketBlock;
+
         tokens[symbol] = {
             canonical: symbol,
-            prices: {
-                calculated: {
-                    price_usd: calcPrice,
-                    formula: `${config.base} × ${ratioObj.ratio.toFixed(6)}`,
-                    base_token: config.base,
-                    base_price: basePrice,
-                    ratio: ratioObj.ratio,
-                    ratio_source: ratioObj.source,
-                },
-            },
+            prices: pricesObj,
             match_quality: 'calculated',
             astroport_vs_cg_delta_pct: null,
+            market_price_usd: marketBlock ? marketBlock.price_usd : null,
+            price_divergence_pct: divergencePct,              // calc vs market (+ = calc high)
+            price_divergence_flagged: divergenceFlagged,      // |divergence| > threshold
             final_price_usd: calcPrice,
             final_source: 'calculated-' + (ratioObj.source === 'astroport-trpc' ? 'astroport' : 'eris'),
         };
+        if (divergenceFlagged) {
+            console.warn(`  ⚠ ${symbol}: hub-ratio price $${calcPrice.toFixed(5)} diverges ${divergencePct.toFixed(1)}% from market $${marketBlock.price_usd.toFixed(5)} — final still using calc, review for flip`);
+        }
         calcCount++;
     }
 
