@@ -202,6 +202,13 @@ async function run() {
         console.log('  ✓ data/participants.json');
         await publishFile('data/heartbeat.json', hbContent, `heartbeat ${overall}`);
         console.log('  ✓ data/heartbeat.json');
+
+        // Daily archive — one snapshot per calendar day (same-day overwrite). Ally
+        // members feed the Portfolio Tracker (Layer 2 of the mission), so their
+        // position history must accumulate. Was live-only; this starts the clock.
+        const dateStr = startedAt.toISOString().slice(0, 10);
+        await publishFile(`data/daily/${dateStr}.json`, combinedContent, `📸 allies daily snapshot — ${dateStr} (${overall})`);
+        console.log(`  ✓ data/daily/${dateStr}.json`);
     }
 
     console.log(`\n✅ aDAO Allies — overall ${overall}`);
