@@ -1,1 +1,68 @@
-Place
+# votion-positions
+
+Captures every **Votion vault** user's position. Votion is a liquid-lock wrapper
+around veLUNA: deposit an LST, receive a factory v-token share, the vault pools
+everything into ONE veLUNA lock it owns and auto-compounds + auto-votes. Offered
+as a **{LST} × {duration}** matrix — each cell its own contract (`code_id 3677`,
+label `votion-la`).
+
+**Why it matters:** Votion users are invisible to every other cron (their LST is
+locked inside a vault's single NFT). This cron makes them visible AND
+re-attributes the big "anonymous whale" lock-holders that `tla-participants`
+flagged — those whales ARE the Votion MAX vaults; this cron maps that VP to the
+real underlying users.
+
+## Vault matrix (v1 seed; cron self-discovers via code_id 3677)
+| | MAX | 3 Months | 1 Week |
+|---|---|---|---|
+| arbLUNA | `terra13aae4f…pqmye9` | `terra163jnveu…d9zj9l` | `terra16xzky47…uxkjuj` |
+| ampLUNA | `terra1v7aw9e…3mffyz` | `terra1dr7mv4w…hnzm5p` | `terra1mzelg87…s0sux0` |
+
+Cron reads each vault's REAL config on-chain (LST, vdenom, lock_id, fee), so the
+labels above are cosmetic and a new vault (bLUNA row, new duration) is picked up
+automatically via the code_id listing.
+
+## How it works
+1. **Discover vaults** — LCD `code/3677/contracts` (self-maintaining; seed
+   fallback). Read each `config`: `lock_info.cw20` (LST), `vdenom`, `lock_id`,
+   `protocol_fee` (0.1 = Votion's 10% cut).
+2. **Vault state** — `staked` (total LST) ÷ vdenom supply = **exchange rate**
+   (LST per vtoken; validated against a real deposit: bond_amount/bond_share).
+   Vault's lock VP via escrow `lock_info{lock_id}`.
+3. **Discover holders** — factory denoms have no `all_accounts`, so reconstruct
+   from deposits: `tx_search` each vault for `wasm.action='votion-la/deposit'` →
+   every historical `recipient`. (F1 DESC paging, F2 null≠[].)
+4. **Value each holder** — current vdenom **bank balance** × exchange rate =
+   underlying LST → USD (live LST ratio × LUNA price); share of supply × vault
+   lock VP = implied VP. Holders who fully exited (0 current balance) are dropped.
+5. PFPK names; publish.
+
+## Output (repo: `votion-positions-data_2026`)
+- `data/current.json` — per-vault system view + holders (vtoken, underlying LST,
+  USD, share %, implied VP, name)
+- `data/vaults.json` — light: vault list + exchange rates + lock VP + TVL
+- `data/heartbeat.json`
+
+## Scope
+v1 = live holdings + per-vault system view, FULL userbase (all vdenom holders).
+**v1.1 (future)** = full deposit-history backfill (every deposit, not just current
+holders — already half-built since discovery walks deposit events).
+**v1.2 (future)** = realized compounding yield from the daily `Compound` txs
+(observed APR per vault vs Votion's quoted number — the trust-layer metric).
+
+## Status semantics (F7)
+`partial` if any vault's holder discovery was incomplete (paging cap / null page)
+or a vdenom was missing; `error` if zero vaults resolved.
+
+## Env
+`GITHUB_TOKEN`, `GITHUB_REPO` (default `defipatriot/votion-positions-data_2026`
+— **needs the `defipatriot/` prefix**), `GITHUB_BRANCH`.
+
+## Render
+Root `votion-positions`, build `npm install`, start `node votion-positions.js`,
+daily after aDAO+TLA. LCD-heavy (tx_search per vault + bank balance per holder),
+concurrency 5.
+
+### Recent changes
+- **2026-06-14 — v1.0.** Initial build. Vault discovery + holder reconstruction
+  from deposit events + live valuation via vdenom bank balances. Shared engine.

@@ -1,0 +1,8 @@
+{
+  "name": "votion-positions",
+  "version": "1.0.0",
+  "description": "Votion vault holdings & yield capture",
+  "main": "votion-positions.js",
+  "scripts": { "start": "node votion-positions.js" },
+  "license": "MIT"
+}
