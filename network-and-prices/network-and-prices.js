@@ -151,7 +151,7 @@ const CALCULATED_LST_MARKET_ADDR = {
 };
 // Divergence threshold: if market is more than this % from the hub-ratio price,
 // flag it. arbLUNA's gap was ~14%, so 5% is a sensible alarm line.
-const LST_PRICE_DIVERGENCE_FLAG_PCT = 5;
+const LST_PRICE_DIVERGENCE_FLAG_PCT = 2;   // within 2% = agreement (use robust hub); beyond = real gap (use market, show both)
 
 // Match quality thresholds (delta-pct between Astroport and CoinGecko)
 const MATCH_DIRECT_THRESHOLD_PCT  = 5;    // within ±5% → direct_match
@@ -635,19 +635,40 @@ function assemblePriceTable({ astroData, cgData, lstRatios }) {
         };
         if (marketBlock) pricesObj.market = marketBlock;
 
+        // SMART PRICE SELECTION (Camron's rule):
+        //  - within tolerance → prices AGREE → use hub-ratio (most robust, rarely
+        //    breaks, continuously updated from the staking contract).
+        //  - beyond tolerance → REAL disagreement → market is what users actually
+        //    transact at, so it's the accurate one → use market as final, and
+        //    surface BOTH + the spread so the gap is never hidden.
+        // If no market price exists at all (clean LST not on Astroport), hub is the
+        // only source → use it.
+        let finalPrice = calcPrice;
+        let finalSource = 'calculated-' + (ratioObj.source === 'astroport-trpc' ? 'astroport' : 'eris');
+        let priceSelection = marketBlock ? 'agree-hub' : 'hub-only';
+        if (marketBlock && divergenceFlagged) {
+            finalPrice = marketBlock.price_usd;
+            finalSource = 'astroport-market';
+            priceSelection = 'disagree-market';
+        }
+
         tokens[symbol] = {
             canonical: symbol,
             prices: pricesObj,
             match_quality: 'calculated',
             astroport_vs_cg_delta_pct: null,
             market_price_usd: marketBlock ? marketBlock.price_usd : null,
-            price_divergence_pct: divergencePct,              // calc vs market (+ = calc high)
-            price_divergence_flagged: divergenceFlagged,      // |divergence| > threshold
-            final_price_usd: calcPrice,
-            final_source: 'calculated-' + (ratioObj.source === 'astroport-trpc' ? 'astroport' : 'eris'),
+            hub_price_usd: calcPrice,
+            price_divergence_pct: divergencePct,              // hub vs market (+ = hub high)
+            price_divergence_flagged: divergenceFlagged,      // |divergence| > tolerance
+            price_selection: priceSelection,                  // agree-hub | disagree-market | hub-only
+            final_price_usd: finalPrice,
+            final_source: finalSource,
         };
         if (divergenceFlagged) {
-            console.warn(`  ⚠ ${symbol}: hub-ratio price $${calcPrice.toFixed(5)} diverges ${divergencePct.toFixed(1)}% from market $${marketBlock.price_usd.toFixed(5)} — final still using calc, review for flip`);
+            console.warn(`  ⚠ ${symbol}: hub $${calcPrice.toFixed(5)} vs market $${marketBlock.price_usd.toFixed(5)} = ${divergencePct.toFixed(1)}% spread → using MARKET (accurate); both surfaced`);
+        } else if (marketBlock) {
+            console.log(`  ✓ ${symbol}: hub & market agree within ${LST_PRICE_DIVERGENCE_FLAG_PCT}% (${divergencePct.toFixed(1)}%) → using hub (robust)`);
         }
         calcCount++;
     }
