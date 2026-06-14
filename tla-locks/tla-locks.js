@@ -56,6 +56,17 @@ const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
 const ALL_TOKENS_PAGE = 100;
 const EPOCH_START_MS = Date.parse('2022-10-31T00:00:00Z');
+
+// Lockable-asset symbol map (fixed, small set — confirmed via token_info 2026-06-13).
+// More robust than matching the lock config against the price list. Keyed by the
+// assetKey() form: 'cw20:<addr>' or 'native:<denom>'.
+const LOCK_ASSET_SYMBOLS = {
+    'native:uluna': 'LUNA',
+    'cw20:terra1ecgazyd0waaj3g7l9cmy5gulhxkps2gmxu9ghducvuypjq68mq2s5lvsct': 'ampLUNA',
+    'cw20:terra17aj4ty4sz4yhgm08na8drc0v03v2jwr3waxcqrwhajj729zhl7zqnpc0ml': 'bLUNA',
+    'cw20:terra1se7rvuerys4kd2snt6vqswh9wugu49vhyzls8ymc02wl37g2p2ms5yz490': 'arbLUNA',
+    'native:ibc/08095CEDEA29977C9DD0CE9A48329FDA622C183359D5F90CF04CC4FF80CBE431': 'stLUNA',
+};
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 
 function epochToDate(period) {
@@ -104,7 +115,7 @@ function assetKey(info) {
 // Map a lock asset to {symbol, current_ratio} using ctx.lstRatios + a denom map.
 function resolveAssetMeta(info, ctx, denomToSymbol) {
     const key = assetKey(info);
-    const symbol = denomToSymbol[key] || (info?.native === 'uluna' ? 'LUNA' : key);
+    const symbol = LOCK_ASSET_SYMBOLS[key] || denomToSymbol[key] || (info?.native === 'uluna' ? 'LUNA' : key);
     // LUNA is the base (ratio 1). LSTs carry a ratio from network-and-prices.
     let ratio = 1;
     if (symbol !== 'LUNA') {
