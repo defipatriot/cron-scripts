@@ -1,0 +1,8 @@
+{
+  "name": "system-health",
+  "version": "1.0.0",
+  "description": "Reads all cron heartbeats, evaluates freshness/status, writes system-health.json",
+  "main": "system-health.js",
+  "scripts": { "start": "node system-health.js" },
+  "license": "MIT"
+}
