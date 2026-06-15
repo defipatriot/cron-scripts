@@ -286,6 +286,21 @@ async function captureSnapshot() {
     const indexMsg     = `📸 Update snapshot index (${dateStr})`;
     await pushToGithub(indexPath, indexContent, indexMsg);
 
+    // ── 5. Heartbeat — so System Health can monitor this cron ────────────────
+    const heartbeat = {
+        schemaVersion: 1,
+        cron: 'ampcapa',
+        capturedAt: new Date().toISOString(),
+        capturedAtUnix: Date.now(),
+        status: 'ok',
+        next_expected_run_at: new Date(Date.now() + 25 * 60 * 60 * 1000).toISOString(),
+        stats: {
+            latest_daily: index.latest_daily || dateStr,
+        },
+    };
+    await pushToGithub('snapshots/heartbeat.json', JSON.stringify(heartbeat, null, 2), `heartbeat ok (${dateStr})`);
+    console.log('   ✅ Pushed: snapshots/heartbeat.json');
+
     console.log(`\n✅ Snapshot complete!\n`);
 }
 
