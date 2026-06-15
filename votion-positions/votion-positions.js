@@ -48,6 +48,7 @@ const {
     TERRA_LCD_FALLBACK,
     TLA_VOTING_ESCROW,
 } = require('../lib/capture-engine.js');
+const { ErrorLog } = require('../lib/error-reporter.js');
 
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/votion-positions-data_2026';
@@ -200,6 +201,7 @@ async function discoverHolders(vault) {
 // -----------------------------------------------------------------------------
 async function run() {
     const startedAt = new Date();
+    const errors = new ErrorLog();   // safe, sanitized error capture for System Health
     const epochInfo = currentEpochInfo();
     console.log(`\n🗳  votion-positions — epoch ${epochInfo.number} — ${startedAt.toISOString()}\n`);
 
@@ -209,7 +211,12 @@ async function run() {
     const vaults = await discoverVaults();
     console.log(`📊 Loading state for ${vaults.length} vaults...`);
     for (const v of vaults) {
-        v.state = await loadVaultState(v, ctx);
+        try {
+            v.state = await loadVaultState(v, ctx);
+        } catch (e) {
+            errors.add(`loading vault state for ${v.label || v.address.slice(0,10)}`, e);
+            v.state = {};
+        }
         const ex = v.state.exchange_rate;
         console.log(`  ${v.label || v.address.slice(0,12)}: staked ${v.state.staked_lst_human?.toFixed(2)} ${v.lst_symbol} | rate ${ex?.toFixed(4)} | lock VP ${v.state.lock_vp_human?.toLocaleString()}`);
     }
@@ -218,7 +225,7 @@ async function run() {
     const vaultBlocks = [];
     let anyIncomplete = false;
     for (const v of vaults) {
-        if (!v.vdenom) { console.warn(`  ⚠ ${v.label}: no vdenom in config, skipping holders`); vaultBlocks.push({ ...vaultLight(v), holders: [], holder_discovery_complete: false }); anyIncomplete = true; continue; }
+        if (!v.vdenom) { console.warn(`  ⚠ ${v.label}: no vdenom in config, skipping holders`); errors.add(`vault ${v.label || v.address.slice(0,10)} has no vdenom`, 'config missing vdenom — cannot enumerate holders'); vaultBlocks.push({ ...vaultLight(v), holders: [], holder_discovery_complete: false }); anyIncomplete = true; continue; }
         console.log(`👥 ${v.label}: discovering holders...`);
         const { addresses, complete } = await discoverHolders(v);
         if (!complete) anyIncomplete = true;
@@ -316,7 +323,9 @@ async function run() {
             unique_holders: totalHolders,
             total_tvl_usd: totalTvlUsd,
             any_discovery_incomplete: anyIncomplete,
+            error_count: errors.count(),
         },
+        recent_errors: errors.list(),   // sanitized — safe to surface on System Health
     };
 
     const fullContent = JSON.stringify(fullDoc, null, 2);
@@ -329,21 +338,24 @@ async function run() {
         fs.writeFileSync('vaults.json', lightContent);
         fs.writeFileSync('heartbeat.json', hbContent);
     } else {
-        await publishFile('data/current.json', fullContent, `votion epoch ${epochInfo.number} (${totalHolders} holders)`);
-        console.log('  ✓ data/current.json');
-        await publishFile('data/vaults.json', lightContent, `votion vaults epoch ${epochInfo.number}`);
-        console.log('  ✓ data/vaults.json');
-        await publishFile('data/heartbeat.json', hbContent, `heartbeat ${status} epoch ${epochInfo.number}`);
-        console.log('  ✓ data/heartbeat.json');
-
-        // Daily archive — one snapshot per calendar day (same-day overwrite keeps
-        // the most recent capture). This is the time-series the Portfolio Tracker
-        // reads for Votion growth over time. Without it, Votion stays live-only and
-        // no history accumulates — every day skipped is a permanently lost data
-        // point. Mirrors the proven adao-positions daily pattern.
-        const dateStr = startedAt.toISOString().slice(0, 10);
-        await publishFile(`data/daily/${dateStr}.json`, fullContent, `📸 votion daily snapshot — ${dateStr} (${totalHolders} holders, TVL $${Math.round(totalTvlUsd)})`);
-        console.log(`  ✓ data/daily/${dateStr}.json`);
+        try {
+            await publishFile('data/current.json', fullContent, `votion epoch ${epochInfo.number} (${totalHolders} holders)`);
+            console.log('  ✓ data/current.json');
+            await publishFile('data/vaults.json', lightContent, `votion vaults epoch ${epochInfo.number}`);
+            console.log('  ✓ data/vaults.json');
+        } catch (e) {
+            errors.add('publishing votion data files', e);
+        }
+        // rebuild heartbeat so any publish error is captured in it, then publish hb last
+        heartbeat.stats.error_count = errors.count();
+        heartbeat.recent_errors = errors.list();
+        if (errors.hasErrors() && heartbeat.status === 'ok') heartbeat.status = 'partial';
+        try {
+            await publishFile('data/heartbeat.json', JSON.stringify(heartbeat, null, 2), `heartbeat ${heartbeat.status} epoch ${epochInfo.number}`);
+            console.log('  ✓ data/heartbeat.json');
+        } catch (e) {
+            console.error('  ✗ heartbeat publish failed:', e.message);
+        }
     }
 
     console.log(`\n✅ votion-positions — status ${status}`);
