@@ -225,6 +225,21 @@ async function captureSnapshot() {
     await pushToGithub(indexPath, JSON.stringify(index, null, 2),
         `🌕 Update backing index (${dateStr})`);
 
+    // ── 5b. Heartbeat — so System Health can monitor this cron ──────────────
+    const heartbeat = {
+        schemaVersion: 1,
+        cron: 'backing',
+        capturedAt: new Date().toISOString(),
+        capturedAtUnix: Date.now(),
+        status: 'ok',
+        next_expected_run_at: new Date(Date.now() + 25 * 60 * 60 * 1000).toISOString(),
+        stats: {
+            backing_luna_per_nft: Number(backingInLuna.toFixed(6)),
+            latest_date: dateStr,
+        },
+    };
+    await pushToGithub('snapshots/heartbeat.json', JSON.stringify(heartbeat, null, 2), `heartbeat ok (${dateStr})`);
+
     // ── 6. Log daily gain vs yesterday ─────────────────────────────────────
     if (index.history.length >= 2) {
         const prev = index.history[index.history.length - 2];
