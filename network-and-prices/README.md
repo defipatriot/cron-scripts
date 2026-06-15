@@ -6,6 +6,38 @@ Daily snapshot of Terra network state, LST exchange rates, and token USD prices 
 
 ---
 
+## ⚠️ Pricing Doctrine (current — updated 2026-06-14)
+
+**This supersedes the older "pick CoinGecko on mismatch" logic described below.**
+Full rationale in `website-adao-core/PRICING-DOCTRINE.md`.
+
+The rule: **match the price source to the asset's liquidity.**
+
+- **Tier 1 — big, liquid assets** (LUNA, wBTC, USDC, ATOM): CoinGecko is reliable
+  (many CEX feeds) → use it directly.
+- **Tier 2 — small / derivative tokens** (arbLUNA, ampLUNA, bLUNA, ampCAPA,
+  ampROAR, xASTRO): do NOT trust a direct CoinGecko or single-pool price (CoinGecko
+  isn't motivated to keep small-caps fresh; a thin Astroport pool can be stale/
+  manipulated). Instead **DERIVE**: `final = CoinGecko base price × on-chain Eris
+  ratio`. Both inputs are rock-solid (a big-liquid price CG nails + a chain-truth
+  ratio). This is the `final_price_usd` / `calculated-eris` path.
+
+**Cross-check, never override:** the single-pool "market" price is still read and
+recorded (`pool_market_price_usd`, `price_divergence_pct`, `price_divergence_flagged`)
+as a DATA-QUALITY signal. If it diverges >10% from the derived price, it FLAGS the
+pool as suspect — it does NOT change our price. (Proven: the arbLUNA pool read ~14%
+low and the bLUNA pool ~76% low; the hub-derived price matched CoinGecko within
+1.6% and was correct.)
+
+**Output fields per Tier-2 token:** `hub_price_usd`, `pool_market_price_usd`,
+`price_divergence_pct`, `price_divergence_flagged`, `price_selection`
+(`hub-ratio-primary`), `final_price_usd`, `final_source`.
+
+**The lesson:** "market" is not automatically right — a thin pool can be the broken
+one. Validate against an independent aggregator before ever flipping a price.
+
+---
+
 ## Why this cron exists
 
 The dashboard reads this cron's output instead of hitting CoinGecko and Astroport directly. Three reasons:
