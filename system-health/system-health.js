@@ -49,6 +49,38 @@ const MONITORED = [
     { key: 'skeletonswap',       repo: 'ss-pool-data_2026',            path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'aux', stale_expected: true, stale_reason: 'Upstream SkeletonSwap API frozen ~30d — data labeled unverified by design.' },
 ];
 
+// External endpoints the platform depends on. We ping each and report up/down +
+// latency, so "is our data trustworthy" extends down to "are the chain endpoints
+// we rely on even alive right now." A cron failing is often downstream of one of
+// these being down.
+const ENDPOINTS = [
+    { key: 'terra-lcd (primary)', url: 'https://terra-lcd.publicnode.com/cosmos/base/tendermint/v1beta1/blocks/latest', role: 'Terra LCD — chain queries (primary)' },
+    { key: 'terra-rest (fallback)', url: 'https://terra-rest.publicnode.com/cosmos/base/tendermint/v1beta1/blocks/latest', role: 'Terra LCD — chain queries (fallback)' },
+    { key: 'daodao indexer', url: 'https://indexer.daodao.zone', role: 'DAODAO indexer — staker resolution' },
+    { key: 'pfpk', url: 'https://pfpk.daodao.zone', role: 'PFPK — wallet name resolution' },
+    { key: 'coingecko', url: 'https://api.coingecko.com/api/v3/ping', role: 'CoinGecko — base asset prices' },
+    { key: 'eris backend', url: 'https://backend.erisprotocol.com', role: 'Eris Protocol — LST/pool data' },
+    { key: 'warlock (BBL)', url: 'https://warlock.backbonelabs.io', role: 'BackBone Labs — marketplace listings' },
+];
+
+function pingEndpoint(ep) {
+    return new Promise((resolve) => {
+        const start = Date.now();
+        const req = https.get(ep.url, { timeout: 8000 }, res => {
+            res.on('data', () => {});
+            res.on('end', () => {
+                const ms = Date.now() - start;
+                const up = res.statusCode < 500;
+                resolve({ key: ep.key, role: ep.role, up, status: res.statusCode, latency_ms: ms,
+                    health: up ? (ms > 4000 ? 'warn' : 'ok') : 'down',
+                    reason: up ? (ms > 4000 ? `Responding slowly (${ms}ms).` : `Up (${ms}ms, HTTP ${res.statusCode}).`) : `Returned server error ${res.statusCode}.` });
+            });
+        });
+        req.on('error', () => resolve({ key: ep.key, role: ep.role, up: false, status: null, latency_ms: null, health: 'down', reason: 'No response — endpoint unreachable.' }));
+        req.on('timeout', () => { req.destroy(); resolve({ key: ep.key, role: ep.role, up: false, status: null, latency_ms: null, health: 'down', reason: 'Timed out after 8s.' }); });
+    });
+}
+
 // Grace multiplier: a cron is "late" only after cadence × this (tolerates jitter).
 const LATE_GRACE = 1.5;
 // "stale/down" after cadence × this.
@@ -185,6 +217,12 @@ async function run() {
     const coreOk = coreSet.filter(r => r.health === 'ok').length;
     const confidence = coreSet.length ? Math.round((coreOk / coreSet.length) * 100) : 0;
 
+    // ping external endpoints
+    console.log('\n🔌 checking endpoints...');
+    const endpoints = await Promise.all(ENDPOINTS.map(pingEndpoint));
+    for (const e of endpoints) console.log(`  ${e.health==='ok'?'✓':e.health==='warn'?'⚠':'✗'} ${e.key.padEnd(22)} ${e.reason}`);
+    const epDown = endpoints.filter(e => e.health === 'down');
+
     const doc = {
         schemaVersion: 1,
         capturedAt: started.toISOString(),
@@ -195,11 +233,11 @@ async function run() {
         attention: results.filter(r => r.health !== 'ok').map(r => ({ key: r.key, health: r.health, status: r.status, reason: r.reason, recent_errors: r.recent_errors || [] })),
         systems: results.map(r => ({
             ...r,
-            // GitHub links (public) — data repo + cron source folder. No Render link
-            // (private/account-specific). cron source path assumes cron-scripts layout.
             data_repo_url: `https://github.com/defipatriot/${r.repo}`,
             cron_source_url: cronSourceUrl(r.key),
         })),
+        endpoints,
+        endpoints_down: epDown.length,
         next_self_run_hint: 'Run every 15–30 min so the page stays current.',
     };
     const content = JSON.stringify(doc, null, 2);
