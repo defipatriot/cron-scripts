@@ -32,7 +32,7 @@ const MONITORED = [
     { key: 'network-and-prices', repo: 'network-and-prices-data_2026', path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'foundation' },
     { key: 'tla-registry',       repo: 'tla-chain-registry',           path: '2026/heartbeat.json', cadenceMin: 1440, tier: 'foundation' },
     { key: 'tla-snapshot',       repo: 'tla-snapshot-data_2026',       path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
-    { key: 'nft-inventory',      repo: 'nft-inventory-data_2026',      path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
+    { key: 'nft-inventory',      repo: 'nft-inventory-data_2026',      path: 'data/v2/heartbeat.json', cadenceMin: 60, tier: 'core' },
     { key: 'marketplace',        repo: 'marketplace-data_2026',        path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
     { key: 'fuel',               repo: 'fuel-data_2026',               path: 'snapshots/heartbeat.json', cadenceMin: 60, tier: 'aux' },
     { key: 'bribes-history',     repo: 'bribes-data_2026',             path: 'data/heartbeat.json', cadenceMin: 240,  tier: 'core' },
