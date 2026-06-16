@@ -64,6 +64,18 @@ USD price, market cap, FDV, circulating supply, 24h/7d/30d price changes, ATH/AT
 
 For ampLUNA, arbLUNA, ampROAR, ampCAPA, bLUNA — direct chain query of each Eris hub contract. For xASTRO — Astroport TRPC (Neutron-side staking APY + USD prices).
 
+**Daily ratio history (added 2026-06-15).** Each end-of-day run also appends these
+rates to a consolidated time-series, `data/ratio-history.json`
+(`{ tokens: { ampCAPA: { base, points:[[date,rate]] }, … } }`, 6 LSTs). This is
+the **forward-capture ratio history** — built after confirming no free Terra
+phoenix-1 archive node serves historical state (TFL/publicnode/polkachu all
+pruned). It unblocks USD for the no-CoinGecko tokens (ampCAPA, ampROAR, xASTRO):
+`LST_USD(day) = base_USD(day) × rate(day)`, joined against price-history's
+`daily-prices.json`. Append-only, dedups by date, skips a token that failed that
+run (honest), never shrinks. Historical reach was bootstrapped once by
+`ratio-history-consolidate.js` (in the data repo) from existing `data/daily/*.json`
+archives. See `appendRatioHistory()`.
+
 ### Token prices from TWO sources, side-by-side
 
 For every tracked token, the snapshot includes:
