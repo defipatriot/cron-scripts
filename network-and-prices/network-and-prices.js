@@ -765,6 +765,56 @@ async function pushToGithub(filepath, content, message) {
     return false;
 }
 
+// =============================================================================
+// RATIO HISTORY (consolidated daily LST exchange-rate series)
+// =============================================================================
+// We already fetch every LST's exchange_rate each run. This keeps a single
+// growing time-series (data/ratio-history.json) so the UI gets one file instead
+// of globbing 365 daily archives. The no-CoinGecko tokens (ampCAPA, ampROAR,
+// xASTRO) get priced as LST_USD(day) = base_USD(day) × rate(day) by joining this
+// against price-history's daily-prices.json; the CG-listed LSTs (ampLUNA/arbLUNA/
+// bLUNA) get an exact chain-rate cross-check. Append-only, dedup by date, never
+// shrinks — written once per day at end-of-day, alongside the daily archive.
+// (This is the forward-capture path chosen after no public Terra ARCHIVE node was
+// found to serve historical state; from here on the series is exact.)
+const RATIO_HISTORY_BASES = { ampLUNA: 'LUNA', arbLUNA: 'LUNA', bLUNA: 'LUNA', ampCAPA: 'CAPA', ampROAR: 'ROAR', xASTRO: 'ASTRO' };
+
+function fetchJsonRaw(filepath) {
+    return new Promise((resolve) => {
+        const url = `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${filepath}`;
+        const req = https.get(url, { timeout: 8000 }, (res) => {
+            if (res.statusCode !== 200) { resolve(null); return; }
+            let body = ''; res.on('data', c => body += c);
+            res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+}
+
+async function appendRatioHistory(ratiosObj, dateStr) {
+    const prev = await fetchJsonRaw('data/ratio-history.json');
+    const doc = (prev && prev.tokens) ? prev
+        : { schemaVersion: 1, note: 'Daily LST exchange rates (chain-exact). USD: LST_USD(day) = base_USD(day) × rate(day), join against price-history daily-prices.json.', tokens: {} };
+    let added = 0, updated = 0;
+    for (const [tok, base] of Object.entries(RATIO_HISTORY_BASES)) {
+        const r = ratiosObj?.[tok]?.ratio;
+        if (!r || !Number.isFinite(r) || r <= 0) continue;       // honest: skip a token that failed this run
+        const t = doc.tokens[tok] || (doc.tokens[tok] = { base, points: [] });
+        const idx = t.points.findIndex(p => p[0] === dateStr);
+        if (idx >= 0) { t.points[idx][1] = r; updated++; }       // re-run same day → overwrite, no dup
+        else { t.points.push([dateStr, r]); added++; }
+        t.points.sort((a, b) => a[0].localeCompare(b[0]));
+    }
+    doc.updatedAt = new Date().toISOString();
+    // never-shrink guard: refuse to publish if we somehow ended up with fewer points than before
+    const prevTotal = prev?.tokens ? Object.values(prev.tokens).reduce((s, t) => s + (t.points?.length || 0), 0) : 0;
+    const nowTotal = Object.values(doc.tokens).reduce((s, t) => s + (t.points?.length || 0), 0);
+    if (nowTotal < prevTotal) { console.warn(`  ⚠ ratio-history shrink guard tripped (${nowTotal} < ${prevTotal}) — not publishing`); return; }
+    await pushToGithub('data/ratio-history.json', JSON.stringify(doc, null, 2), `📈 ratio-history ${dateStr} (+${added} new, ${updated} updated)`);
+    console.log(`  ✓ ratio-history.json — ${Object.keys(doc.tokens).length} tokens, +${added} new day-point(s), ${updated} updated`);
+}
+
 // -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
@@ -917,6 +967,7 @@ async function captureNetworkAndPrices() {
             await pushToGithub(`data/daily/${dateStr}.json`, content,
                 `📊 Daily archive ${dateStr}`);
             console.log(`  ✓ End-of-day archive written to data/daily/${dateStr}.json`);
+            await appendRatioHistory(ratios.ratios, dateStr);
         } else {
             console.log(`  (skipping daily archive — only written at 23:xx UTC; current hour ${startedAt.getUTCHours()})`);
         }
