@@ -124,6 +124,60 @@ async function getFileFromGithub(filePath) {
 }
 
 // ============================================================
+// ROLLUP HELPERS (epoch / monthly / yearly averages)
+// Pattern: daily history (index.json) is the source; periods are averaged from it.
+// ============================================================
+const EPOCH_START_MS = Date.UTC(2022, 9, 31); // epoch 1 begins 2022-10-31 (7-day epochs)
+const DAY_MS = 86400000;
+
+function dateToMs(d) { return Date.parse(d + 'T00:00:00Z'); }
+function msToDate(ms) { return new Date(ms).toISOString().slice(0, 10); }
+function nextDayStr(d) { return msToDate(dateToMs(d) + DAY_MS); }
+
+// Epoch number for a date (1-indexed), matching the Eris/Votion calendar.
+function epochOf(d) { return Math.floor((dateToMs(d) - EPOCH_START_MS) / (7 * DAY_MS)) + 1; }
+function epochStartStr(ep) { return msToDate(EPOCH_START_MS + (ep - 1) * 7 * DAY_MS); }
+function epochEndStr(ep)   { return msToDate(EPOCH_START_MS + (ep * 7 - 1) * DAY_MS); }
+// True when `d` is the final day of its epoch (next day rolls into a new epoch).
+function isEpochEnd(d) { return epochOf(d) !== epochOf(nextDayStr(d)); }
+
+// Average the daily-history rows whose date is within [from, to] inclusive.
+// Prices/TVL are averaged; volume is reported both as period total and avg/day.
+function periodAverage(history, from, to) {
+    const rows = (history || []).filter(e => e.date >= from && e.date <= to);
+    if (!rows.length) return null;
+    const avg = k => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0) / rows.length;
+    const sum = k => rows.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+    return {
+        days: rows.length,
+        avg_price: +avg('avgPrice').toFixed(10),
+        avg_tvl_usd: +avg('avgTvlUsd').toFixed(2),
+        total_volume_luna: +sum('dailyVolumeLuna').toFixed(6),
+        avg_daily_volume_luna: +avg('dailyVolumeLuna').toFixed(6)
+    };
+}
+
+async function getTextFromGithub(filePath) {
+    try {
+        const res = await githubApiRequest('GET', `/repos/${GITHUB_REPO}/contents/${filePath}`);
+        if (!res.data?.content) return '';
+        return Buffer.from(res.data.content, 'base64').toString('utf8');
+    } catch (e) { return ''; }
+}
+
+// Append a CSV row (creating the file w/ header if missing). Idempotent: replaces any
+// existing row whose first column equals `key`, then re-sorts. Safe to re-run.
+async function appendCsvRow(filePath, header, key, rowStr, commitMsg) {
+    const csv = await getTextFromGithub(filePath);
+    let lines = csv ? csv.replace(/\n+$/, '').split('\n') : [];
+    lines = lines.filter(l => l && l !== header && !l.startsWith(key + ','));
+    lines.push(rowStr);
+    lines.sort();
+    await pushToGithub(filePath, [header, ...lines].join('\n') + '\n', commitMsg);
+}
+
+
+// ============================================================
 // FETCH FUEL DATA
 // ============================================================
 
@@ -324,23 +378,47 @@ async function captureHourly() {
         else index.history.push(histEntry);
         index.history.sort((a, b) => a.date.localeCompare(b.date));
 
-        // ── 3c. Weekly (Sunday) ───────────────────────────────────────────────
-        if (dow === 0) {
-            const weeklyPath = `fuel/snapshots/weekly/${dateStr}.json`;
-            await pushToGithub(weeklyPath, JSON.stringify(dailySummary, null, 2),
-                `⛽ FUEL weekly snapshot (${dateStr})`);
-            console.log(`   ✅ Weekly ${dateStr} saved`);
+        // ── 3c. Epoch-end rollup (52/year) — average the epoch's daily rows ────
+        if (isEpochEnd(dateStr)) {
+            const ep = epochOf(dateStr);
+            const a = periodAverage(index.history, epochStartStr(ep), epochEndStr(ep));
+            if (a) {
+                const year = dateStr.slice(0, 4);
+                const path = `fuel/snapshots/${year}/epoch-avg/${year}.csv`;
+                const header = 'epoch,end_date,days,avg_price,avg_tvl_usd,total_volume_luna,avg_daily_volume_luna';
+                const row = `${ep},${dateStr},${a.days},${a.avg_price},${a.avg_tvl_usd},${a.total_volume_luna},${a.avg_daily_volume_luna}`;
+                await appendCsvRow(path, header, String(ep), row, `⛽ FUEL epoch-${ep} avg (${dateStr})`);
+                console.log(`   ✅ Epoch ${ep} avg saved (${a.days}d)`);
+            }
         }
 
-        // ── 3d. Monthly (last day of month) ───────────────────────────────────
+        // ── 3d. Month-end rollup (12/year) — average the month's daily rows ────
         if (isLastDayOfMonth(now)) {
-            const monthlyPath = `fuel/snapshots/monthly/${dateStr}.json`;
-            await pushToGithub(monthlyPath, JSON.stringify(dailySummary, null, 2),
-                `⛽ FUEL monthly snapshot (${dateStr})`);
-            console.log(`   ✅ Monthly ${dateStr} saved`);
+            const month = dateStr.slice(0, 7);              // YYYY-MM
+            const a = periodAverage(index.history, month + '-01', dateStr);
+            if (a) {
+                const year = dateStr.slice(0, 4);
+                const path = `fuel/snapshots/${year}/monthly-avg/${year}.csv`;
+                const header = 'month,end_date,days,avg_price,avg_tvl_usd,total_volume_luna,avg_daily_volume_luna';
+                const row = `${month},${dateStr},${a.days},${a.avg_price},${a.avg_tvl_usd},${a.total_volume_luna},${a.avg_daily_volume_luna}`;
+                await appendCsvRow(path, header, month, row, `⛽ FUEL ${month} avg (${dateStr})`);
+                console.log(`   ✅ Monthly ${month} avg saved (${a.days}d)`);
+            }
         }
 
-        // ── 3e. Update index ──────────────────────────────────────────────────
+        // ── 3e. Year-end rollup (1/year) — average the whole year ──────────────
+        if (dateStr.slice(5) === '12-31') {
+            const year = dateStr.slice(0, 4);
+            const a = periodAverage(index.history, year + '-01-01', year + '-12-31');
+            if (a) {
+                await pushToGithub(`fuel/snapshots/${year}/yearly-avg.json`,
+                    JSON.stringify({ year: +year, end_date: dateStr, ...a }, null, 2),
+                    `⛽ FUEL ${year} yearly avg`);
+                console.log(`   ✅ Yearly ${year} avg saved (${a.days}d)`);
+            }
+        }
+
+        // ── 3f. Update index ──────────────────────────────────────────────────
         await pushToGithub(indexPath, JSON.stringify(index, null, 2),
             `⛽ Update FUEL index (${dateStr} EOD)`);
 
@@ -359,6 +437,17 @@ async function captureHourly() {
 
         console.log(`\n✅ Hourly snapshot saved — $${price.toFixed(8)}\n`);
     }
+
+    // ── current.json: latest reading, always at the top for easy access ──
+    try {
+        await pushToGithub('fuel/snapshots/current.json', JSON.stringify({
+            date:        dateStr,
+            updated:     now.toISOString(),
+            epoch:       epochOf(dateStr),
+            price_usd:   price,
+            tvl_usd:     liq.latestTvl
+        }, null, 2), `⛽ FUEL current ${dateStr} ${hourStr}:50`);
+    } catch (e) { console.log('   ⚠️ current.json write failed:', e.message); }
 
     // ─── HEARTBEAT (CRON-FIXES-BRIEF 1.6) ──────────────────────────────────
     // Emit a heartbeat file in the same shape as the other 7 production crons
