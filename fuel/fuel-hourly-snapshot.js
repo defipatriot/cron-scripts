@@ -9,7 +9,7 @@ const FUEL_POOL   = 'terra10yfnsqn20rzlnlzkeva5255q27zp6ws9te9uuql9e0lacfcze7zsf
 const ASTRO_HOST  = 'app.astroport.fi';
 
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
-const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/fuel-data_2026';
+const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/tla-core';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
 
 const DAY_NAMES = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
@@ -158,7 +158,7 @@ async function loadHourlyFiles(dateStr) {
     const results = [];
     for (let h = 0; h <= 23; h++) {
         try {
-            const path = `snapshots/hourly/${dateStr}/${zeroPad(h)}.json`;
+            const path = `fuel/snapshots/hourly/${dateStr}/${zeroPad(h)}.json`;
             const data = await getFileFromGithub(path);
             if (data) results.push(data);
         } catch (e) {
@@ -274,7 +274,7 @@ async function captureHourly() {
         return;
     }
 
-    const hourlyPath = `snapshots/hourly/${dateStr}/${hourStr}.json`;
+    const hourlyPath = `fuel/snapshots/hourly/${dateStr}/${hourStr}.json`;
     await pushToGithub(hourlyPath, JSON.stringify(hourlyData, null, 2),
         `⛽ FUEL hourly ${dateStr} ${hourStr}:50 UTC`);
 
@@ -294,7 +294,7 @@ async function captureHourly() {
         console.log(`   Vol (day):  ${dailySummary.pool.dailyVolumeLuna} LUNA`);
 
         // ── Load index ────────────────────────────────────────────────────────
-        const indexPath = 'snapshots/index.json';
+        const indexPath = 'fuel/snapshots/index.json';
         let index;
         try {
             index = await getFileFromGithub(indexPath);
@@ -302,7 +302,7 @@ async function captureHourly() {
         if (!index) index = { latest: null, daily: {}, history: [] };
 
         // ── 3a. Rolling daily file ────────────────────────────────────────────
-        const dailyPath = `snapshots/daily/${dayName}.json`;
+        const dailyPath = `fuel/snapshots/daily/${dayName}.json`;
         await pushToGithub(dailyPath, JSON.stringify(dailySummary, null, 2),
             `⛽ FUEL daily summary ${dayName} (${dateStr})`);
         index.daily[dayName] = dateStr;
@@ -326,7 +326,7 @@ async function captureHourly() {
 
         // ── 3c. Weekly (Sunday) ───────────────────────────────────────────────
         if (dow === 0) {
-            const weeklyPath = `snapshots/weekly/${dateStr}.json`;
+            const weeklyPath = `fuel/snapshots/weekly/${dateStr}.json`;
             await pushToGithub(weeklyPath, JSON.stringify(dailySummary, null, 2),
                 `⛽ FUEL weekly snapshot (${dateStr})`);
             console.log(`   ✅ Weekly ${dateStr} saved`);
@@ -334,7 +334,7 @@ async function captureHourly() {
 
         // ── 3d. Monthly (last day of month) ───────────────────────────────────
         if (isLastDayOfMonth(now)) {
-            const monthlyPath = `snapshots/monthly/${dateStr}.json`;
+            const monthlyPath = `fuel/snapshots/monthly/${dateStr}.json`;
             await pushToGithub(monthlyPath, JSON.stringify(dailySummary, null, 2),
                 `⛽ FUEL monthly snapshot (${dateStr})`);
             console.log(`   ✅ Monthly ${dateStr} saved`);
@@ -349,12 +349,12 @@ async function captureHourly() {
     } else {
         // Non-final hour: update index latest only
         let index;
-        try { index = await getFileFromGithub('snapshots/index.json'); } catch(e) { index = null; }
+        try { index = await getFileFromGithub('fuel/snapshots/index.json'); } catch(e) { index = null; }
         if (!index) index = { latest: null, daily: {}, history: [] };
         index.latestPrice   = price;
         index.latestTvl     = liq.latestTvl;
         index.latestUpdated = now.toISOString();
-        await pushToGithub('snapshots/index.json', JSON.stringify(index, null, 2),
+        await pushToGithub('fuel/snapshots/index.json', JSON.stringify(index, null, 2),
             `⛽ FUEL index update ${dateStr} ${hourStr}:50`);
 
         console.log(`\n✅ Hourly snapshot saved — $${price.toFixed(8)}\n`);
@@ -385,7 +385,7 @@ async function captureHourly() {
             // Hourly cadence; allow ~15 min jitter / late runs before "stale"
             next_expected_run_at: new Date(now.getTime() + 75 * 60 * 1000).toISOString(),
         };
-        await pushToGithub('snapshots/heartbeat.json',
+        await pushToGithub('fuel/snapshots/heartbeat.json',
             JSON.stringify(heartbeat, null, 2),
             `📍 FUEL heartbeat ${dateStr} ${hourStr}:50`);
     } catch (e) {
