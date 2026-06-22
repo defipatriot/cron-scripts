@@ -47,6 +47,14 @@ const MONITORED = [
     { key: 'astroport',          repo: 'astroport-pool-data_2026',     path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'core' },
     { key: 'tla-vp-holders',     repo: 'tla-vp-holders-data_2026',     path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'aux' },
     { key: 'skeletonswap',       repo: 'ss-pool-data_2026',            path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'aux', stale_expected: true, stale_reason: 'Upstream SkeletonSwap API frozen ~30d — data labeled unverified by design.' },
+    // Manual source: LUNA staking APR is hand-pulled from analytics.smartstake.io/terra
+    // and committed to Staking APR.csv. No cron/heartbeat — freshness is judged by the
+    // age of the newest dated row. Aux tier, so going stale flags this row + lands it in
+    // "attention" (the reminder) without tripping the overall system-down alarm.
+    { key: 'staking-apr', repo: 'tla-ext_json_storage', tier: 'aux', manualSource: true,
+      csvPath: 'Staking%20APR.csv', warnDays: 14, downDays: 30,
+      updateUrl: 'https://analytics.smartstake.io/terra/',
+      note: 'Manual source — pull latest LUNA staking APR from analytics.smartstake.io/terra and commit to Staking APR.csv.' },
 ];
 
 // External endpoints the platform depends on. We ping each and report up/down +
@@ -94,6 +102,62 @@ function fetchJson(url) {
             res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
         }).on('error', () => resolve(null));
     });
+}
+
+// Like fetchJson but returns the raw text body (for CSV / manual sources).
+function fetchText(url) {
+    return new Promise((resolve) => {
+        https.get(url, res => {
+            let d = '';
+            res.on('data', c => d += c);
+            res.on('end', () => resolve(d));
+        }).on('error', () => resolve(null));
+    });
+}
+
+// Find the newest YYYY-MM-DD date in a 2-column CSV ("date","value").
+// String compare is safe for ISO dates, so no Date parsing per row.
+function latestCsvDate(text) {
+    if (!text) return null;
+    let max = null;
+    for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+        const m = line.match(/"?(\d{4}-\d{2}-\d{2})"?\s*,/);
+        if (m && (!max || m[1] > max)) max = m[1];
+    }
+    return max;
+}
+
+// Evaluate a manually-maintained source by the AGE of its newest data row
+// against warnDays/downDays thresholds (rather than cron cadence). Produces the
+// same result shape as evaluate() so the UI renders it identically, plus
+// `manual` + `update_url` so the UI can offer a "where to refresh" link.
+function evaluateManual(mon, latestDate, now) {
+    const r = {
+        key: mon.key, repo: mon.repo, tier: mon.tier || 'aux',
+        present: !!latestDate, status: null, health: null, reason: null,
+        last_run: latestDate || null, age_min: null, cadence_min: null,
+        run_status: null, stuck: false, stats: null,
+        note: mon.note || null, manual: true, update_url: mon.updateUrl || null,
+    };
+    if (!latestDate) {
+        r.health = 'down'; r.status = 'no_data';
+        r.reason = 'Could not read a dated row from the source file — check the path/format.';
+        return r;
+    }
+    const ageDays = Math.floor((now - Date.parse(latestDate + 'T00:00:00Z')) / 86400000);
+    r.age_min = ageDays * 1440;                       // so fmtAge() renders it in days
+    const warnD = mon.warnDays || 14, downD = mon.downDays || 30;
+    if (ageDays > downD) {
+        r.health = 'down'; r.status = 'stale';
+        r.reason = `Last entry ${ageDays}d ago (over ${downD}d). Pull fresh APR from SmartStake and commit Staking APR.csv.`;
+    } else if (ageDays > warnD) {
+        r.health = 'warn'; r.status = 'aging';
+        r.reason = `Last entry ${ageDays}d ago (over ${warnD}d). Refresh from SmartStake soon to keep the APR overlay current.`;
+    } else {
+        r.health = 'ok'; r.status = 'ok';
+        r.reason = `Fresh — newest entry ${ageDays}d ago.`;
+    }
+    return r;
 }
 
 function evaluate(mon, hb, now) {
@@ -189,8 +253,14 @@ async function run() {
 
     const results = [];
     for (const mon of MONITORED) {
-        const hb = await fetchJson(`${RAW}/${mon.repo}/${GITHUB_BRANCH}/${mon.path}?t=${now}`);
-        const r = evaluate(mon, hb, now);
+        let r;
+        if (mon.manualSource) {
+            const csv = await fetchText(`${RAW}/${mon.repo}/${GITHUB_BRANCH}/${mon.csvPath}?t=${now}`);
+            r = evaluateManual(mon, latestCsvDate(csv), now);
+        } else {
+            const hb = await fetchJson(`${RAW}/${mon.repo}/${GITHUB_BRANCH}/${mon.path}?t=${now}`);
+            r = evaluate(mon, hb, now);
+        }
         results.push(r);
         const icon = r.health === 'ok' ? '✓' : r.health === 'warn' ? '⚠' : '✗';
         console.log(`  ${icon} ${r.key.padEnd(20)} ${String(r.health).padEnd(5)} ${r.status} (${fmtAge(r.age_min)} ago)`);
