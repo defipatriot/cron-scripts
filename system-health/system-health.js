@@ -34,7 +34,7 @@ const MONITORED = [
     { key: 'tla-snapshot',       repo: 'tla-snapshot-data_2026',       path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
     { key: 'nft-inventory',      repo: 'nft-inventory-data_2026',      path: 'data/v2/heartbeat.json', cadenceMin: 60, tier: 'core' },
     { key: 'marketplace',        repo: 'marketplace-data_2026',        path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
-    { key: 'fuel',               repo: 'fuel-data_2026',               path: 'snapshots/heartbeat.json', cadenceMin: 60, tier: 'aux' },
+    { key: 'fuel',               repo: 'tla-core',                     path: 'fuel/snapshots/heartbeat.json', cadenceMin: 60, tier: 'aux', note: 'Migrated to tla-core/fuel (2026-06) ✓' },
     { key: 'bribes-history',     repo: 'bribes-data_2026',             path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'core' },
     { key: 'adao-positions',     repo: 'adao-positions-data_2026',     path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'core' },
     { key: 'tla-participants',   repo: 'tla-participants-data_2026',   path: 'data/heartbeat.json', cadenceMin: 1440, tier: 'core' },
@@ -102,6 +102,7 @@ function evaluate(mon, hb, now) {
         present: !!hb, status: null, health: null, reason: null,
         last_run: null, age_min: null, cadence_min: mon.cadenceMin,
         run_status: null, stuck: false, stats: null,
+        note: mon.note || null,
     };
     if (!hb) {
         if (mon.no_heartbeat_yet) {
