@@ -97,6 +97,15 @@ function treasuryCaptureFailed(p) {
     return hadNullQueries || emptyCapture;
 }
 
+// Treasury/council wallet definitions may be plain address strings or objects.
+// Reading t.address on a string yields undefined — which silently targets every
+// chain query at an undefined wallet (the actual epoch-189 break). Normalize both
+// shapes so the address is always valid.
+function normWallet(t, defLabel, defKind) {
+    if (typeof t === 'string') return { address: t, label: defLabel, kind: defKind };
+    return { address: t.address, label: t.label || t.name || defLabel, kind: t.kind || defKind };
+}
+
 // Publish target (cron-side only)
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/adao-positions-data_2026';
@@ -507,16 +516,17 @@ async function captureSnapshot() {
     // 189 onward. Retry the WHOLE capture a few times with a cooldown before accepting
     // failure; cheap since it's only 1–2 wallets, and far more reliable than one pass.
     async function captureTreasury(t) {
+        const w = normWallet(t, 'aDAO Treasury', 'treasury');
         let last = null;
         for (let attempt = 1; attempt <= 4; attempt++) {
             const p = await fetchMemberPortfolio({
-                address: t.address, name: t.label, nft_count: 0, vp_pct_of_dao: 0,
-            }, ctx).then(pp => { if (pp) { pp.kind = t.kind; pp.is_treasury = true; } return pp; })
+                address: w.address, name: w.label, nft_count: 0, vp_pct_of_dao: 0,
+            }, ctx).then(pp => { if (pp) { pp.kind = w.kind; pp.is_treasury = true; pp.name = pp.name || w.label; } return pp; })
               .catch(() => null);
             last = p;
             if (!treasuryCaptureFailed(p)) return p;        // clean capture
             if (attempt < 4) {
-                console.warn(`  ⚠ treasury ${t.label} attempt ${attempt} failed (null-after-retries) — cooling down`);
+                console.warn(`  ⚠ treasury ${w.label} attempt ${attempt} failed (null-after-retries) — cooling down`);
                 await new Promise(r => setTimeout(r, 1500 * attempt)); // let the LCD recover
             }
         }
@@ -560,19 +570,21 @@ async function captureSnapshot() {
     // are the meaningful fields. Failures here never block the rest of the cron.
     console.log(`🏛️  Fetching ${COUNCIL_TREASURY_WALLETS.length} council wallet(s)...`);
     const councilPortfolios = await parallelMap(COUNCIL_TREASURY_WALLETS, t => {
+        const w = normWallet(t, 'aDAO Council', 'council');
         return fetchMemberPortfolio({
-            address: t.address,
-            name: t.label,
+            address: w.address,
+            name: w.label,
             nft_count: 0,
             vp_pct_of_dao: 0,
         }, ctx).then(p => {
             if (p) {
-                p.kind = t.kind;
+                p.kind = w.kind;
                 p.is_treasury = true;
+                p.name = p.name || w.label;
             }
             return p;
         }).catch(err => {
-            console.warn(`  ⚠ Council wallet ${t.label} failed: ${err.message}`);
+            console.warn(`  ⚠ Council wallet ${w.label} failed: ${err.message}`);
             return null;
         });
     }, BATCH_CONCURRENCY);
