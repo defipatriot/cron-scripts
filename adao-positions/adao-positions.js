@@ -79,6 +79,23 @@ const COUNCIL_TREASURY_WALLETS = [
 const DAODAO_INDEXER_URL = `https://indexer.daodao.zone/phoenix-1/contract/${ADAO_VOTING_CONTRACT}/daoVotingCw721Staked/topStakers`;
 const FALLBACK_MEMBERS_CSV_URL = 'https://raw.githubusercontent.com/defipatriot/adao_json_storage/main/members.csv';
 const SELF_CACHED_MEMBERS  = 'https://raw.githubusercontent.com/defipatriot/adao-positions-data_2026/main/data/members.json';
+// Our own last-published full snapshot. Used to carry forward the last-good treasury
+// VP if a live capture fails under LCD load, so history never regresses to a false 0.
+const SELF_CURRENT_URL     = 'https://raw.githubusercontent.com/defipatriot/adao-positions-data_2026/main/data/current.json';
+
+// A treasury portfolio is untrustworthy if its core chain queries failed (returned
+// null after retries — LCD saturation) or it came back with no VP and no locks. The
+// DAO treasury always holds locks, so an empty capture means the query failed, NOT
+// that the VP is genuinely zero. We must never let that overwrite good history.
+function treasuryCaptureFailed(p) {
+    if (!p) return true;
+    if (p._error) return true;
+    const hadNullQueries = (p._errors || []).some(e => /null after retries/i.test(String(e)));
+    const vp = (p.voting && p.voting.total_voting_power_human) || 0;
+    const lockCount = (p.locks || []).length;
+    const emptyCapture = !(vp > 0) && lockCount === 0;
+    return hadNullQueries || emptyCapture;
+}
 
 // Publish target (cron-side only)
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
@@ -485,26 +502,56 @@ async function captureSnapshot() {
     // Tracked alongside members so the TLA Stats page can show treasury-only data.
     // Uses the same portfolio shape, just tagged with `kind`.
     console.log(`🏛️  Fetching ${ADAO_TREASURY_WALLETS.length} treasury wallet(s)...`);
-    const treasuryPortfolios = await parallelMap(ADAO_TREASURY_WALLETS, t => {
-        // Reuse fetchMemberPortfolio by passing a member-shaped object
-        return fetchMemberPortfolio({
-            address: t.address,
-            name: t.label,
-            nft_count: 0,
-            vp_pct_of_dao: 0,
-        }, ctx).then(p => {
-            if (p) {
-                p.kind = t.kind;
-                p.is_treasury = true;
+    // The treasury wallet is query-heavy and its VP is critical, so under LCD load a
+    // single pass can come back null-after-retries — this is what zeroed VP from epoch
+    // 189 onward. Retry the WHOLE capture a few times with a cooldown before accepting
+    // failure; cheap since it's only 1–2 wallets, and far more reliable than one pass.
+    async function captureTreasury(t) {
+        let last = null;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const p = await fetchMemberPortfolio({
+                address: t.address, name: t.label, nft_count: 0, vp_pct_of_dao: 0,
+            }, ctx).then(pp => { if (pp) { pp.kind = t.kind; pp.is_treasury = true; } return pp; })
+              .catch(() => null);
+            last = p;
+            if (!treasuryCaptureFailed(p)) return p;        // clean capture
+            if (attempt < 4) {
+                console.warn(`  ⚠ treasury ${t.label} attempt ${attempt} failed (null-after-retries) — cooling down`);
+                await new Promise(r => setTimeout(r, 1500 * attempt)); // let the LCD recover
             }
-            return p;
-        });
-    }, BATCH_CONCURRENCY);
-    const validTreasuries = treasuryPortfolios.filter(p => p && !p._error);
-    console.log(`  ✓ ${validTreasuries.length}/${ADAO_TREASURY_WALLETS.length} treasury portfolios captured`);
+        }
+        return last; // all attempts failed; the (failed) portfolio or null
+    }
+    // Concurrency 1 so the critical treasury queries run on an un-saturated LCD.
+    const treasuryPortfolios = await parallelMap(ADAO_TREASURY_WALLETS, captureTreasury, 1);
+    const validTreasuries = treasuryPortfolios.filter(p => p && !treasuryCaptureFailed(p));
+    console.log(`  ✓ ${validTreasuries.length}/${ADAO_TREASURY_WALLETS.length} treasury portfolios captured clean`);
     for (const t of validTreasuries) {
         const s = t.summary || {};
         console.log(`    ${t.name}: VP ${s.voting_power_human?.toFixed(0)}, LP $${s.total_lp_position_usd?.toFixed(0)}, Locks ${s.lock_count}, Rewards $${s.total_pending_rewards_usd?.toFixed(2)}`);
+    }
+
+    // Guard + carry-forward: never overwrite good history with a failed (zeroed) capture.
+    // VP is stable — it only changes when locks are adjusted — so the last-good value is
+    // the honest figure when a run's queries fail, not a fabrication. Reuse it, stamped.
+    let treasuryToWrite = validTreasuries.length >= 1 ? validTreasuries[0] : null;
+    if (!treasuryToWrite) {
+        console.warn('  ⚠ treasury capture failed this run — attempting carry-forward of last-good VP');
+        const prev = await fetchJson(SELF_CURRENT_URL, 'self-current-treasury').catch(() => null);
+        const prevT = prev && prev.treasury;
+        const prevVp = prevT && prevT.voting && prevT.voting.total_voting_power_human;
+        if (prevT && (prevVp > 0 || (prevT.locks || []).length)) {
+            treasuryToWrite = {
+                ...prevT,
+                _carried_forward: true,
+                _carry_reason: 'live capture failed (LCD null-after-retries) — preserved last-good VP',
+                _carried_from: prev.capturedAt || null,
+            };
+            const cvp = treasuryToWrite.summary?.display_voting_power_human || treasuryToWrite.summary?.voting_power_human || 0;
+            console.warn(`  ↻ carried forward treasury VP ${cvp.toFixed(0)} from ${prev.capturedAt || 'previous run'}`);
+        } else {
+            console.warn('  ✗ no prior good treasury to carry forward — treasury will be null this run');
+        }
     }
 
     // Phase 3c: Council treasury wallets. Same fetch path as aDAO treasury, but written
@@ -588,8 +635,8 @@ async function captureSnapshot() {
         },
         totals,            // DAO-wide (all current members)
         totals_named: totalsNamed,  // registered-only (back-compat / named leaderboard)
-        treasury: validTreasuries.length === 1 ? validTreasuries[0] : null,
-        treasuries: validTreasuries,
+        treasury: treasuryToWrite,
+        treasuries: treasuryToWrite ? [treasuryToWrite] : [],
         council_treasury: validCouncils.length === 1 ? validCouncils[0] : null,
         council_treasuries: validCouncils,
         members: validPortfolios,   // ALL current members (named + unknown), each tagged is_registered
