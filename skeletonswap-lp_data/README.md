@@ -6,7 +6,14 @@ Captures daily Skeleton Swap pool snapshots from Backbone Labs' aggregator API. 
 
 ---
 
-## ⚠ Data quality warning (added 2026-05-17)
+## ✅ Data quality warning — RESOLVED (2026-06-23)
+
+**The warlock-aggregator reliability problem described below has been fixed.** The cron was re-architected: it no longer trusts BackBone's bulk `dex.warlock.backbonelabs.io/api/pools/phoenix-1` feed for pool state. It now reads the pool _list_ from `skeletonswap.backbonelabs.io/mainnet/phoenix-1/pools_list.json` and queries the **chain directly** for each pool's reserves (the same trustworthy approach as the Astroport cron). It also computes a per-run `dataFingerprint` and tracks `consecutiveStuckRuns`, so a frozen upstream is now _detected_ (heartbeat `dataFreshness` flips to `stuck`) instead of silently captured. Current production runs are healthy (`status: ok`, `dataFreshness: fresh`, 0 stuck runs, ~34 pools/run).
+
+The original warning is kept below for history.
+
+<details>
+<summary>Original warning (2026-05-17) — describes the old warlock-aggregator architecture, now retired</summary>
 
 **The upstream source for this cron is unreliable.** A full audit of the daily backup files from 2026-01-12 → 2026-05-14 found:
 
@@ -17,12 +24,9 @@ Captures daily Skeleton Swap pool snapshots from Backbone Labs' aggregator API. 
 
 **Root cause:** the cron pulls from `dex.warlock.backbonelabs.io/api/pools/phoenix-1`. That endpoint is BackBone Labs' read of Skeleton Swap pool state (they run both BBL marketplace and the SS aggregator). When their aggregator caches stale data, our cron has no way to detect it — the API still responds 200, the cron writes what it gets, the data looks current but isn't.
 
-**Implications for downstream:**
-- ❌ **Do not use this data for LP health scoring or trend analysis** — apparent stability is an artifact of upstream caching, not real market behavior
-- ❌ **Do not display SS data alongside Astroport data without a clear "unverified" label** — users may believe both are equally reliable
-- ✅ Keep capturing best-effort — there's no cost to leaving it running, and the source may recover
+**Path to fix:** querying Skeleton Swap pool contracts directly from chain (same approach as Astroport) would give us trustworthy data. Skeleton pools are on-chain like any other CW20-LP. The current cron's reliance on the BackBone aggregator was a convenience tradeoff that turned out to be expensive. _(Done — see the resolution note above.)_
 
-**Path to fix:** querying Skeleton Swap pool contracts directly from chain (same approach as Astroport) would give us trustworthy data. Skeleton pools are on-chain like any other CW20-LP. The current cron's reliance on the BackBone aggregator was a convenience tradeoff that turned out to be expensive.
+</details>
 
 ---
 
