@@ -1,0 +1,14 @@
+{
+  "name": "tla-flows",
+  "version": "1.0.0",
+  "description": "Resumable LP deposit/withdraw/claim event capture + zap costs via tx_search (writes the tla-core flows module)",
+  "main": "tla-flows.js",
+  "scripts": {
+    "start": "node tla-flows.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
