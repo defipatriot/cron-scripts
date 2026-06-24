@@ -56,9 +56,15 @@ No backend server. No database. Each cron is independent — a failure in one do
 
 | Folder | Status | Notes |
 |---|---|---|
-| `ampcapa/` | Last update 2026-04. No README. | Early experiment with ampCAPA-specific tracking — superseded by general `adao-positions` enumeration |
-| `backing/` | Last update 2026-04. No README. | Early experiment with treasury backing analysis — superseded |
-| `fuel/` | Last update 2026-05-30. No README. | Status unclear; not currently scheduled on Render |
+| `ampcapa/` | LIVE — daily. Heartbeat added 2026-06-15 (`snapshots/heartbeat.json`). | Was an early ampCAPA experiment; still runs daily and is now System-Health-monitored. Candidate to fold into `tla-core` when next touched. |
+| `backing/` | LIVE — daily. Heartbeat added 2026-06-15 (`snapshots/heartbeat.json`). | Treasury backing (ampLUNA/NFT) snapshot; still runs daily and is now monitored. Candidate to fold into `tla-core`. |
+
+> **`fuel/` is NOT legacy — it's the live pilot of the `tla-core` migration.** It
+> runs hourly and writes to the unified `defipatriot/tla-core` repo as the
+> `fuel/snapshots/` module (its heartbeat shows current hourly runs). It is the
+> **reference SNAPSHOT module** for the new module→product→files storage pattern
+> (sibling to `tla-flows`' `flows/events/`). See
+> `website-adao-core/TLA-CORE-STORAGE-DESIGN.md`.
 
 These are kept for git history. They are NOT running as production crons. If you find yourself looking at one of these for active work, you're probably in the wrong folder.
 
