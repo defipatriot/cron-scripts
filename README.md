@@ -28,7 +28,7 @@ No backend server. No database. Each cron is independent — a failure in one do
 
 ## Cron inventory
 
-### 🟢 Active production crons (16)
+### 🟢 Active production crons (16 live + 1 built/pending: `tla-flows`)
 
 | Folder | Writes to | Cadence | Purpose |
 |---|---|---|---|
@@ -48,6 +48,7 @@ No backend server. No database. Each cron is independent — a failure in one do
 | `tla-vp-holders/` | `tla-snapshot-data_2026` (subdirectory) | Daily | Per-wallet veLUNA holdings — voting power resolution |
 | `votion/` | `votion-data_2026` | Daily | Votion bribes market — current epoch incentive offers |
 | `chain/tla-registry/` | `tla-chain-registry` (no `_2026` — separate convention) | Daily 00:05 UTC | **The TLA ecosystem catalog** — 173 tokens, 75 pools, 65 amplps, 668 wallets with cross-source reconciliation. See `chain/tla-registry/README.md`. |
+| `tla-flows/` | **`tla-core` repo, `flows/` module** (new unified-repo storage) | 15 min — **pending Render deploy** | **LP deposit/withdraw/claim event capture + zap costs/fees.** Resumable `tx_search` over 6 shared contracts — the exact claim *timing* + entry/exit *slippage* the daily snapshots can't recover. Sibling to `tla-history` (vote+lock events). Built + locally verified 2026-06-24; parser 42/42 on real data. See `tla-flows/README.md`. |
 
 \* `adao-positions` is currently scheduled `0 1 * * 1` (weekly Mondays). Needs to change to `0 1 * * *` (daily) — tracked in `CHANGES_PENDING.md` P1.
 
@@ -166,6 +167,17 @@ Capture design:
 - **Per-member rollups:** group locks by owner → total VP, stale-VP upside, personal unlock cliff, first-participation.
 - **Marketplace cross-ref:** locks are listable on Boost (already in the marketplace pipeline) → discounted-VP-for-sale flagging.
 - **Voter behavior (rides along):** vote churn + votes-on-dead-LPs from gauge controller `user_info.gauge_votes` snapshots (changes between runs = churn).
+
+### `tla-flows` cron — ✅ BUILT + locally verified 2026-06-24 (Render deploy pending)
+The **LP-flow event sibling to `tla-history`** (which backfills votes+locks). Captures the **deposit / withdraw / claim** stream + **zap entry/exit costs/fees** — the exact intra-day claim *timing* and per-tx *slippage* that daily `adao-positions` snapshots and the vote/lock backfill cannot recover after the fact. Code in `tla-flows/`; **output to the new unified `tla-core` repo, `flows/` module** (first cron on the tla-core storage pattern — storage design documented separately).
+
+- **Resumable, completeness from a cursor:** read cursor → `tx_search [cursor,head]` over **6 shared contracts** (1 compounder = all amplified; 4 bucket staking = non-amp; the zapper) → classify (txhash-dedupe) → append `events/YYYY/MM/DD.jsonl` → **advance cursor LAST**. Error → return without advancing. Same loop from a genesis start height = the backfill. No npm deps.
+- **⚠️ `tx_search` gotcha:** publicnode LCD **400s on `AND tx.height>=N`** — query by contract only, bound the window client-side, paginate to last page. Pruned public nodes keep result sets small.
+- **Parser verified on REAL data (not fixtures):** 42/42 on a live compounder dump + 8 chainscope variations. Routes on wasm `action` (`asset-compounding/*`=amplified, `asset/*`=non-amp, `/claim/`=claim); takes the FIRST flow action so cascades keep the real user. Arbitrage-Vault deposit correctly skipped (arbLUNA mint, not a TLA flow).
+- **Cost capture (Rev A.3):** all swap legs (multi-hop exits) + `provide_liquidity.slippage` (imbalanced Tokens deposits), deposits AND withdrawals. Proof: exit-to-LUNA 0.05% vs exit-to-USDC 0.43%; imbalanced Tokens deposit 1.05%.
+- **⚠️ Realized-APR correction (preserve):** bribes go to VOTERS (`pending_bribes`), NOT LPs (`pending_rewards`) — separate stream, out of scope. The apparent realized≫advertised gap was APR-vs-APY (amp realized is APY; the compounder auto-compounds — the ≈−3pt drag is its reward fee) + a claim-day double-count bug. Corrected: TLA pays ≈ what it advertises, marginally under. `tla-flows`' exact claim timing collapses the wide non-amp band.
+- **Cohort tagging = aDAO NFT stakers** — applied downstream as a label (join nft-inventory/registry), not a capture filter; the cron catches every depositor regardless.
+- **Open:** deploy to Render (15-min, `TLA_OUT_DIR`→tla-core checkout `flows/`, commit step as fuel). Downstream tools (Net-P&L waterfall, realized-APR audit, slippage/fee ledger, Zap-Out Optimizer) spec'd in `CHANGES_PENDING.md`.
 
 ### Open cron-side items (routed to cron chat, see CRON-FIXES-BRIEF.md)
 - **Stake/destake event sweep** (extend nft-inventory pending-claims tx-search → `data/v2/staking-events.json`) — unlocks Stake/Destake in the dashboard feed + DAO-Members chart history.
