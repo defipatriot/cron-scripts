@@ -65,6 +65,7 @@
 
 'use strict';
 const https = require('https');
+const D = require('../lib/tla-decompose.js'); // shared TLA decomposition core (Rev-stamped; mirror copy in aDAO-links-site/lib/)
 
 // ── Chain constants ──────────────────────────────────────────────────────────
 const DAO_MAIN_WALLET = 'terra1sffd4efk2jpdt894r04qwmtjqrrjfc52tmj6vkzjxqhd8qqu2drs3m5vzm';
@@ -244,23 +245,13 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
     // Decompose a pair-pool position into underlying tokens via lp_health,
     // scaled by the position's share of the whole pool's USD.
     const decompose = (pool, positionUsd) => {
-        const lh = pool?.lp_health;
-        if (!lh || !(lh.total_pool_usd > 0) || !(positionUsd > 0)) return false;
-        const frac = positionUsd / lh.total_pool_usd;
-        for (const a of [lh.asset_0, lh.asset_1]) {
-            if (!a) continue;
-            addToken(a.symbol, (a.amount_human || 0) * frac, (a.usd_value || 0) * frac);
-        }
+        const toks = D.decomposeTokens(pool, positionUsd);
+        if (!toks) return false;
+        for (const t of toks) addToken(t.symbol, t.amount, t.usd);
         return true;
     };
 
-    // Advertised reward APR per pool from the snapshot, gating thin-pool garbage
-    // (legit TLA pool APRs sit well under 300%; thin pools report millions of %).
-    const SANE_APR_CAP = 300;
-    const aprOf = (pool) => {
-        const a = pool?.rewards?.approx_apr_pct;
-        return (typeof a === 'number' && isFinite(a) && a >= 0 && a <= SANE_APR_CAP) ? a : null;
-    };
+    // Advertised reward APR per pool — gating handled by the shared core (D.aprOf, cap D.SANE_APR_CAP).
 
     // Non-amplified staked positions
     for (const { bucket, staked } of stakingResults) {
@@ -271,11 +262,9 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
             const totalShares = parseFloat(entry.total_shares) || 0;
             const pool = catalog.findPool(entry.asset?.info);
             let positionUsd = 0;
-            if (totalShares > 0 && pool?.staked_in_tla_usd) {
-                positionUsd = pool.staked_in_tla_usd * (shares / totalShares);
-            }
+            positionUsd = D.nonAmpPositionUsd(pool, shares, totalShares) || 0;
             totalLpUsd += positionUsd;
-            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: false, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null, apr_pct: aprOf(pool) });
+            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: false, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null, apr_pct: D.aprOf(pool) });
             if (!decompose(pool, positionUsd) && pool) {
                 // single-asset pool: the position IS the token
                 const sym = pool.lp_health?.asset_0?.symbol || pool.name;
@@ -296,20 +285,15 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
             let positionUsd = 0;
             if (pool?.lp_health?.total_share) {
                 const totalShare = parseFloat(pool.lp_health.total_share) || 0;
-                if (totalShare > 0) {
-                    // Use total_pool_usd — the SAME base decompose() divides by and the
-                    // true reserve valuation. depth_usd runs 5-15% higher and inflated
-                    // every amplified position (and its decomposed underlying) by that ratio.
-                    const refUsd = pool.lp_health?.total_pool_usd ?? pool.staked_in_tla_usd;
-                    if (refUsd) positionUsd = refUsd * (userLp / totalShare);
-                }
+                // total_pool_usd base (not depth_usd) — handled in the shared core.
+                positionUsd = D.ampPositionUsd(pool, userLp, totalShare) || 0;
             } else if (pool) {
                 const sym = pool.lp_health?.asset_0?.symbol || pool.name;
                 const price = catalog.prices[sym] || pool.lp_health?.asset_0?.price_usd || 0;
                 positionUsd = (userLp / 1e6) * price;
             }
             totalLpUsd += positionUsd;
-            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: true, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null, apr_pct: aprOf(pool) });
+            positions.push({ bucket, pool_name: pool?.name || null, dex: pool?.dex || null, is_amplified: true, position_usd: positionUsd, pool_staked_usd: pool?.staked_in_tla_usd ?? null, apr_pct: D.aprOf(pool) });
             if (!decompose(pool, positionUsd) && pool) {
                 const sym = pool.lp_health?.asset_0?.symbol || pool.name;
                 const price = catalog.prices[sym] || pool.lp_health?.asset_0?.price_usd || 0;
@@ -340,12 +324,8 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
         }))
         .sort((a, b) => b.usd - a.usd);
 
-    // Deposit-weighted advertised APR across positions that have a (gated) APR.
-    let aprNum = 0, aprDen = 0;
-    for (const p of positions) {
-        if (typeof p.apr_pct === 'number') { aprNum += p.position_usd * p.apr_pct; aprDen += p.position_usd; }
-    }
-    const est_apr_pct = aprDen > 0 ? aprNum / aprDen : null;
+    // Deposit-weighted advertised APR — shared core.
+    const est_apr_pct = D.depositWeightedApr(positions);
 
     return {
         total_usd: totalLpUsd + zlunaUsd,
@@ -355,6 +335,7 @@ function aggregateDeposits({ stakingResults, ampResults, zlunaBank }, catalog) {
         tokens,
         positions: positions.filter(p => p.position_usd > 0.01),
         composition: 'lp_underlying+zluna',
+        decompose_core_version: D.VERSION,
     };
 }
 
