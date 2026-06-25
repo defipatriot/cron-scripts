@@ -1,0 +1,8 @@
+{
+  "name": "address-catalog",
+  "version": "1.0.0",
+  "description": "Platform-wide member/holder discovery registry — writes tla-core/catalog/",
+  "main": "address-catalog.js",
+  "scripts": { "start": "node address-catalog.js" },
+  "license": "MIT"
+}
