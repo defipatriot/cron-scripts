@@ -1,0 +1,8 @@
+{
+  "name": "contract-token-catalog",
+  "version": "1.0.0",
+  "description": "Registry of all queryable TLA/NFT/governance contracts, tokens, and LPs — writes tla-core/contracts/",
+  "main": "contract-token-catalog.js",
+  "scripts": { "start": "node contract-token-catalog.js" },
+  "license": "MIT"
+}
