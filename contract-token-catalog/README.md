@@ -13,7 +13,7 @@ crons READ this instead of hardcoding addresses.
 ## Structure
 - **`pools.{active,inactive,single}`** — DYNAMIC, harvested from `tla-snapshot` each run.
   Per pool: `dex`, `dex_contract` (pair), `pair_type`, `bucket`, `status`,
-  `lp_address` (non-amplified base LP), `amplp_denom` (amplified, `factory/<compounder>/<n>/<bucket>/amplp`),
+  `lp_nonamplified` (base LP), `lp_amplified` (per-pool amplified denom matched via asset_configs; null if not amplified), `pools.amplified_configs` (raw config truth),
   `gauge_pool_id`, `token_a`/`token_b` (symbol+address+decimals), `ratio`/`ratio_type`.
   This is the part that changes as TLA adds/removes pools.
 - **`tokens`** — symbol → {type, address/denom, decimals, cgId, price.from}. `price.from`:

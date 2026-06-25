@@ -138,24 +138,38 @@ async function discoverPools() {
   const snap = await fetchJson(TLA_SNAPSHOT_URL, 'tla-snapshot').catch(() => null);
   if (!snap || !Array.isArray(snap.pools)) return { ok: false, active: [], inactive: [], single: [] };
 
-  // amplified LP denoms: factory/<compounder>/<n>/<bucket>/amplp — map gauge -> denom via asset_configs
-  let amplpByGauge = {};
+  // Amplified LP denoms are PER-POOL: factory/<compounder>/<configId>/<bucket>/amplp
+  // (multiple configIds per bucket). asset_configs lists every amplified pool; each
+  // entry references its pool's address (e.g. the Astroport pair). We capture the raw
+  // configs AND build an address->amplp map so each pool matches its OWN amplified
+  // denom by address overlap — non-amplified pools correctly get null.
+  let amplifiedConfigs = [];
+  const amplpByAddress = {};
   try {
     const cfgs = await queryContract(TLA_ASSET_COMPOUNDER, { asset_configs: {} });
     if (Array.isArray(cfgs)) {
       for (const c of cfgs) {
-        const g = c.gauge || c.bucket;
-        const denom = c.amp_denom || c.amplp_denom || (c.asset && c.asset.native) || null;
-        if (g && denom) amplpByGauge[g] = denom;
+        const blob = JSON.stringify(c);
+        const dm = blob.match(/factory\/[a-z0-9]+\/\d+\/[a-z]+\/amplp/);
+        if (!dm) continue;
+        const amplp = dm[0];
+        const addrs = [...new Set(blob.match(/terra1[a-z0-9]{38,}/g) || [])];
+        const gm = blob.match(/"gauge":"([a-z]+)"/);
+        amplifiedConfigs.push({ gauge: gm ? gm[1] : null, amplp_denom: amplp, addresses: addrs });
+        // every referenced address EXCEPT the compounder itself points at this amplp denom
+        for (const a of addrs) if (a !== TLA_ASSET_COMPOUNDER) amplpByAddress[a] = amplp;
       }
     }
-  } catch (e) { /* amplified denom enrichment best-effort */ }
+  } catch (e) { /* amplified config enrichment best-effort */ }
 
-  const out = { active: [], inactive: [], single: [], _asset_configs_ok: Object.keys(amplpByGauge).length > 0 };
+  const out = { active: [], inactive: [], single: [], amplified_configs: amplifiedConfigs,
+    _asset_configs_ok: amplifiedConfigs.length > 0, _amplp_matched: 0 };
   for (const p of snap.pools) {
     const assets = [];
     const h = p.lp_health || {};
     for (const side of ['asset_0', 'asset_1']) if (h[side] && h[side].symbol) assets.push(tokenRef(h[side].symbol));
+    const ampDenom = amplpByAddress[p.pool_address] || amplpByAddress[p.lp_address] || null;
+    if (ampDenom) out._amplp_matched++;
     const row = {
       name: p.name,
       dex: p.dex || null,
@@ -164,8 +178,8 @@ async function discoverPools() {
       bucket: p.bucket || null,
       status: p.status,                              // active | voted_but_below_threshold | zero_vp
       dex_contract: p.pool_address || null,          // the DEX pair contract
-      lp_address: p.lp_address || null,              // base LP (non-amplified, staked into bucket contract)
-      amplp_denom: amplpByGauge[p.bucket] || null,   // amplified LP (compounder factory denom), if amplified
+      lp_nonamplified: p.lp_address || null,         // base LP (non-amplified, staked into bucket contract)
+      lp_amplified: ampDenom,                        // amplified LP (compounder factory denom); null if not amplified
       gauge_pool_id: p.gauge_pool_id || null,        // staked-LP identifier
       token_a: assets[0] || null,
       token_b: assets[1] || null,
@@ -216,7 +230,7 @@ async function run() {
 
   const pools = await discoverPools();
   const poolsOk = pools.ok;
-  console.log(`  pools: ${pools.active.length} active, ${pools.inactive.length} inactive, ${pools.single.length} single (asset_configs ${pools._asset_configs_ok ? 'ok' : 'miss'})`);
+  console.log(`  pools: ${pools.active.length} active, ${pools.inactive.length} inactive, ${pools.single.length} single | amplified configs: ${pools.amplified_configs.length}, matched to pools: ${pools._amplp_matched}`);
 
   const status = poolsOk ? 'ok' : 'partial';
   const catalog = {
@@ -225,7 +239,7 @@ async function run() {
       generated_at: startedAt.toISOString(), epoch: epochInfo?.number ?? null,
       status, source: 'contract-token-catalog cron (cron-scripts/contract-token-catalog)',
     },
-    pools: { active: pools.active, inactive: pools.inactive, single: pools.single },
+    pools: { active: pools.active, inactive: pools.inactive, single: pools.single, amplified_configs: pools.amplified_configs },
     tokens: TOKENS,
     ratio_hubs: RATIO_HUBS,
     contracts: CONTRACTS,
@@ -237,7 +251,7 @@ async function run() {
   const heartbeat = {
     schemaVersion: 1, capturedAt: startedAt.toISOString(), runId: `contracts-${startedAt.getTime()}`,
     status, currentEpoch: epochInfo?.number ?? null,
-    counts: { active: pools.active.length, inactive: pools.inactive.length, single: pools.single.length, tokens: Object.keys(TOKENS).length },
+    counts: { active: pools.active.length, inactive: pools.inactive.length, single: pools.single.length, tokens: Object.keys(TOKENS).length, amplified_pools: pools._amplp_matched },
     next_expected_run_at: new Date(startedAt.getTime() + 25 * 3600 * 1000).toISOString(),
   };
 
