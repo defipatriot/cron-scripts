@@ -1,0 +1,8 @@
+{
+  "name": "price-cron",
+  "version": "1.0.0",
+  "description": "Consolidates network-and-prices into one token->price table + tier history — writes tla-core/prices/",
+  "main": "price-cron.js",
+  "scripts": { "start": "node price-cron.js" },
+  "license": "MIT"
+}
