@@ -29,6 +29,13 @@ const TierBuilder = require('../lib/tier-builder.js');
 
 const PRICES_SOURCE_URL = process.env.PRICES_SOURCE_URL
   || 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+// LP + ampLP per-unit prices come from pool reserves (tla-snapshot) keyed by the
+// LP/ampLP denoms the contract catalog resolved. Both are single repointable constants.
+const TLA_SNAPSHOT_URL = process.env.TLA_SNAPSHOT_URL
+  || 'https://raw.githubusercontent.com/defipatriot/tla-snapshot-data_2026/main/data/tla-snapshot.json';
+const CATALOG_URL = process.env.CATALOG_URL
+  || 'https://raw.githubusercontent.com/defipatriot/tla-core/main/contracts/current.json';
+const LP_DECIMALS = 6; // Astroport LP + compounder amplp factory tokens are 6-dec
 const HISTORY_RAW_URL = 'https://raw.githubusercontent.com/defipatriot/tla-core/main/prices/history.json';
 
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
@@ -92,6 +99,7 @@ async function run() {
     const astro = (e.prices && e.prices.astroport) || {};
     prices[sym] = {
       price_usd: p,
+      type: 'token',
       source: e.final_source || null,
       change_24h_pct: astro.price_change_24h_pct ?? null,
       change_7d_pct: astro.price_change_7d_pct ?? null,
@@ -103,7 +111,38 @@ async function run() {
   for (const [sym, e] of Object.entries(np.lst_ratios || {})) {
     ratios[sym] = { ratio: e.ratio, hub: e.hub, base_token: e.base_token, source: e.source || null };
   }
-  console.log(`  ✓ ${priced} tokens priced, ${Object.keys(ratios).length} ratios`);
+  console.log(`  ✓ ${priced} token prices, ${Object.keys(ratios).length} ratios`);
+
+  // ---- LP + ampLP per-unit prices from reserves (tla-snapshot) keyed by denom (catalog) ----
+  // LP token price  = total_pool_usd / total_share          (same base as tla-decompose)
+  // ampLP price     = LP price × amp_lp.ratio                (claim on underlying LP per share)
+  // These go in the price TABLE (for portfolio valuation); history stays token-only.
+  let lpPriced = 0;
+  const snap = await httpGetJson(TLA_SNAPSHOT_URL + '?t=' + now);
+  const cat = await httpGetJson(CATALOG_URL + '?t=' + now);
+  if (snap && Array.isArray(snap.pools) && cat && cat.pools) {
+    const catByPool = {};
+    for (const grp of ['active', 'inactive', 'single'])
+      for (const r of (cat.pools[grp] || [])) if (r.dex_contract) catByPool[r.dex_contract] = r;
+    for (const pl of snap.pools) {
+      const h = pl.lp_health || {};
+      const totalPoolUsd = h.total_pool_usd, totalShare = h.total_share;
+      if (!(totalPoolUsd > 0) || !(totalShare > 0)) continue;
+      const lpPrice = totalPoolUsd / (totalShare / Math.pow(10, LP_DECIMALS)); // USD per LP token
+      const cr = catByPool[pl.pool_address] || {};
+      const lpDenom = cr.lp_nonamplified || pl.lp_address;
+      if (lpDenom && lpPrice > 0) { prices[lpDenom] = { price_usd: lpPrice, type: 'lp', source: 'lp_reserve', pool: pl.name }; lpPriced++; }
+      const ratio = (pl.amp_lp || {}).ratio;
+      const amplpDenom = cr.lp_amplified;
+      if (amplpDenom && lpPrice > 0 && ratio > 0) {
+        prices[amplpDenom] = { price_usd: lpPrice * ratio, type: 'amplp', source: 'amplp_derived', pool: pl.name, ratio };
+        lpPriced++;
+      }
+    }
+    console.log(`  ✓ ${lpPriced} LP/ampLP prices from reserves`);
+  } else {
+    console.warn('  ⚠ tla-snapshot or catalog unavailable — LP/ampLP prices skipped this run');
+  }
 
   // roll history via the shared tier-builder (reads its own prior history)
   let history = await httpGetJson(HISTORY_RAW_URL + '?t=' + now);
@@ -112,11 +151,11 @@ async function run() {
 
   const current = {
     meta: { version: 'prices-1.0.0', schemaVersion: 1, generated_at: new Date(now).toISOString(), epoch,
-      source: 'network-and-prices (consolidated)', token_count: priced },
+      source: 'network-and-prices + tla-snapshot reserves', token_count: priced, lp_entries: lpPriced, total_price_entries: Object.keys(prices).length },
     prices, ratios,
   };
   const heartbeat = { schemaVersion: 1, capturedAt: new Date(now).toISOString(), runId: `prices-${now}`,
-    status: 'ok', currentEpoch: epoch, token_count: priced,
+    status: 'ok', currentEpoch: epoch, token_count: priced, lp_entries: lpPriced, total_price_entries: Object.keys(prices).length,
     next_expected_run_at: new Date(now + 16 * 60 * 1000).toISOString() };
 
   const curStr = JSON.stringify(current, null, 2);
@@ -135,7 +174,7 @@ async function run() {
   } else {
     console.log('  (no GITHUB_TOKEN — wrote current.json + heartbeat.json locally only)');
   }
-  console.log(`\n✅ Done — ${priced} tokens priced, history tiers updated`);
+  console.log(`\n✅ Done — ${priced} tokens + ${lpPriced} LP/ampLP = ${Object.keys(prices).length} price entries; history tiers updated`);
 }
 
 run().catch(e => { console.error('FATAL', e); process.exit(1); });
