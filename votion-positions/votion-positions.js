@@ -76,6 +76,29 @@ const LST_SYMBOLS = {
 };
 
 // -----------------------------------------------------------------------------
+// Community candidate universe (v1.1 discovery fix).
+// tx_search-only discovery silently ran on public-node TX RETENTION (~2-3
+// weeks): historical depositors vanished while `complete:true` was reported
+// in good conscience (observed: 2 holders found vs 147K vtokens outstanding).
+// Fix: union deposit-event recipients with the org address-catalog (aDAO
+// stakers, ALL TLA lock holders, registered Pixel Lions / Lion DAO — the
+// community this feed serves), then sweep bank balances ONCE across the
+// union. Completeness becomes MEASURED per vault (found balances / supply),
+// never asserted.
+// -----------------------------------------------------------------------------
+const COMMUNITY_CATALOG_URL = 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/catalog/snapshots/current.json';
+async function fetchCommunityCandidates() {
+    try {
+        const d = await fetchJson(COMMUNITY_CATALOG_URL + '?t=' + Date.now(), 'catalog', 15000);
+        const rows = Array.isArray(d?.addresses) ? d.addresses : [];
+        const addrs = [...new Set(rows.map(r => r.address).filter(a => typeof a === 'string' && a.startsWith('terra1')))];
+        if (addrs.length) return { ok: true, addresses: addrs, source: `org-catalog@${String(d?.meta?.generated_at || '').slice(0, 10)}` };
+    } catch (e) { /* fall through */ }
+    console.warn('  ⚠ community catalog unavailable — universe falls back to deposit events only');
+    return { ok: false, addresses: [], source: 'unavailable' };
+}
+
+// -----------------------------------------------------------------------------
 // LCD raw GET (for code-id contract listing + tx_search; engine's queryContract
 // is smart-query only)
 // -----------------------------------------------------------------------------
@@ -193,7 +216,7 @@ async function discoverHolders(vault) {
         page++;
         if (page > 50) { complete = false; console.warn(`  ⚠ ${vault.label}: >50 deposit pages, stopping`); break; }
     }
-    return { addresses: [...recipients], complete };
+    return { addresses: [...recipients], txSearchComplete: complete };
 }
 
 // -----------------------------------------------------------------------------
@@ -221,26 +244,44 @@ async function run() {
         console.log(`  ${v.label || v.address.slice(0,12)}: staked ${v.state.staked_lst_human?.toFixed(2)} ${v.lst_symbol} | rate ${ex?.toFixed(4)} | lock VP ${v.state.lock_vp_human?.toLocaleString()}`);
     }
 
-    // Phase 2: discover holders per vault, then value each holder's current balance
-    const vaultBlocks = [];
-    let anyIncomplete = false;
+    // Phase 2 (v1.1): candidate universe -> ONE balance sweep -> value per vault.
+    const catalog = await fetchCommunityCandidates();
+    const depositRecipients = new Map();      // vault address -> { addresses, txSearchComplete }
+    let anyTxSearchIncomplete = false;
     for (const v of vaults) {
-        if (!v.vdenom) { console.warn(`  ⚠ ${v.label}: no vdenom in config, skipping holders`); errors.add(`vault ${v.label || v.address.slice(0,10)} has no vdenom`, 'config missing vdenom — cannot enumerate holders'); vaultBlocks.push({ ...vaultLight(v), holders: [], holder_discovery_complete: false }); anyIncomplete = true; continue; }
-        console.log(`👥 ${v.label}: discovering holders...`);
-        const { addresses, complete } = await discoverHolders(v);
-        if (!complete) anyIncomplete = true;
-        console.log(`  ${addresses.length} historical depositors (complete: ${complete})`);
+        if (!v.vdenom) continue;
+        const r = await discoverHolders(v);
+        depositRecipients.set(v.address, r);
+        if (!r.txSearchComplete) anyTxSearchIncomplete = true;
+    }
+    const depositAddrs = new Set([].concat(...[...depositRecipients.values()].map(r => r.addresses)));
+    const candidateSet = new Set([...catalog.addresses, ...depositAddrs]);
+    const candidates = [...candidateSet];
+    console.log(`👥 candidate universe: ${candidates.length} (catalog ${catalog.addresses.length} [${catalog.source}] ∪ deposit-events ${depositAddrs.size})`);
 
-        // LST price for USD
+    // One bank/balances call per candidate answers ALL vaults at once.
+    const vdenoms = new Set(vaults.map(v => v.vdenom).filter(Boolean));
+    const balByAddr = new Map();
+    await parallelMap(candidates, async (addr) => {
+        const bals = await fetchBankBalances(addr);
+        if (!Array.isArray(bals)) return;      // null = fetch failed ≠ empty
+        const mine = {};
+        for (const b of bals) if (vdenoms.has(b.denom)) mine[b.denom] = Number(b.amount);
+        if (Object.keys(mine).length) balByAddr.set(addr, mine);
+    }, BATCH_CONCURRENCY);
+    console.log(`  ${balByAddr.size} of ${candidates.length} candidates hold ≥1 vtoken`);
+
+    const vaultBlocks = [];
+    for (const v of vaults) {
+        if (!v.vdenom) { console.warn(`  ⚠ ${v.label}: no vdenom in config, skipping holders`); errors.add(`vault ${v.label || v.address.slice(0,10)} has no vdenom`, 'config missing vdenom — cannot enumerate holders'); vaultBlocks.push({ ...vaultLight(v), holders: [], holder_discovery_complete: false, supply_coverage_pct: null }); continue; }
+
         const lstRatio = priceOfLst(v.lst_symbol, ctx);   // LST -> LUNA multiple
         const lunaUsd = ctx.lunaPriceUsd || 0;
 
-        const holders = await parallelMap(addresses, async (addr) => {
-            // current vdenom bank balance
-            const bals = await fetchBankBalances(addr);
-            const entry = (bals || []).find(b => b.denom === v.vdenom);
-            const vtokenRaw = entry ? Number(entry.amount) : 0;
-            if (vtokenRaw <= 0) return null;   // deposited historically but no current balance (withdrew/transferred)
+        const holdersRaw = [];
+        for (const [addr, mine] of balByAddr) {
+            const vtokenRaw = mine[v.vdenom];
+            if (!vtokenRaw || vtokenRaw <= 0) continue;
             const vtoken = vtokenRaw / 1e6;
             const underlyingLst = v.state.exchange_rate != null ? vtoken * v.state.exchange_rate : null;
             // USD via our network-and-prices feed (hub-ratio price). NOTE: for
@@ -251,7 +292,7 @@ async function run() {
             const underlyingUsd = (underlyingLst != null && lstRatio != null) ? underlyingLst * lstRatio * lunaUsd : null;
             const shareOfVault = v.state.vdenom_supply_human ? vtoken / v.state.vdenom_supply_human : null;
             const impliedVp = (shareOfVault != null && v.state.lock_vp_human != null) ? shareOfVault * v.state.lock_vp_human : null;
-            return {
+            holdersRaw.push({
                 address: addr,
                 vtoken_balance: vtoken,
                 underlying_lst: underlyingLst,
@@ -259,9 +300,9 @@ async function run() {
                 underlying_usd_price_source: 'network-and-prices/hub-ratio',
                 share_of_vault_pct: shareOfVault != null ? shareOfVault * 100 : null,
                 implied_vp: impliedVp,
-            };
-        }, BATCH_CONCURRENCY);
-        const valid = holders.filter(Boolean).sort((a, b) => (b.implied_vp || 0) - (a.implied_vp || 0));
+            });
+        }
+        const valid = holdersRaw.sort((a, b) => (b.implied_vp || 0) - (a.implied_vp || 0));
 
         // PFPK names
         let named = 0;
@@ -272,24 +313,45 @@ async function run() {
             } catch { h.name = null; }
         }, BATCH_CONCURRENCY);
 
-        console.log(`  ✓ ${valid.length} current holders (${named} named), ${addresses.length - valid.length} fully exited`);
+        // MEASURED completeness: found vtoken balances vs actual supply.
+        const foundVtok = valid.reduce((s2, h) => s2 + (h.vtoken_balance || 0), 0);
+        const coverage = v.state.vdenom_supply_human > 0 ? foundVtok / v.state.vdenom_supply_human : null;
+        const vaultTvlUsd = (v.state.staked_lst_human != null && lstRatio != null) ? v.state.staked_lst_human * lstRatio * lunaUsd : null;
+        const depMeta = depositRecipients.get(v.address) || { addresses: [], txSearchComplete: false };
+        console.log(`  ✓ ${v.label}: ${valid.length} holders (${named} named) | coverage ${coverage != null ? (coverage * 100).toFixed(1) + '%' : '?'} of supply | vault TVL ${vaultTvlUsd != null ? '$' + vaultTvlUsd.toFixed(0) : '?'}`);
         vaultBlocks.push({
             ...vaultLight(v),
             holder_count: valid.length,
-            historical_depositor_count: addresses.length,
-            holder_discovery_complete: complete,
-            total_underlying_usd: valid.reduce((s, h) => s + (h.underlying_usd || 0), 0),
+            historical_depositor_count: depMeta.addresses.length,   // deposit-event recipients within tx retention (window-limited)
+            tx_search_complete: depMeta.txSearchComplete,
+            supply_coverage_pct: coverage != null ? coverage * 100 : null,
+            holder_discovery_complete: coverage != null && coverage >= 0.995,   // MEASURED, never asserted
+            vault_tvl_usd: vaultTvlUsd,
+            total_underlying_usd: valid.reduce((s2, h) => s2 + (h.underlying_usd || 0), 0),
             holders: valid,
         });
     }
+    const anyIncomplete = vaultBlocks.some(b => !b.holder_discovery_complete) || !catalog.ok;
 
     // Phase 3: assemble + publish
     const status = vaults.length === 0 ? 'error' : (anyIncomplete ? 'partial' : 'ok');
-    const totalTvlUsd = vaultBlocks.reduce((s, b) => s + (b.total_underlying_usd || 0), 0);
+    // v1.1: total_tvl_usd is now REAL vault TVL (staked LST valued), not the
+    // discovered-holders' sum it silently was — that sum survives under its
+    // honest name.
+    const totalTvlUsd = vaultBlocks.reduce((s, b) => s + (b.vault_tvl_usd || 0), 0);
+    const discoveredHoldersUsd = vaultBlocks.reduce((s, b) => s + (b.total_underlying_usd || 0), 0);
     const totalHolders = new Set(vaultBlocks.flatMap(b => b.holders.map(h => h.address))).size;
+    const discoveryMeta = {
+        universe: 'community-catalog + recent-deposit-events',
+        catalog_source: catalog.source,
+        catalog_addresses: catalog.addresses.length,
+        deposit_event_addresses: depositAddrs.size,
+        candidates_swept: candidates.length,
+        tx_search_complete: !anyTxSearchIncomplete,
+    };
 
     const fullDoc = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         capturedAt: startedAt.toISOString(),
         capturedAtUnix: startedAt.getTime(),
         epoch: epochInfo,
@@ -297,11 +359,13 @@ async function run() {
         luna_price_used_usd: ctx.lunaPriceUsd,
         vault_count: vaults.length,
         total_tvl_usd: totalTvlUsd,
+        discovered_holders_usd: discoveredHoldersUsd,
         unique_holders: totalHolders,
+        discovery: discoveryMeta,
         vaults: vaultBlocks,
     };
     const lightDoc = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         capturedAt: startedAt.toISOString(),
         epoch: epochInfo,
         total_tvl_usd: totalTvlUsd,
@@ -310,6 +374,7 @@ async function run() {
             address: b.address, label: b.label, lst_symbol: b.lst_symbol, vdenom: b.vdenom,
             staked_lst_human: b.staked_lst_human, exchange_rate: b.exchange_rate,
             lock_vp_human: b.lock_vp_human, holder_count: b.holder_count, total_underlying_usd: b.total_underlying_usd,
+            vault_tvl_usd: b.vault_tvl_usd, supply_coverage_pct: b.supply_coverage_pct,
         })),
     };
     const heartbeat = {
@@ -323,6 +388,7 @@ async function run() {
             unique_holders: totalHolders,
             total_tvl_usd: totalTvlUsd,
             any_discovery_incomplete: anyIncomplete,
+            discovery: discoveryMeta,
             error_count: errors.count(),
         },
         recent_errors: errors.list(),   // sanitized — safe to surface on System Health
