@@ -94,5 +94,22 @@ daily after aDAO+TLA. LCD-heavy (tx_search per vault + bank balance per holder),
 concurrency 5.
 
 ### Recent changes
+- **2026-07-21 — v1.1.0 (discovery fix).** tx_search-only discovery silently ran
+  on public-node TX RETENTION (~2–3 weeks): historical depositors vanished while
+  `complete:true` was asserted (observed: 2 holders vs 147K vtokens outstanding;
+  DeFi_Patriot's own positions invisible). Fix: candidate universe = **org
+  address-catalog** (tla-core `catalog/snapshots/current.json`, 389 community
+  addresses incl. all TLA lock holders) ∪ deposit-event recipients, then ONE
+  `bank/balances` sweep across the union (each call answers all 6 vdenoms).
+  Completeness is now **MEASURED** per vault (`supply_coverage_pct`;
+  `holder_discovery_complete` = coverage ≥ 99.5%) — never asserted.
+  `total_tvl_usd` now = REAL vault TVL (staked LST × ratio × LUNA); the old
+  holders-only sum survives as `discovered_holders_usd`. schemaVersion **2** +
+  `discovery` meta block (universe, catalog source, candidates swept).
+  Gated 14/14 on the Eris-UI fixture (1,225.39 ampLUNA / 4,363.47 arbLUNA);
+  first production run: 18 holders (was 2), TVL $35,105 (was $744 mislabel).
+  Note: `denom_owners` LCD endpoint is NOT served by publicnode or
+  phoenix-lcd (tested) — the catalog-sweep is the durable design and is what
+  the future org port inherits.
 - **2026-06-14 — v1.0.** Initial build. Vault discovery + holder reconstruction
   from deposit events + live valuation via vdenom bank balances. Shared engine.
