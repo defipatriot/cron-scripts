@@ -122,7 +122,7 @@ const OUTPUT_PATH = 'data/v2';
 
 // Sister cron data repos (read-only fetches for prices & catalog token metadata)
 // These are PUBLIC — no auth needed.
-const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const PRICES_DATA_URL  = 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 const CATALOG_DATA_URL = 'https://raw.githubusercontent.com/defipatriot/tla-chain-registry/main/2026/current.json';
 
 // DAODAO pending-claim tracking (Rev B.3). Forward-only state persisted in the data repo.
@@ -1054,7 +1054,7 @@ async function fetchBackingData(unbrokenCount) {
 // directly. This avoids duplication, keeps load off CoinGecko/Eris, and
 // inherits the sister crons' price-validation logic.
 //
-//   network-and-prices-data_2026 → LUNA price + Astroport snapshot prices
+//   tla-core/network-and-prices (org feed, cutover 2026-08-07) → LUNA price + Astroport snapshot prices
 //   tla-chain-registry           → Eris exchange rates + token catalog
 //
 // Used to:
