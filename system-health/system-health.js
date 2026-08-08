@@ -24,12 +24,13 @@ const fs = require('fs');
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
 const GITHUB_REPO   = process.env.GITHUB_REPO   || 'defipatriot/system-health-data_2026';
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
-const RAW = 'https://raw.githubusercontent.com/defipatriot';
+const RAW_HOST = 'https://raw.githubusercontent.com';
+const ownerOf = (mon) => mon.owner || 'defipatriot';   // rows may point at org repos (network-and-prices cutover 2026-08-07)
 
 // Each monitored cron: repo, heartbeat path, expected cadence (minutes), and
 // whether staleness is EXPECTED (e.g. frozen upstream) so we don't false-alarm.
 const MONITORED = [
-    { key: 'network-and-prices', repo: 'network-and-prices-data_2026', path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'foundation' },
+    { key: 'network-and-prices', owner: 'thealliancedao', repo: 'tla-core', path: 'network-and-prices/heartbeat.json', cadenceMin: 60, tier: 'foundation', note: 'Cutover to org feed (2026-08-07) ✓' },
     { key: 'tla-registry',       repo: 'tla-chain-registry',           path: '2026/heartbeat.json', cadenceMin: 1440, tier: 'foundation' },
     { key: 'tla-snapshot',       repo: 'tla-snapshot-data_2026',       path: 'data/heartbeat.json', cadenceMin: 60,   tier: 'core' },
     { key: 'nft-inventory',      repo: 'nft-inventory-data_2026',      path: 'data/v2/heartbeat.json', cadenceMin: 60, tier: 'core' },
@@ -133,7 +134,7 @@ function latestCsvDate(text) {
 // `manual` + `update_url` so the UI can offer a "where to refresh" link.
 function evaluateManual(mon, latestDate, now) {
     const r = {
-        key: mon.key, repo: mon.repo, tier: mon.tier || 'aux',
+        key: mon.key, repo: mon.repo, owner: mon.owner || null, tier: mon.tier || 'aux',
         present: !!latestDate, status: null, health: null, reason: null,
         last_run: latestDate || null, age_min: null, cadence_min: null,
         run_status: null, stuck: false, stats: null,
@@ -162,7 +163,7 @@ function evaluateManual(mon, latestDate, now) {
 
 function evaluate(mon, hb, now) {
     const r = {
-        key: mon.key, repo: mon.repo, tier: mon.tier,
+        key: mon.key, repo: mon.repo, owner: mon.owner || null, tier: mon.tier,
         present: !!hb, status: null, health: null, reason: null,
         last_run: null, age_min: null, cadence_min: mon.cadenceMin,
         run_status: null, stuck: false, stats: null,
@@ -255,10 +256,10 @@ async function run() {
     for (const mon of MONITORED) {
         let r;
         if (mon.manualSource) {
-            const csv = await fetchText(`${RAW}/${mon.repo}/${GITHUB_BRANCH}/${mon.csvPath}?t=${now}`);
+            const csv = await fetchText(`${RAW_HOST}/${ownerOf(mon)}/${mon.repo}/${GITHUB_BRANCH}/${mon.csvPath}?t=${now}`);
             r = evaluateManual(mon, latestCsvDate(csv), now);
         } else {
-            const hb = await fetchJson(`${RAW}/${mon.repo}/${GITHUB_BRANCH}/${mon.path}?t=${now}`);
+            const hb = await fetchJson(`${RAW_HOST}/${ownerOf(mon)}/${mon.repo}/${GITHUB_BRANCH}/${mon.path}?t=${now}`);
             r = evaluate(mon, hb, now);
         }
         results.push(r);
@@ -304,7 +305,7 @@ async function run() {
         attention: results.filter(r => r.health !== 'ok').map(r => ({ key: r.key, health: r.health, status: r.status, reason: r.reason, recent_errors: r.recent_errors || [] })),
         systems: results.map(r => ({
             ...r,
-            data_repo_url: `https://github.com/defipatriot/${r.repo}`,
+            data_repo_url: `https://github.com/${r.owner || 'defipatriot'}/${r.repo}`,
             cron_source_url: cronSourceUrl(r.key),
         })),
         endpoints,
