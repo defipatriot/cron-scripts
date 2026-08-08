@@ -28,7 +28,7 @@ const https = require('https');
 const TierBuilder = require('../lib/tier-builder.js');
 
 const PRICES_SOURCE_URL = process.env.PRICES_SOURCE_URL
-  || 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+  || 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 const HISTORY_RAW_URL = 'https://raw.githubusercontent.com/defipatriot/tla-core/main/prices/history.json';
 
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
