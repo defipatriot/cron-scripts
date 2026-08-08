@@ -505,7 +505,7 @@ function fetchPreviousHeartbeat() {
 //   price_captured_at           (when network-and-prices was last refreshed)
 
 const NETWORK_PRICES_URL = process.env.NETWORK_PRICES_URL ||
-    'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+    'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 
 function httpFetchJsonUrl(url) {
     return new Promise((resolve, reject) => {
