@@ -28,7 +28,7 @@ const { execSync } = require('child_process');
 //   The pre-2026-04-16 backups in this repo are the only volume history we have.
 // -----------------------------------------------------------------------------
 const POOLS_LIST_URL = 'https://skeletonswap.backbonelabs.io/mainnet/phoenix-1/pools_list.json';
-const PRICES_URL = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const PRICES_URL = 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 const LCD_URL = process.env.TERRA_LCD || 'https://terra-lcd.publicnode.com';
 
 // Concurrency cap when querying pools in parallel. Public LCD endpoints tolerate
