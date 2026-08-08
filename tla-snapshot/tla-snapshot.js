@@ -124,7 +124,7 @@ const REFRESH_INTERVAL_MS = REFRESH_INTERVAL_HOURS * 60 * 60 * 1000;
 
 // Data repo URLs (raw.githubusercontent.com)
 const DATA_REPOS = {
-    networkPricesUrl:  'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json',
+    networkPricesUrl:  'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json',
     bribesCurrentUrl:  'https://raw.githubusercontent.com/defipatriot/bribes-data_2026/main/data/current-state.json',
     bribesHistoryUrl:  'https://raw.githubusercontent.com/defipatriot/bribes-data_2026/main/data/pd-bribes-history.json',
     votionBaseUrl:     'https://raw.githubusercontent.com/defipatriot/votion-data_2026/main/votion',
