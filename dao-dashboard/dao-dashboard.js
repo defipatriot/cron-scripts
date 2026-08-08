@@ -119,7 +119,7 @@ const DENOM_MAP = {
 const LCD_PRIMARY  = 'https://terra-lcd.publicnode.com';
 const LCD_FALLBACK = 'https://terra.publicnode.com';
 const URL_TLA_SNAPSHOT   = 'https://raw.githubusercontent.com/defipatriot/tla-snapshot-data_2026/main/data/tla-snapshot.json';
-const URL_NETWORK_PRICES = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const URL_NETWORK_PRICES = 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 const URL_STAKING_APR    = 'https://raw.githubusercontent.com/defipatriot/tla-ext_json_storage/main/Staking%20APR.csv';
 
 // ── Publish target ───────────────────────────────────────────────────────────
