@@ -66,7 +66,7 @@ const BOOST_API_URL         = 'https://api.boostdao.io/graphql';
 const BOOST_LAUNCH_CONTRACT = 'terra1kj7pasyahtugajx9qud02r5jqaf60mtm7g5v9utr94rmdfftx0vqspf4at';
 
 // Network-and-prices cron output (for converting bLUNA prices to USD)
-const NETWORK_PRICES_URL = 'https://raw.githubusercontent.com/defipatriot/network-and-prices-data_2026/main/data/network-and-prices.json';
+const NETWORK_PRICES_URL = 'https://raw.githubusercontent.com/thealliancedao/tla-core/main/network-and-prices/current.json';
 
 // Data repo where THIS cron writes (used by sales-history reads for incremental dedupe)
 const SELF_REPO_RAW_BASE = 'https://raw.githubusercontent.com/defipatriot/marketplace-data_2026/main';
